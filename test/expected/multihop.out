@@ -1,0 +1,227 @@
+-- Test: multi-hop scope resolution (the shared path-walker)
+--
+-- Semantics under test:
+--   1. One-hop using_path: grants on comments scoped to projects via
+--      tasks resolve per row by walking the FK chain.
+--   2. Explicit final hop: a using_path that lands on the scope table
+--      itself behaves identically to the inferred final hop.
+--   3. Two-hop path with an inferred final hop.
+--   4. NULL along the chain denies — the grant does not apply to the
+--      row. It never enforces as unscoped (the old fail-open bug).
+--   5. Fail-loud grant-time validation: ambiguous final hop, no FK
+--      path to the scope, using_path on an unscoped grant.
+CREATE EXTENSION letter;
+CREATE TABLE users (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL
+);
+CREATE TABLE projects (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL
+);
+CREATE TABLE tasks (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id uuid NOT NULL REFERENCES projects(id),
+    title TEXT NOT NULL
+);
+CREATE TABLE comments (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id uuid REFERENCES tasks(id),
+    body TEXT NOT NULL
+);
+CREATE TABLE reactions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    comment_id uuid NOT NULL REFERENCES comments(id),
+    emoji TEXT NOT NULL
+);
+CREATE TABLE team_members (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    role TEXT NOT NULL
+);
+INSERT INTO users (id, name) VALUES
+    ('a0000000-0000-0000-0000-000000000001', 'Alice'),
+    ('a0000000-0000-0000-0000-000000000002', 'Bob');
+INSERT INTO projects (id, name) VALUES
+    ('b0000000-0000-0000-0000-000000000001', 'Alpha'),
+    ('b0000000-0000-0000-0000-000000000002', 'Beta');
+INSERT INTO tasks (id, project_id, title) VALUES
+    ('d0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'Alpha task'),
+    ('d0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000002', 'Beta task');
+INSERT INTO comments (id, task_id, body) VALUES
+    ('e0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000001', 'alpha comment'),
+    ('e0000000-0000-0000-0000-000000000002', 'd0000000-0000-0000-0000-000000000002', 'beta comment'),
+    ('e0000000-0000-0000-0000-000000000003', NULL,                                    'orphan comment');
+INSERT INTO reactions (id, comment_id, emoji) VALUES
+    ('f0000000-0000-0000-0000-000000000001', 'e0000000-0000-0000-0000-000000000001', 'thumbsup'),
+    ('f0000000-0000-0000-0000-000000000002', 'e0000000-0000-0000-0000-000000000003', 'wave');
+-- Roles: Alice is editor on Alpha, Bob is editor on Beta.
+SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
+    role_name := NULL, role_column := 'role', if_fn := NULL);
+ assign 
+--------
+ t
+(1 row)
+
+INSERT INTO team_members (user_id, project_id, role) VALUES
+    ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor'),
+    ('a0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000002', 'editor');
+-- One-hop grants on comments, scoped to projects via tasks.
+SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
+    'public.projects', ARRAY['task_id'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('update', 'public.comments', 'editor', ARRAY['body'],
+    'public.projects', ARRAY['task_id'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+-- Two-hop grant on reactions with an inferred final hop
+-- (reactions.comment_id -> comments.task_id -> tasks, then tasks.project_id inferred).
+SELECT letter.grant('select', 'public.reactions', 'editor', ARRAY['emoji'],
+    'public.projects', ARRAY['comment_id', 'task_id'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+-- ============================================================
+-- Test 1: one-hop read — Alice sees only the Alpha comment.
+-- The orphan comment (NULL task_id) is excluded, not treated
+-- as unscoped. body is visible, task_id redacted (PK always visible).
+-- ============================================================
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT * FROM letter.read('public.comments') t(row_data)
+    ORDER BY row_data->>'body';
+                                                      row_data                                                      
+--------------------------------------------------------------------------------------------------------------------
+ {"id": "e0000000-0000-0000-0000-000000000001", "body": "alpha comment", "task_id": null, "_redacted": ["task_id"]}
+(1 row)
+
+-- ============================================================
+-- Test 2: one-hop read — Bob sees only the Beta comment.
+-- ============================================================
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+SELECT * FROM letter.read('public.comments') t(row_data)
+    ORDER BY row_data->>'body';
+                                                     row_data                                                      
+-------------------------------------------------------------------------------------------------------------------
+ {"id": "e0000000-0000-0000-0000-000000000002", "body": "beta comment", "task_id": null, "_redacted": ["task_id"]}
+(1 row)
+
+-- ============================================================
+-- Test 3: two-hop read — Alice sees the reaction on the Alpha
+-- comment. The reaction on the orphan comment is excluded
+-- (NULL at the second hop).
+-- ============================================================
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT * FROM letter.read('public.reactions') t(row_data)
+    ORDER BY row_data->>'emoji';
+                                                       row_data                                                       
+----------------------------------------------------------------------------------------------------------------------
+ {"id": "f0000000-0000-0000-0000-000000000001", "emoji": "thumbsup", "_redacted": ["comment_id"], "comment_id": null}
+(1 row)
+
+-- ============================================================
+-- Test 4: one-hop write — Alice can update the Alpha comment...
+-- ============================================================
+UPDATE comments SET body = 'alpha comment v2'
+    WHERE id = 'e0000000-0000-0000-0000-000000000001';
+SELECT body FROM comments WHERE id = 'e0000000-0000-0000-0000-000000000001';
+       body       
+------------------
+ alpha comment v2
+(1 row)
+
+-- ============================================================
+-- Test 5: ...but not the Beta comment (wrong scope)...
+-- ============================================================
+\set VERBOSITY terse
+UPDATE comments SET body = 'hacked'
+    WHERE id = 'e0000000-0000-0000-0000-000000000002';
+ERROR:  letter: UPDATE denied on "public.comments" column "body" for user "a0000000-0000-0000-0000-000000000001" — requires 'update' privilege
+-- ============================================================
+-- Test 6: ...and not the orphan comment (NULL along the chain
+-- denies; it must not enforce as unscoped).
+-- ============================================================
+UPDATE comments SET body = 'hacked'
+    WHERE id = 'e0000000-0000-0000-0000-000000000003';
+ERROR:  letter: UPDATE denied on "public.comments" column "body" for user "a0000000-0000-0000-0000-000000000001" — requires 'update' privilege
+\set VERBOSITY default
+-- ============================================================
+-- Test 7: explicit final hop — a path that lands on the scope
+-- table itself behaves identically to the inferred final hop.
+-- ============================================================
+SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
+    'public.projects', ARRAY['task_id', 'project_id'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT * FROM letter.read('public.comments') t(row_data)
+    ORDER BY row_data->>'body';
+                                                       row_data                                                        
+-----------------------------------------------------------------------------------------------------------------------
+ {"id": "e0000000-0000-0000-0000-000000000001", "body": "alpha comment v2", "task_id": null, "_redacted": ["task_id"]}
+(1 row)
+
+-- ============================================================
+-- Test 8: grant-time fail-loud — two FKs to the scope table
+-- make the final hop ambiguous.
+-- ============================================================
+CREATE TABLE links (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    src_project uuid REFERENCES projects(id),
+    dst_project uuid REFERENCES projects(id),
+    label TEXT
+);
+\set VERBOSITY terse
+SELECT letter.grant('select', 'public.links', 'editor', ARRAY['label'],
+    'public.projects', NULL, NULL);
+ERROR:  letter.grant: public.links has more than one foreign key to scope "public.projects" — extend using_path to name the final hop column
+\set VERBOSITY default
+-- Naming the final hop column resolves the ambiguity.
+SELECT letter.grant('select', 'public.links', 'editor', ARRAY['label'],
+    'public.projects', ARRAY['src_project'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+-- ============================================================
+-- Test 9: grant-time fail-loud — no FK path to the scope table.
+-- ============================================================
+CREATE TABLE isolated (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    note TEXT
+);
+\set VERBOSITY terse
+SELECT letter.grant('select', 'public.isolated', 'editor', ARRAY['note'],
+    'public.projects', NULL, NULL);
+ERROR:  letter.grant: no foreign key path from public.isolated to scope "public.projects" — this grant's scope could never be resolved
+-- ============================================================
+-- Test 10: grant-time fail-loud — using_path on an unscoped grant.
+-- ============================================================
+SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
+    '', ARRAY['task_id'], NULL);
+ERROR:  letter.grant: using_path requires a scoped grant
+\set VERBOSITY default
+-- Clean up
+RESET letter.current_user_id;
+SET letter.bypass = true;
+DROP TABLE isolated;
+DROP TABLE links CASCADE;
+DROP TABLE team_members CASCADE;
+DROP TABLE reactions CASCADE;
+DROP TABLE comments CASCADE;
+DROP TABLE tasks CASCADE;
+DROP TABLE projects CASCADE;
+DROP TABLE users CASCADE;
+DROP EXTENSION letter CASCADE;

@@ -1,0 +1,39 @@
+# letter thoughts
+
+## scopes
+
+### for queries
+
+Scope of object possible by lookup following using_path on query
+
+Possible to do Russian doll cache
+
+
+### for streaming
+
+Messages:
+
+SET
+table::key::row::scopes::rev
+
+TOMB
+table::key
+
+
+
+Move in made visible by new scope values
+
+But only if done on write with triggers
+
+Move outs result in a removal of scope value but this revised value not propagated as not visible!!
+
+A new message needs to be emitted `out-of-scope` this should be sent to anyone with access to to this scope?
+
+
+OUT 
+table::key::scope 
+
+
+
+
+

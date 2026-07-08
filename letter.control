@@ -1,0 +1,5 @@
+comment = 'letter: role-based access control for PostgreSQL'
+default_version = '0.1'
+module_pathname = '$libdir/letter'
+relocatable = false
+schema = letter

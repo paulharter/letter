@@ -1,0 +1,5 @@
+cmake-build-debug/
+
+*.dylib
+.claude/
+.idea/
