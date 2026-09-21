@@ -70,6 +70,10 @@ INSERT INTO team_members (user_id, project_id, role) VALUES
 -- One-hop grants on comments, scoped to projects via tasks.
 SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
     'public.projects', ARRAY['task_id'], NULL);
+WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.comments (task_id);
+WARNING:  letter.grant: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.tasks (project_id);
  grant 
 -------
  t
@@ -86,6 +90,12 @@ SELECT letter.grant('update', 'public.comments', 'editor', ARRAY['body'],
 -- (reactions.comment_id -> comments.task_id -> tasks, then tasks.project_id inferred).
 SELECT letter.grant('select', 'public.reactions', 'editor', ARRAY['emoji'],
     'public.projects', ARRAY['comment_id', 'task_id'], NULL);
+WARNING:  letter.grant: scope path column "comment_id" on public.reactions has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.reactions (comment_id);
+WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.comments (task_id);
+WARNING:  letter.grant: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.tasks (project_id);
  grant 
 -------
  t
@@ -160,6 +170,10 @@ ERROR:  letter: UPDATE denied on "public.comments" column "body" for user "a0000
 -- ============================================================
 SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
     'public.projects', ARRAY['task_id', 'project_id'], NULL);
+WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.comments (task_id);
+WARNING:  letter.grant: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.tasks (project_id);
  grant 
 -------
  t
@@ -190,6 +204,8 @@ ERROR:  letter.grant: public.links has more than one foreign key to scope "publi
 -- Naming the final hop column resolves the ambiguity.
 SELECT letter.grant('select', 'public.links', 'editor', ARRAY['label'],
     'public.projects', ARRAY['src_project'], NULL);
+WARNING:  letter.grant: scope path column "src_project" on public.links has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.links (src_project);
  grant 
 -------
  t

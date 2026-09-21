@@ -1,5 +1,13 @@
 # Letter — Query Hooks for Read Enforcement
 
+> **SUPERSEDED (2026-09-21).** Kept for the record of how the idea started. The hook
+> location (`planner_hook`) stands; the mechanics below do not. Strategy A's per-column
+> `CASE … letter_check_column(…)` wrapping redacts at the sink and leaks through
+> predicates (`14` §1), and a per-row function cannot scale with the user's scope set
+> (`16` §2). Current design: `15-join-enforcement.md` (what is enforced),
+> `16-scope-resolution-direction.md` §3 (what is generated),
+> `17-planner-hook-implementation.md` (how it is built).
+
 ## Goal
 
 `SELECT * FROM tasks` on a table with grants should transparently enforce column-level permissions. The app doesn't call special functions or query special views — it queries tables normally and letter handles enforcement invisibly.

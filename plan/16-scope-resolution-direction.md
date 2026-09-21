@@ -71,34 +71,40 @@ via `using_path = {task_id}` — `editor` may read `body`, `viewer` may read `au
 
 ```sql
 (SELECT c.id,                                             -- PK always visible
-        CASE WHEN t.project_id = ANY (u.editor_projects)
+        CASE WHEN t.project_id IN (SELECT r.scope_id::bigint FROM letter.roles r
+                  WHERE r.user_id = current_setting('letter.current_user_id')
+                    AND r.role = 'editor' AND r.scope_table = 'public.projects')
              THEN c.body END                                        AS body,
-        CASE WHEN t.project_id = ANY (u.viewer_projects)
+        CASE WHEN t.project_id IN (SELECT … r.role = 'viewer' …)
              THEN c.author END                                      AS author,
         …
  FROM public.comments c
  LEFT JOIN public.tasks t ON t.id = c.task_id             -- hop: many-to-one onto a PK
- CROSS JOIN (SELECT                                       -- user's scope sets, once per statement
-     ARRAY(SELECT r.scope_id::bigint FROM letter.roles r
+ WHERE t.project_id IN (SELECT r.scope_id::bigint FROM letter.roles r   -- row visibility
            WHERE r.user_id = current_setting('letter.current_user_id')
-             AND r.role = 'editor' AND r.scope_table = 'public.projects') AS editor_projects,
-     ARRAY(SELECT … r.role = 'viewer' …)                               AS viewer_projects
- ) u
- WHERE t.project_id = ANY (u.editor_projects || u.viewer_projects)   -- row visibility
+             AND r.role IN ('editor', 'viewer') AND r.scope_table = 'public.projects')
 ) /* security_barrier */ comments
 ```
 
-The exact SQL (single-row FROM item vs InitPlan params vs a semijoin against
-`letter.roles` for the `WHERE`) is to be settled by `EXPLAIN` experiments — §8 Q1. The
-rules below are the design; the SQL is an illustration.
+**This form was chosen by experiment** (2026-09-21, `bench/barrier/RESULTS.md`, "form
+E"). The `WHERE` becomes a semijoin the planner drives from `letter.roles`; each
+`CASE` test becomes a *hashed* SubPlan, built once per statement and probed O(1) per
+row. The first draft of this section represented the user's scope sets as arrays
+(`= ANY(ARRAY(SELECT …))`); that lost on two counts — a linear array scan per row per
+column (6× slower at 2000 scopes), and row estimates blind to the set's size (1000
+estimated vs 200,000 actual). **No arrays.**
 
 ### 3.2 Rules
 
 1. **Join up the chain once; test many times.** Each distinct `(scope, using_path)`
    among the table's `select` grants contributes one chain of joins and one exposed
    scope-id column. Row visibility (`WHERE`) and every column's `CASE` test *that
-   column*. Do **not** put an `EXISTS (…)` per column in the target list — in a `CASE`
-   it cannot become a semijoin and degrades to a correlated SubPlan per row per column.
+   column* with `<scope id> IN (SELECT r.scope_id::<pk_type> FROM letter.roles …)`.
+   The sub-select must stay **uncorrelated and hashable** (a plain `IN` over the user's
+   role rows) so it plans as a hashed SubPlan; never re-walk the FK chain inside it.
+   *(Corrected after the experiment: the first draft banned sub-selects in the target
+   list and used arrays instead — measurably the wrong way round.)* Columns the outer
+   query never reads cost nothing: their SubPlans are pruned.
 2. **Hops are `LEFT JOIN`s onto primary keys.** Many-to-one onto a PK cannot multiply
    rows. `LEFT`, not `INNER`: a NULL/missing hop must make *this grant* not apply (D4 —
    `NULL = ANY(…)` is not true) without dropping a row that another grant makes visible.
@@ -112,12 +118,22 @@ rules below are the design; the SQL is an illustration.
    `VARCHAR(256)`. `p.org_id::text = r.scope_id` defeats the index on `projects(org_id)`
    — the exact index that lets the bounded side drive. Generate
    `r.scope_id::<pk_type>`; `lookup_pk_column` already returns the type.
-5. **Group grants before generating.** Grants sharing `(scope, using_path)` share one
-   join chain; their role sets are merged for the `WHERE`. Keeping the row-visibility
-   predicate a single strict test per chain matters: it lets the planner reduce the
-   `LEFT JOIN` to an inner join and reorder it to start from the scope side. An `OR`
-   across *different* chains (or with an unscoped grant) is not strict and loses this —
-   see §8 Q2.
+5. **Group grants before generating; one `UNION ALL` branch per group.** Grants sharing
+   `(scope, using_path)` share one join chain and their role names are merged into one
+   `r.role IN (…)`. The row-visibility predicate of a branch must be a single *strict*
+   test: that is what lets the planner reduce the `LEFT JOIN` to an inner join and
+   start from the scope side. A single `OR` across different chains, or with an
+   unscoped grant, is not strict and measurably falls off a cliff (full scan of the
+   leaf: 109 ms vs 0.3 ms on 1M rows). So:
+   - each additional chain is its own branch, excluding rows earlier branches already
+     produced (`AND (<earlier branch's test>) IS NOT TRUE`) — mutually exclusive, so no
+     de-duplication;
+   - an **unscoped** select grant is a branch with no joins, gated by the run-time
+     constant `(SELECT EXISTS (… user holds the role, scope_table IS NULL))`. The
+     planner turns that into a `One-Time Filter`: the branch is *never executed* for
+     users without the role, and the scoped branches are never executed for users with
+     it (`AND NOT <same test>`).
+   Both confirmed in `bench/barrier/RESULTS.md` finding 6. Plans stay user-independent.
 6. **Row visibility = any applicable `select` grant** (today's
    `row_has_any_select_grant`), column visibility = the grants covering that column.
    Same semantics as `letter.read()`; PK always visible.
@@ -134,17 +150,21 @@ The scope predicate lives *inside* the barrier — it is letter's trusted qual, 
 same position an RLS policy qual occupies. `security_barrier` only stops *user* quals
 being pushed *below* it; it does not stop the planner choosing join order and index
 conditions within the barrier subquery. So the fear in `15` §9.5 — that the barrier
-forces a full scan + nested-loop scope check — should apply much less to row filtering
-than that section assumes. **Unverified; this is the first thing to test** (§8 Q1).
-What the barrier *does* still cost: a selective user predicate on the protected table
-cannot be used as an index condition beneath it unless leakproof.
+forces a full scan + nested-loop scope check — does not apply to row filtering.
+**Verified 2026-09-21** (`bench/barrier/RESULTS.md` finding 1): every strict form plans
+as `roles → tasks(project_id) → comments(task_id)`, 0.6 ms for 698 of 1M rows, vs
+4.6 s for a B1-style per-row function. What the barrier *does* still cost: a selective
+user predicate on the protected table cannot be used as an index condition beneath it
+unless leakproof (`id = 165` is pushed down; `body LIKE …` stays above as a filter over
+the already-small visible set).
 
 ### 3.4 The FK-index requirement
 
 Driving from the scope side needs a btree on every **referencing** column along the
 path (`comments.task_id`, `tasks.project_id`). PostgreSQL indexes only the referenced
 PK side automatically; nothing guarantees these exist. Without them the plan silently
-degrades to scanning the leaf table.
+degrades to scanning the leaf table (measured: 53 ms vs 0.7 ms on 1M rows, and it grows
+with the table rather than the user).
 
 **Decision:** `letter.grant()` checks each `using_path` column (and the final hop) for
 a usable index and raises a `WARNING` naming the missing one — a warning, not an error,
@@ -258,6 +278,14 @@ FK-walking is slow:
 None of this changes semantics; the existing regression suite is the test. It is
 independent of Phase 5 and can land first.
 
+**DONE 2026-09-21** (checklist 2.7; `get_compiled_scope_path` + `walk_scope_path` in
+`letter.c`; tests in `test/sql/walker_cache.sql`; harness in `bench/walker/`). Measured
+on a 2-hop path: 10k-row bulk insert 9.85 s → 46 ms, `letter.read()` over 20k rows
+39.1 s → 23 ms, single-row insert 1.05 ms → 0.12 ms. The overhead *was* the cost: the
+traversal itself is ~2–4 µs per row. As built, the memo resets on command-id change and
+at (sub)transaction end rather than from an executor hook, and compiled paths are keyed
+by path content (not per grant) and flushed on any relcache invalidation.
+
 The trigger path still reads roles/grants from the backend cache, so `14` §4.1 remains
 open *for writes*. Out of scope here.
 
@@ -273,15 +301,17 @@ both at execution. What the *shape* of the rewrite depends on is then only
 
 | Option | Rewrite depends on | Cached plan reused across users? | Cost |
 |---|---|---|---|
-| **(a) Generic** | `letter.grants` only | safe by construction | predicates for roles the user doesn't hold still appear (empty arrays at run time); unscoped grants become a run-time `OR`, which hurts rule 5 |
+| **(a) Generic** | `letter.grants` only | safe by construction | branches for roles the user doesn't hold still appear, but cost ~nothing at run time — empty semijoin (0.02 ms for a user with no roles) or a `One-Time Filter` that never executes the branch (rule 5) |
 | (b) Role-signature | grants ∩ role *names* the user holds | only among users with the same role-name set — needs a guard or forced replan on user switch | tighter plans |
 | (c) Per-user (`15` §9.2 as written) | user id | never | no plan reuse on pooled connections |
 
 **Recommendation: start with (a).** It makes the correctness landmine disappear instead
 of guarding it — the same stance RLS takes with policies that read `current_setting()`.
 Invalidate cached plans when `letter.grants` changes (the existing `cache_inval`
-statement trigger is the place to call for a plan-cache reset). Move to (b) only if
-measurement shows (a)'s plans are materially worse. This turns the step-2 entry
+statement trigger is the place to call for a plan-cache reset). The experiment found no
+case where (a)'s plans are worse once rule 5's `UNION ALL` branches are used — the one
+suspected cost (unscoped grants as a run-time `OR`) is gone — so (b) has no remaining
+motivation. This turns the step-2 entry
 criterion from "key the plan cache on the user" into "prove the rewritten tree contains
 nothing user-specific" — a property a test can assert.
 
@@ -289,17 +319,18 @@ nothing user-specific" — a property a test can assert.
 
 ## 8. Open questions
 
-1. **Does the planner actually drive from the scope side inside the barrier?** Build the
-   §3.1 SQL by hand as a `security_barrier` view over a 2-hop schema with ~1M leaf rows
-   and compare `EXPLAIN (ANALYZE)` for: scope sets as a single-row FROM item, as
-   InitPlan params, and as a semijoin against `letter.roles`. Watch the row estimate for
-   `= ANY(<array of unknown size>)`. **Do this before writing any hook code** — it
-   validates §2, §3.3 and the choice in §7 in an afternoon, with no C.
-2. **Non-strict row-visibility predicates.** When a table's select grants span different
-   chains, or mix scoped and unscoped, the `WHERE` is an `OR` the planner will not turn
-   into a union of index-driven branches. Options: accept (rare in practice?); generate
-   a `UNION ALL` of per-chain branches with de-duplication; or option (b) of §7 so
-   unscoped grants resolve at plan time. Needs the Q1 harness to judge.
+1. ~~**Does the planner actually drive from the scope side inside the barrier?**~~
+   **ANSWERED 2026-09-21 — yes.** Harness and raw plans in `bench/barrier/`; write-up in
+   `bench/barrier/RESULTS.md`. Outcomes folded back into this doc: the `IN (SELECT …)`
+   form of §3.1, rule 1's correction, the measured costs behind rules 4–5 and §3.4.
+   Still untested there: 3+ hop chains, per-hop gating predicates, partitioned leaves,
+   the write-path result relation, and a hook-built tree vs a view (should be
+   identical — a `security_barrier` view expands to exactly this subquery RTE).
+2. ~~**Non-strict row-visibility predicates.**~~ **RESOLVED 2026-09-21** — confirmed as a
+   real cliff (one `OR` → full leaf scan) and fixed by generating mutually exclusive
+   `UNION ALL` branches, with unscoped grants as a `One-Time Filter`-gated branch. Now
+   rule 5 of §3.2. Residual cost: the generator emits an append of subqueries rather
+   than one subquery, and Var fix-up must cope with that.
 3. **Scope-id typing.** `roles.scope_id` as text forces a cast per generated predicate
    and assumes every role row for a scope table casts cleanly. Fine for now; revisit if
    composite or non-castable PKs appear.
@@ -312,13 +343,16 @@ nothing user-specific" — a property a test can assert.
 
 Supersedes the "Suggested sequencing" tail of `15` §10 from step 2 onward.
 
-0. **Experiment (§8 Q1)** — hand-written barrier view, `EXPLAIN` the three forms. No C.
-1. **Walker performance (§6)** — saved plans, compiled paths, statement memo.
-   Independent; existing tests cover it.
-2. **FK-index warning at grant time (§3.4).** Small, independent.
+0. ~~**Experiment (§8 Q1)** — hand-written barrier view, `EXPLAIN` the three forms. No C.~~
+   **DONE 2026-09-21** — `bench/barrier/RESULTS.md`.
+1. ~~**Walker performance (§6)** — saved plans, compiled paths, statement memo.~~
+   **DONE 2026-09-21.**
+2. ~~**FK-index warning at grant time (§3.4).** Small, independent.~~ **DONE 2026-09-21**
+   — `select` grants only; `test/sql/index_warning.sql`.
 3. **`planner_hook` barrier substitution generating the §3 form directly** (B2), generic
    per §7(a), with the "nothing user-specific in the tree" test as the entry criterion.
    `letter.read()` rebuilt on it or deprecated (`15` §9.3, unchanged).
+   **Implementation plan: `17-planner-hook-implementation.md`.**
 4. Per-hop gating (`15` §7.4) decorating the §3 joins.
 5. Nested cases; write-path redaction (`15` §8). Unchanged.
 6. **Intermediate-table materialisation (§5)** — only if step 0/3 measurements ask for it.

@@ -83,4 +83,8 @@ SELECT letter.unassign(
 SELECT count(*) AS roles_after_unscp FROM letter.roles;
 SELECT count(*) AS assignments_after_unscp FROM letter.assignments;
 
+DROP TABLE admins CASCADE;
+DROP TABLE team_members CASCADE;
+DROP TABLE projects CASCADE;
+DROP TABLE users CASCADE;
 DROP EXTENSION letter CASCADE;

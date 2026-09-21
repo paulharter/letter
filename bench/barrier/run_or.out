@@ -1,0 +1,339 @@
+---- v_or_union as alice
+                                                                              QUERY PLAN                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=39163.15..39163.16 rows=1 width=16) (actual time=0.255..0.257 rows=1 loops=1)
+   ->  Append  (cost=13.09..34149.67 rows=1002696 width=11) (actual time=0.053..0.241 rows=698 loops=1)
+         ->  Subquery Scan on "*SELECT* 1"  (cost=13.09..28347.09 rows=1000000 width=11) (actual time=0.016..0.017 rows=0 loops=1)
+               ->  Result  (cost=13.09..18347.09 rows=1000000 width=19) (actual time=0.015..0.016 rows=0 loops=1)
+                     One-Time Filter: (InitPlan 2).col1
+                     InitPlan 2
+                       ->  Result  (cost=13.08..13.09 rows=1 width=1) (actual time=0.014..0.014 rows=1 loops=1)
+                             InitPlan 1
+                               ->  Bitmap Heap Scan on roles r_1  (cost=9.06..13.08 rows=1 width=0) (actual time=0.013..0.014 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = current_setting('lx.uid'::text)))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=9.06..9.06 rows=1 width=0) (actual time=0.013..0.013 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.007..0.007 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.005..0.005 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                     ->  Seq Scan on comments c  (cost=0.00..18334.00 rows=1000000 width=11) (never executed)
+         ->  Subquery Scan on "*SELECT* 2"  (cost=214.05..789.09 rows=2696 width=32) (actual time=0.036..0.205 rows=698 loops=1)
+               ->  Result  (cost=214.05..762.13 rows=2696 width=40) (actual time=0.036..0.184 rows=698 loops=1)
+                     One-Time Filter: (NOT (InitPlan 5).col1)
+                     InitPlan 3
+                       ->  Bitmap Heap Scan on roles r_2  (cost=4.50..100.12 rows=14 width=8) (actual time=0.004..0.005 rows=3 loops=1)
+                             Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                             Filter: (((role)::text = 'editor'::text) AND ((scope_table)::text = 'lx.projects'::text))
+                             Rows Removed by Filter: 8
+                             Heap Blocks: exact=2
+                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.003..0.003 rows=11 loops=1)
+                                   Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                     InitPlan 5
+                       ->  Result  (cost=13.08..13.09 rows=1 width=1) (actual time=0.010..0.010 rows=1 loops=1)
+                             InitPlan 4
+                               ->  Bitmap Heap Scan on roles r_3  (cost=9.06..13.08 rows=1 width=0) (actual time=0.010..0.010 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = current_setting('lx.uid'::text)))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=9.06..9.06 rows=1 width=0) (actual time=0.010..0.010 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.002..0.002 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.008..0.008 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                     ->  Nested Loop  (cost=100.84..615.23 rows=2696 width=19) (actual time=0.019..0.140 rows=698 loops=1)
+                           ->  Nested Loop  (cost=100.41..323.84 rows=270 width=16) (actual time=0.015..0.039 rows=70 loops=1)
+                                 ->  HashAggregate  (cost=100.12..100.39 rows=27 width=4) (actual time=0.009..0.010 rows=7 loops=1)
+                                       Group Key: (r.scope_id)::bigint
+                                       Batches: 1  Memory Usage: 24kB
+                                       ->  Bitmap Heap Scan on roles r  (cost=4.50..100.05 rows=27 width=4) (actual time=0.005..0.007 rows=8 loops=1)
+                                             Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                                             Filter: (((role)::text = ANY ('{editor,viewer}'::text[])) AND ((scope_table)::text = 'lx.projects'::text))
+                                             Rows Removed by Filter: 3
+                                             Heap Blocks: exact=2
+                                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.002..0.002 rows=11 loops=1)
+                                                   Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                                 ->  Index Scan using tasks_project_id_idx on tasks t  (cost=0.30..8.18 rows=10 width=16) (actual time=0.003..0.004 rows=10 loops=7)
+                                       Index Cond: (project_id = (r.scope_id)::bigint)
+                           ->  Index Scan using comments_task_id_idx on comments c_1  (cost=0.42..0.98 rows=10 width=19) (actual time=0.001..0.001 rows=10 loops=70)
+                                 Index Cond: (task_id = t.id)
+ Planning Time: 0.625 ms
+ Execution Time: 0.308 ms
+(57 rows)
+
+---- v_2chain_or as alice
+                                                                   QUERY PLAN                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=36328.47..36328.48 rows=1 width=16) (actual time=116.975..116.977 rows=1 loops=1)
+   ->  Hash Left Join  (cost=2986.00..25078.47 rows=750000 width=19) (actual time=7.622..116.955 rows=718 loops=1)
+         Hash Cond: (c.task_id = t.id)
+         Filter: ((ANY (t.project_id = (hashed SubPlan 2).col1)) OR (ANY (c.task_id = (hashed SubPlan 4).col1)))
+         Rows Removed by Filter: 999282
+         ->  Seq Scan on comments c  (cost=0.00..18334.00 rows=1000000 width=19) (actual time=0.003..23.598 rows=1000000 loops=1)
+         ->  Hash  (cost=1736.00..1736.00 rows=100000 width=16) (actual time=7.387..7.387 rows=100000 loops=1)
+               Buckets: 131072  Batches: 1  Memory Usage: 5712kB
+               ->  Seq Scan on tasks t  (cost=0.00..1736.00 rows=100000 width=16) (actual time=0.001..3.715 rows=100000 loops=1)
+         SubPlan 2
+           ->  Bitmap Heap Scan on roles r  (cost=4.50..100.18 rows=27 width=8) (actual time=0.005..0.007 rows=8 loops=1)
+                 Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                 Filter: (((role)::text = ANY ('{editor,viewer}'::text[])) AND ((scope_table)::text = 'lx.projects'::text))
+                 Rows Removed by Filter: 3
+                 Heap Blocks: exact=2
+                 ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.003..0.003 rows=11 loops=1)
+                       Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+         SubPlan 4
+           ->  Bitmap Heap Scan on roles r_1  (cost=9.06..13.09 rows=1 width=8) (actual time=0.006..0.007 rows=3 loops=1)
+                 Recheck Cond: (((role)::text = 'assignee'::text) AND ((user_id)::text = current_setting('lx.uid'::text)))
+                 Filter: ((scope_table)::text = 'lx.tasks'::text)
+                 Heap Blocks: exact=1
+                 ->  BitmapAnd  (cost=9.06..9.06 rows=1 width=0) (actual time=0.005..0.005 rows=0 loops=1)
+                       ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.003..0.003 rows=3 loops=1)
+                             Index Cond: ((role)::text = 'assignee'::text)
+                       ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.002..0.002 rows=11 loops=1)
+                             Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+ Planning Time: 0.094 ms
+ Execution Time: 117.013 ms
+(29 rows)
+
+---- v_2chain_union as alice
+                                                                              QUERY PLAN                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=794.70..794.71 rows=1 width=16) (actual time=0.211..0.211 rows=1 loops=1)
+   ->  Append  (cost=100.84..781.17 rows=2706 width=11) (actual time=0.019..0.197 rows=718 loops=1)
+         ->  Subquery Scan on "*SELECT* 1"  (cost=100.84..642.19 rows=2696 width=11) (actual time=0.018..0.138 rows=698 loops=1)
+               ->  Nested Loop  (cost=100.84..615.23 rows=2696 width=19) (actual time=0.018..0.118 rows=698 loops=1)
+                     ->  Nested Loop  (cost=100.41..323.84 rows=270 width=8) (actual time=0.015..0.032 rows=70 loops=1)
+                           ->  HashAggregate  (cost=100.12..100.39 rows=27 width=4) (actual time=0.013..0.013 rows=7 loops=1)
+                                 Group Key: (r.scope_id)::bigint
+                                 Batches: 1  Memory Usage: 24kB
+                                 ->  Bitmap Heap Scan on roles r  (cost=4.50..100.05 rows=27 width=4) (actual time=0.009..0.011 rows=8 loops=1)
+                                       Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                                       Filter: (((role)::text = ANY ('{editor,viewer}'::text[])) AND ((scope_table)::text = 'lx.projects'::text))
+                                       Rows Removed by Filter: 3
+                                       Heap Blocks: exact=2
+                                       ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.006..0.006 rows=11 loops=1)
+                                             Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                           ->  Index Scan using tasks_project_id_idx on tasks t  (cost=0.30..8.18 rows=10 width=16) (actual time=0.002..0.002 rows=10 loops=7)
+                                 Index Cond: (project_id = (r.scope_id)::bigint)
+                     ->  Index Scan using comments_task_id_idx on comments c  (cost=0.42..0.98 rows=10 width=19) (actual time=0.001..0.001 rows=10 loops=70)
+                           Index Cond: (task_id = t.id)
+         ->  Subquery Scan on "*SELECT* 2"  (cost=113.99..125.45 rows=10 width=11) (actual time=0.018..0.040 rows=20 loops=1)
+               ->  Nested Loop Left Join  (cost=113.99..125.35 rows=10 width=19) (actual time=0.018..0.039 rows=20 loops=1)
+                     Filter: ((t_1.project_id = ANY ((InitPlan 1).col1)) IS NOT TRUE)
+                     Rows Removed by Filter: 10
+                     InitPlan 1
+                       ->  Bitmap Heap Scan on roles r_2  (cost=4.50..100.18 rows=27 width=8) (actual time=0.003..0.004 rows=8 loops=1)
+                             Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                             Filter: (((role)::text = ANY ('{editor,viewer}'::text[])) AND ((scope_table)::text = 'lx.projects'::text))
+                             Rows Removed by Filter: 3
+                             Heap Blocks: exact=2
+                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.002..0.002 rows=11 loops=1)
+                                   Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                     ->  Nested Loop  (cost=13.52..21.80 rows=10 width=19) (actual time=0.011..0.019 rows=30 loops=1)
+                           ->  HashAggregate  (cost=13.09..13.10 rows=1 width=4) (actual time=0.007..0.007 rows=3 loops=1)
+                                 Group Key: (r_1.scope_id)::bigint
+                                 Batches: 1  Memory Usage: 24kB
+                                 ->  Bitmap Heap Scan on roles r_1  (cost=9.06..13.08 rows=1 width=4) (actual time=0.006..0.007 rows=3 loops=1)
+                                       Recheck Cond: (((role)::text = 'assignee'::text) AND ((user_id)::text = current_setting('lx.uid'::text)))
+                                       Filter: ((scope_table)::text = 'lx.tasks'::text)
+                                       Heap Blocks: exact=1
+                                       ->  BitmapAnd  (cost=9.06..9.06 rows=1 width=0) (actual time=0.005..0.005 rows=0 loops=1)
+                                             ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.003..0.003 rows=3 loops=1)
+                                                   Index Cond: ((role)::text = 'assignee'::text)
+                                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.002..0.002 rows=11 loops=1)
+                                                   Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                           ->  Index Scan using comments_task_id_idx on comments c_1  (cost=0.43..8.60 rows=10 width=19) (actual time=0.003..0.003 rows=10 loops=3)
+                                 Index Cond: (task_id = (r_1.scope_id)::bigint)
+                     ->  Index Scan using tasks_pkey on tasks t_1  (cost=0.29..0.31 rows=1 width=16) (actual time=0.000..0.000 rows=1 loops=30)
+                           Index Cond: (id = c_1.task_id)
+ Planning Time: 0.208 ms
+ Execution Time: 0.235 ms
+(50 rows)
+
+---- v_2chain_union as alice, leakproof PK qual
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Append  (cost=5.22..247.34 rows=2 width=19) (actual time=0.033..0.033 rows=0 loops=1)
+   ->  Nested Loop Semi Join  (cost=5.22..117.27 rows=1 width=19) (actual time=0.019..0.019 rows=0 loops=1)
+         Join Filter: (t.project_id = (r.scope_id)::bigint)
+         Rows Removed by Join Filter: 8
+         ->  Nested Loop  (cost=0.72..16.75 rows=1 width=27) (actual time=0.012..0.012 rows=1 loops=1)
+               ->  Index Scan using comments_pkey on comments c  (cost=0.42..8.44 rows=1 width=27) (actual time=0.010..0.010 rows=1 loops=1)
+                     Index Cond: (id = 165)
+               ->  Index Scan using tasks_pkey on tasks t  (cost=0.29..8.31 rows=1 width=16) (actual time=0.001..0.001 rows=1 loops=1)
+                     Index Cond: (id = c.task_id)
+         ->  Bitmap Heap Scan on roles r  (cost=4.50..100.05 rows=27 width=4) (actual time=0.005..0.006 rows=8 loops=1)
+               Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+               Filter: (((role)::text = ANY ('{editor,viewer}'::text[])) AND ((scope_table)::text = 'lx.projects'::text))
+               Rows Removed by Filter: 3
+               Heap Blocks: exact=2
+               ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.003..0.003 rows=11 loops=1)
+                     Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+   ->  Nested Loop Semi Join  (cost=109.96..130.06 rows=1 width=19) (actual time=0.013..0.013 rows=0 loops=1)
+         Join Filter: (c_1.task_id = (r_1.scope_id)::bigint)
+         Rows Removed by Join Filter: 3
+         InitPlan 1
+           ->  Bitmap Heap Scan on roles r_2  (cost=4.50..100.18 rows=27 width=8) (actual time=0.003..0.004 rows=8 loops=1)
+                 Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                 Filter: (((role)::text = ANY ('{editor,viewer}'::text[])) AND ((scope_table)::text = 'lx.projects'::text))
+                 Rows Removed by Filter: 3
+                 Heap Blocks: exact=2
+                 ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.002..0.002 rows=11 loops=1)
+                       Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+         ->  Nested Loop Left Join  (cost=0.72..16.78 rows=1 width=27) (actual time=0.007..0.007 rows=1 loops=1)
+               Filter: ((t_1.project_id = ANY ((InitPlan 1).col1)) IS NOT TRUE)
+               ->  Index Scan using comments_pkey on comments c_1  (cost=0.42..8.44 rows=1 width=27) (actual time=0.001..0.001 rows=1 loops=1)
+                     Index Cond: (id = 165)
+               ->  Index Scan using tasks_pkey on tasks t_1  (cost=0.29..8.31 rows=1 width=16) (actual time=0.001..0.001 rows=1 loops=1)
+                     Index Cond: (id = c_1.task_id)
+         ->  Bitmap Heap Scan on roles r_1  (cost=9.06..13.08 rows=1 width=4) (actual time=0.005..0.006 rows=3 loops=1)
+               Recheck Cond: (((role)::text = 'assignee'::text) AND ((user_id)::text = current_setting('lx.uid'::text)))
+               Filter: ((scope_table)::text = 'lx.tasks'::text)
+               Heap Blocks: exact=1
+               ->  BitmapAnd  (cost=9.06..9.06 rows=1 width=0) (actual time=0.005..0.005 rows=0 loops=1)
+                     ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.002..0.002 rows=3 loops=1)
+                           Index Cond: ((role)::text = 'assignee'::text)
+                     ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.50 rows=27 width=0) (actual time=0.003..0.003 rows=11 loops=1)
+                           Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+ Planning Time: 0.219 ms
+ Execution Time: 0.048 ms
+(44 rows)
+
+---- v_or_union as root
+                                                                            QUERY PLAN                                                                            
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=38519.76..38519.77 rows=1 width=16) (actual time=130.765..130.767 rows=1 loops=1)
+   ->  Append  (cost=12.93..33517.27 rows=1000499 width=11) (actual time=0.011..111.835 rows=1000000 loops=1)
+         ->  Subquery Scan on "*SELECT* 1"  (cost=12.93..28346.93 rows=1000000 width=11) (actual time=0.011..84.288 rows=1000000 loops=1)
+               ->  Result  (cost=12.93..18346.93 rows=1000000 width=19) (actual time=0.011..54.792 rows=1000000 loops=1)
+                     One-Time Filter: (InitPlan 2).col1
+                     InitPlan 2
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.008..0.009 rows=1 loops=1)
+                             InitPlan 1
+                               ->  Bitmap Heap Scan on roles r_1  (cost=8.90..12.92 rows=1 width=0) (actual time=0.008..0.009 rows=1 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = current_setting('lx.uid'::text)))
+                                     Filter: (scope_table IS NULL)
+                                     Heap Blocks: exact=1
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.007..0.007 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.002..0.002 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.005..0.005 rows=1 loops=1)
+                                                 Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                     ->  Seq Scan on comments c  (cost=0.00..18334.00 rows=1000000 width=11) (actual time=0.002..20.432 rows=1000000 loops=1)
+         ->  Subquery Scan on "*SELECT* 2"  (cost=60.47..167.85 rows=499 width=32) (actual time=0.024..0.025 rows=0 loops=1)
+               ->  Result  (cost=60.47..162.86 rows=499 width=40) (actual time=0.024..0.025 rows=0 loops=1)
+                     One-Time Filter: (NOT (InitPlan 5).col1)
+                     InitPlan 3
+                       ->  Bitmap Heap Scan on roles r_2  (cost=4.33..23.41 rows=3 width=8) (never executed)
+                             Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                             Filter: (((role)::text = 'editor'::text) AND ((scope_table)::text = 'lx.projects'::text))
+                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (never executed)
+                                   Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                     InitPlan 5
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.022..0.022 rows=1 loops=1)
+                             InitPlan 4
+                               ->  Bitmap Heap Scan on roles r_3  (cost=8.90..12.92 rows=1 width=0) (actual time=0.022..0.022 rows=1 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = current_setting('lx.uid'::text)))
+                                     Filter: (scope_table IS NULL)
+                                     Heap Blocks: exact=1
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.017..0.017 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.011..0.011 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.006..0.006 rows=1 loops=1)
+                                                 Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                     ->  Nested Loop  (cost=24.13..120.28 rows=499 width=19) (never executed)
+                           ->  Nested Loop  (cost=23.71..66.32 rows=50 width=16) (never executed)
+                                 ->  HashAggregate  (cost=23.41..23.46 rows=5 width=4) (never executed)
+                                       Group Key: (r.scope_id)::bigint
+                                       ->  Bitmap Heap Scan on roles r  (cost=4.33..23.40 rows=5 width=4) (never executed)
+                                             Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                                             Filter: (((role)::text = ANY ('{editor,viewer}'::text[])) AND ((scope_table)::text = 'lx.projects'::text))
+                                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (never executed)
+                                                   Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                                 ->  Index Scan using tasks_project_id_idx on tasks t  (cost=0.30..8.47 rows=10 width=16) (never executed)
+                                       Index Cond: (project_id = (r.scope_id)::bigint)
+                           ->  Index Scan using comments_task_id_idx on comments c_1  (cost=0.42..0.98 rows=10 width=19) (never executed)
+                                 Index Cond: (task_id = t.id)
+ Planning Time: 0.113 ms
+ Execution Time: 130.787 ms
+(54 rows)
+
+---- D v_exists_case as bigshot (EXISTS per column at 200k rows)
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=108578786.97..108578786.98 rows=1 width=24) (actual time=45.311..45.312 rows=1 loops=1)
+   ->  Nested Loop  (cost=1181.62..108575156.28 rows=207468 width=80) (actual time=0.872..41.287 rows=200000 loops=1)
+         ->  Hash Join  (cost=1181.20..3482.19 rows=20747 width=16) (actual time=0.487..6.293 rows=20000 loops=1)
+               Hash Cond: (t.project_id = (r.scope_id)::bigint)
+               ->  Seq Scan on tasks t  (cost=0.00..1736.00 rows=100000 width=16) (actual time=0.002..2.078 rows=100000 loops=1)
+               ->  Hash  (cost=1157.55..1157.55 rows=1892 width=4) (actual time=0.483..0.483 rows=2000 loops=1)
+                     Buckets: 2048  Batches: 1  Memory Usage: 89kB
+                     ->  HashAggregate  (cost=1138.63..1157.55 rows=1892 width=4) (actual time=0.328..0.399 rows=2000 loops=1)
+                           Group Key: (r.scope_id)::bigint
+                           Batches: 1  Memory Usage: 241kB
+                           ->  Bitmap Heap Scan on roles r  (cost=40.40..1133.43 rows=2078 width=4) (actual time=0.025..0.215 rows=2000 loops=1)
+                                 Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                                 Filter: (((role)::text = ANY ('{editor,viewer}'::text[])) AND ((scope_table)::text = 'lx.projects'::text))
+                                 Heap Blocks: exact=19
+                                 ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.88 rows=2078 width=0) (actual time=0.021..0.021 rows=2000 loops=1)
+                                       Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+         ->  Index Scan using comments_task_id_idx on comments c  (cost=0.42..0.98 rows=10 width=30) (actual time=0.001..0.001 rows=10 loops=20000)
+               Index Cond: (task_id = t.id)
+         SubPlan 2
+           ->  Bitmap Heap Scan on roles r_1  (cost=40.15..1138.48 rows=1061 width=8) (actual time=0.021..0.177 rows=2000 loops=1)
+                 Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                 Filter: (((role)::text = 'editor'::text) AND ((scope_table)::text = 'lx.projects'::text))
+                 Heap Blocks: exact=19
+                 ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.88 rows=2078 width=0) (actual time=0.018..0.018 rows=2000 loops=1)
+                       Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+         SubPlan 4
+           ->  Bitmap Heap Scan on roles r_2  (cost=40.13..1138.25 rows=1017 width=8) (actual time=0.101..0.101 rows=0 loops=1)
+                 Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                 Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::text = 'lx.projects'::text))
+                 Rows Removed by Filter: 2000
+                 Heap Blocks: exact=19
+                 ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.88 rows=2078 width=0) (actual time=0.017..0.018 rows=2000 loops=1)
+                       Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+ Planning Time: 0.161 ms
+ Execution Time: 45.343 ms
+(35 rows)
+
+---- C v_semi as bigshot (same aggregate, for comparison)
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=36966.48..36966.49 rows=1 width=24) (actual time=424.313..424.314 rows=1 loops=1)
+   ->  Nested Loop  (cost=3458.36..33335.79 rows=207468 width=80) (actual time=0.768..420.343 rows=200000 loops=1)
+         InitPlan 1
+           ->  Bitmap Heap Scan on roles r_1  (cost=40.15..1138.48 rows=1061 width=8) (actual time=0.019..0.156 rows=2000 loops=1)
+                 Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                 Filter: (((role)::text = 'editor'::text) AND ((scope_table)::text = 'lx.projects'::text))
+                 Heap Blocks: exact=19
+                 ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.88 rows=2078 width=0) (actual time=0.017..0.017 rows=2000 loops=1)
+                       Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+         InitPlan 2
+           ->  Bitmap Heap Scan on roles r_2  (cost=40.13..1138.25 rows=1017 width=8) (actual time=0.107..0.107 rows=0 loops=1)
+                 Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                 Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::text = 'lx.projects'::text))
+                 Rows Removed by Filter: 2000
+                 Heap Blocks: exact=19
+                 ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.88 rows=2078 width=0) (actual time=0.019..0.019 rows=2000 loops=1)
+                       Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+         ->  Hash Join  (cost=1181.20..3482.19 rows=20747 width=16) (actual time=0.458..6.255 rows=20000 loops=1)
+               Hash Cond: (t.project_id = (r.scope_id)::bigint)
+               ->  Seq Scan on tasks t  (cost=0.00..1736.00 rows=100000 width=16) (actual time=0.001..2.052 rows=100000 loops=1)
+               ->  Hash  (cost=1157.55..1157.55 rows=1892 width=4) (actual time=0.456..0.456 rows=2000 loops=1)
+                     Buckets: 2048  Batches: 1  Memory Usage: 89kB
+                     ->  HashAggregate  (cost=1138.63..1157.55 rows=1892 width=4) (actual time=0.307..0.376 rows=2000 loops=1)
+                           Group Key: (r.scope_id)::bigint
+                           Batches: 1  Memory Usage: 241kB
+                           ->  Bitmap Heap Scan on roles r  (cost=40.40..1133.43 rows=2078 width=4) (actual time=0.022..0.196 rows=2000 loops=1)
+                                 Recheck Cond: ((user_id)::text = current_setting('lx.uid'::text))
+                                 Filter: (((role)::text = ANY ('{editor,viewer}'::text[])) AND ((scope_table)::text = 'lx.projects'::text))
+                                 Heap Blocks: exact=19
+                                 ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.88 rows=2078 width=0) (actual time=0.019..0.019 rows=2000 loops=1)
+                                       Index Cond: ((user_id)::text = current_setting('lx.uid'::text))
+         ->  Index Scan using comments_task_id_idx on comments c  (cost=0.42..0.98 rows=10 width=30) (actual time=0.000..0.001 rows=10 loops=20000)
+               Index Cond: (task_id = t.id)
+ Planning Time: 0.115 ms
+ Execution Time: 424.334 ms
+(35 rows)
+

@@ -61,6 +61,10 @@ INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
 SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
     'public.projects', ARRAY['task_id'], NULL);
+WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.comments (task_id);
+WARNING:  letter.grant: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.tasks (project_id);
  grant 
 -------
  t
@@ -166,6 +170,10 @@ SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
 
 SELECT letter.grant('select', 'public.comments', 'ev''il; DROP TABLE users;--',
     ARRAY['body'], 'public.projects', ARRAY['task_id'], NULL);
+WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.comments (task_id);
+WARNING:  letter.grant: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.tasks (project_id);
  grant 
 -------
  t

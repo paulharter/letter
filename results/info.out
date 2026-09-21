@@ -55,6 +55,8 @@ SELECT letter.grant('insert', 'public.projects', 'admin', ARRAY['*'], '', NULL, 
 (1 row)
 
 SELECT letter.grant('select', 'public.team_members', 'editor', ARRAY['*'], 'public.projects', NULL, NULL);
+WARNING:  letter.grant: scope path column "project_id" on public.team_members has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.team_members (project_id);
  grant 
 -------
  t

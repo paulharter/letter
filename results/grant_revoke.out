@@ -140,6 +140,8 @@ CREATE TABLE scope_child (
 -- valid: parent_id is an FK
 SELECT letter.grant('select', 'public.scope_child', 'r', ARRAY['plain_col'],
     'public.scope_parent', ARRAY['parent_id'], NULL);
+WARNING:  letter.grant: scope path column "parent_id" on public.scope_child has no index — reads scoped through it will scan the whole table
+HINT:  CREATE INDEX ON public.scope_child (parent_id);
  grant 
 -------
  t

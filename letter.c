@@ -5,11 +5,14 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/uuid.h"
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "utils/datum.h"
@@ -89,7 +92,7 @@ static char *spi_query_text(const char *sql);
 static void install_enforcement_triggers(const char *qualified_table);
 static void maybe_remove_enforcement_triggers(const char *qualified_table);
 static void validate_scope_path(const char *on_table_qualified, const char *scope_qualified,
-								ArrayType *using_path_arr);
+								ArrayType *using_path_arr, bool warn_unindexed);
 static ScopePathResult walk_scope_path(const char *schema_name, const char *table_name,
 									   const char *scope_qualified, const char *using_path_str,
 									   HeapTuple tuple, TupleDesc tupdesc, char **scope_id_out);
@@ -168,7 +171,8 @@ letter_grant(PG_FUNCTION_ARGS)
 	 * the scope table. Skipped silently if the on_table doesn't exist
 	 * yet (grants may be declared before the table is created). */
 	validate_scope_path(text_to_cstring(on_table), text_to_cstring(scope),
-						using_path_null ? NULL : using_path);
+						using_path_null ? NULL : using_path,
+						strcmp(text_to_cstring(privilege), "select") == 0);
 
 	for (i = 0; i < col_count; i++)
 	{
@@ -551,6 +555,50 @@ lookup_pk_column(const char *schema_name, const char *table_name,
 }
 
 /* ----------------------------------------------------------------
+ * Helper: warn if a scope path column has no usable index.
+ *
+ * Reads are driven from the user's scopes *down* the FK chain
+ * (plan/16-scope-resolution-direction.md §3.4), which needs a btree
+ * whose leading column is the referencing FK column. PostgreSQL only
+ * indexes the referenced side automatically. A missing index is a
+ * performance problem, never a correctness one, so this warns and
+ * the grant still succeeds.
+ * Must be called within an SPI connection.
+ * ---------------------------------------------------------------- */
+static void
+warn_if_unindexed(const char *schema_name, const char *table_name, const char *col_name)
+{
+	Oid			argtypes[3] = {TEXTOID, TEXTOID, TEXTOID};
+	Datum		values[3];
+	int			ret;
+
+	values[0] = CStringGetTextDatum(schema_name);
+	values[1] = CStringGetTextDatum(table_name);
+	values[2] = CStringGetTextDatum(col_name);
+	ret = SPI_execute_with_args(
+		"SELECT 1 FROM pg_index i "
+		"JOIN pg_class t ON t.oid = i.indrelid "
+		"JOIN pg_namespace n ON n.oid = t.relnamespace "
+		"JOIN pg_class ic ON ic.oid = i.indexrelid "
+		"JOIN pg_am am ON am.oid = ic.relam "
+		"JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0] "
+		"WHERE n.nspname = $1 AND t.relname = $2 AND a.attname = $3 "
+		"AND am.amname = 'btree' AND i.indisvalid AND i.indpred IS NULL "
+		"LIMIT 1",
+		3, argtypes, values, NULL, true, 1);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "letter: index lookup failed on %s.%s", schema_name, table_name);
+
+	if (SPI_processed == 0)
+		ereport(WARNING,
+				(errmsg("letter.grant: scope path column \"%s\" on %s.%s has no index — reads scoped through it will scan the whole table",
+						col_name, schema_name, table_name),
+				 errhint("CREATE INDEX ON %s.%s (%s);",
+						 quote_identifier(schema_name), quote_identifier(table_name),
+						 quote_identifier(col_name))));
+}
+
+/* ----------------------------------------------------------------
  * Helper: validate a grant's scope path at grant time.
  *
  * Every hop in using_path must be an FK, and the chain must land on
@@ -558,6 +606,9 @@ lookup_pk_column(const char *schema_name, const char *table_name,
  * it) or via exactly one inferable final FK. A grant whose scope
  * could never resolve fails loudly here, not silently at
  * enforcement time (plan/13-multihop-issues.md).
+ *
+ * For select grants (warn_unindexed) it also warns about path columns
+ * with no index — see warn_if_unindexed.
  *
  * Silently skips what cannot be checked yet: the protected table or
  * scope table not existing (grants may be declared before their
@@ -567,7 +618,7 @@ lookup_pk_column(const char *schema_name, const char *table_name,
  * ---------------------------------------------------------------- */
 static void
 validate_scope_path(const char *on_table_qualified, const char *scope_qualified,
-					ArrayType *using_path_arr)
+					ArrayType *using_path_arr, bool warn_unindexed)
 {
 	char		   *schema_name;
 	char		   *table_name;
@@ -616,6 +667,9 @@ validate_scope_path(const char *on_table_qualified, const char *scope_qualified,
 				 "letter.grant: using_path column \"%s\" is not a foreign key on %s.%s",
 				 col_name, schema_name, table_name);
 
+		if (warn_unindexed)
+			warn_if_unindexed(schema_name, table_name, col_name);
+
 		/* Advance to the target table for the next hop */
 		split_table_name(target, &schema_name, &table_name);
 	}
@@ -630,8 +684,9 @@ validate_scope_path(const char *on_table_qualified, const char *scope_qualified,
 
 	{
 		int		nfks = 0;
+		char   *fk_col;
 
-		(void) lookup_fk_to_table(schema_name, table_name, scope_schema, scope_name, &nfks);
+		fk_col = lookup_fk_to_table(schema_name, table_name, scope_schema, scope_name, &nfks);
 
 		if (nfks == 0)
 			ereport(ERROR,
@@ -643,6 +698,9 @@ validate_scope_path(const char *on_table_qualified, const char *scope_qualified,
 					(errcode(ERRCODE_AMBIGUOUS_COLUMN),
 					 errmsg("letter.grant: %s.%s has more than one foreign key to scope \"%s\" — extend using_path to name the final hop column",
 							schema_name, table_name, scope_qualified)));
+
+		if (warn_unindexed)
+			warn_if_unindexed(schema_name, table_name, fk_col);
 	}
 }
 
@@ -1503,71 +1561,375 @@ tuple_column_text(HeapTuple tuple, TupleDesc tupdesc,
 }
 
 /* ----------------------------------------------------------------
- * Helper: fetch one column of one row as text, by primary key.
- * Returns false if the row doesn't exist or the column is NULL.
- * Must be called within an SPI connection.
+ * Compiled scope paths (plan/16-scope-resolution-direction.md §6).
+ *
+ * Resolving a grant's scope path needs catalog lookups (which table
+ * does each FK hop land on, what is its primary key) and one row
+ * fetch per hop after the first. The catalog work is identical for
+ * every row, so each distinct (table, scope, using_path) is compiled
+ * once per backend into a list of hops, each carrying a saved SPI
+ * plan for its fetch. Compiled paths are dropped wholesale on any
+ * relcache invalidation (an FK or PK along a path may have changed);
+ * the flush is deferred to the next lookup so a path is never freed
+ * while a walk is using it.
  * ---------------------------------------------------------------- */
-static bool
-fetch_row_column(const char *schema_name, const char *table_name,
-				 const char *col_name, const char *key, char **value_out)
+
+typedef struct ScopePathHop
 {
-	char	   *pk_col;
-	char	   *pk_type;
-	StringInfoData buf;
-	Oid			argtypes[1] = {TEXTOID};
-	Datum		values[1];
-	int			ret;
-	char	   *val;
+	char	   *schema_name;	/* table this hop's column lives on */
+	char	   *table_name;
+	char	   *col_name;		/* column holding the next key (or the scope id) */
+	SPIPlanPtr	plan;			/* fetch col by PK; NULL for hop 0 (read from the tuple) */
+} ScopePathHop;
 
-	if (!lookup_pk_column(schema_name, table_name, &pk_col, &pk_type))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("letter: no primary key on %s.%s — required for scope path resolution",
-						schema_name, table_name)));
+#define SCOPE_PATH_KEY_LEN	768
 
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-		"SELECT %s::text FROM %s.%s WHERE %s = CAST($1 AS %s)",
-		quote_identifier(col_name),
-		quote_identifier(schema_name), quote_identifier(table_name),
-		quote_identifier(pk_col), pk_type);
+typedef struct CompiledScopePath
+{
+	char		key[SCOPE_PATH_KEY_LEN];	/* hash key: "schema.table|scope|using_path" */
+	int			id;				/* stable within a flush generation; memo key */
+	int			nhops;
+	ScopePathHop *hops;
+} CompiledScopePath;
 
-	values[0] = CStringGetTextDatum(key);
-	ret = SPI_execute_with_args(buf.data, 1, argtypes, values, NULL, true, 1);
-	pfree(buf.data);
-	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "letter: scope path lookup failed on %s.%s", schema_name, table_name);
+static MemoryContext scope_path_cxt = NULL;
+static HTAB *scope_path_hash = NULL;
+static int	scope_path_next_id = 0;
+static bool scope_path_stale = false;
+static int	scope_walk_depth = 0;
+static bool scope_path_callbacks_registered = false;
 
-	if (SPI_processed == 0)
-		return false;
+/* ----------------------------------------------------------------
+ * Statement-local memo: (compiled path, first-hop key) -> scope id.
+ *
+ * A bulk write touches few distinct parents, and several grants
+ * usually share a path, so the same chain is otherwise re-walked
+ * many times per statement. Safe because the walker's fetches run
+ * read-only under the statement's snapshot — blind to the
+ * statement's own writes — so within one command id a given chain
+ * always resolves the same way. The memo is discarded whenever the
+ * command id changes and at (sub)transaction end.
+ * ---------------------------------------------------------------- */
 
-	val = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-	if (val == NULL)
-		return false;
+#define SCOPE_MEMO_KEY_LEN		300
+#define SCOPE_MEMO_MAX_ENTRIES	8192
 
-	*value_out = pstrdup(val);
-	return true;
+typedef struct ScopeMemoEntry
+{
+	char		key[SCOPE_MEMO_KEY_LEN];	/* "<path id>|<first-hop key>" */
+	bool		resolved;
+	char	   *scope_id;		/* in scope_memo_cxt; NULL unless resolved */
+} ScopeMemoEntry;
+
+static MemoryContext scope_memo_cxt = NULL;
+static HTAB *scope_memo_hash = NULL;
+static CommandId scope_memo_cid = InvalidCommandId;
+
+static void
+scope_memo_reset(void)
+{
+	if (scope_memo_cxt != NULL)
+		MemoryContextReset(scope_memo_cxt);
+	scope_memo_hash = NULL;
+	scope_memo_cid = InvalidCommandId;
+}
+
+static void
+scope_memo_xact_callback(XactEvent event, void *arg)
+{
+	scope_memo_reset();
+}
+
+static void
+scope_memo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+							SubTransactionId parentSubid, void *arg)
+{
+	scope_memo_reset();
+}
+
+static void
+scope_path_relcache_callback(Datum arg, Oid relid)
+{
+	scope_path_stale = true;
+}
+
+/* The memo table for the current statement, created on demand. */
+static HTAB *
+scope_memo_table(void)
+{
+	CommandId	cid = GetCurrentCommandId(false);
+
+	if (scope_memo_hash != NULL &&
+		(scope_memo_cid != cid ||
+		 hash_get_num_entries(scope_memo_hash) >= SCOPE_MEMO_MAX_ENTRIES))
+		scope_memo_reset();
+
+	if (scope_memo_hash == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (scope_memo_cxt == NULL)
+			scope_memo_cxt = AllocSetContextCreate(TopMemoryContext,
+												   "letter scope memo",
+												   ALLOCSET_DEFAULT_SIZES);
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = SCOPE_MEMO_KEY_LEN;
+		ctl.entrysize = sizeof(ScopeMemoEntry);
+		ctl.hcxt = scope_memo_cxt;
+		scope_memo_hash = hash_create("letter scope memo", 256, &ctl,
+									  HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+		scope_memo_cid = cid;
+	}
+	return scope_memo_hash;
+}
+
+/* Drop every compiled path and its saved plans. */
+static void
+scope_path_flush(void)
+{
+	if (scope_path_hash != NULL)
+	{
+		HASH_SEQ_STATUS seq;
+		CompiledScopePath *cp;
+
+		hash_seq_init(&seq, scope_path_hash);
+		while ((cp = (CompiledScopePath *) hash_seq_search(&seq)) != NULL)
+		{
+			int			i;
+
+			for (i = 0; i < cp->nhops; i++)
+				if (cp->hops[i].plan != NULL)
+					SPI_freeplan(cp->hops[i].plan);
+		}
+	}
+	if (scope_path_cxt != NULL)
+		MemoryContextReset(scope_path_cxt);
+	scope_path_hash = NULL;
+	scope_path_stale = false;
+
+	/* memo keys embed compiled-path ids */
+	scope_memo_reset();
+}
+
+/* Append a hop to a path under construction (arrays live in scope_path_cxt). */
+static void
+scope_path_add_hop(CompiledScopePath *cp, int *capacity,
+				   const char *schema_name, const char *table_name,
+				   const char *col_name, bool fetched)
+{
+	ScopePathHop *hop;
+
+	if (cp->nhops == *capacity)
+	{
+		*capacity *= 2;
+		cp->hops = repalloc(cp->hops, sizeof(ScopePathHop) * (*capacity));
+	}
+
+	hop = &cp->hops[cp->nhops++];
+	hop->schema_name = MemoryContextStrdup(scope_path_cxt, schema_name);
+	hop->table_name = MemoryContextStrdup(scope_path_cxt, table_name);
+	hop->col_name = MemoryContextStrdup(scope_path_cxt, col_name);
+	hop->plan = NULL;
+
+	if (fetched)
+	{
+		char	   *pk_col;
+		char	   *pk_type;
+		StringInfoData buf;
+		Oid			argtypes[1] = {TEXTOID};
+		SPIPlanPtr	plan;
+
+		if (!lookup_pk_column(schema_name, table_name, &pk_col, &pk_type))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("letter: no primary key on %s.%s — required for scope path resolution",
+							schema_name, table_name)));
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+			"SELECT %s::text FROM %s.%s WHERE %s = CAST($1 AS %s)",
+			quote_identifier(col_name),
+			quote_identifier(schema_name), quote_identifier(table_name),
+			quote_identifier(pk_col), pk_type);
+
+		plan = SPI_prepare(buf.data, 1, argtypes);
+		if (plan == NULL)
+			elog(ERROR, "letter: could not prepare scope path lookup on %s.%s",
+				 schema_name, table_name);
+		if (SPI_keepplan(plan) != 0)
+			elog(ERROR, "letter: could not save scope path lookup plan");
+		hop->plan = plan;
+		pfree(buf.data);
+	}
 }
 
 /* ----------------------------------------------------------------
- * The shared path-walker: resolve a row's scope_id for a grant.
- *
- * This is the single implementation of scope resolution — used
- * today by the write-enforcement triggers and letter.read(), and by
- * the Phase 5 planner hook later. Both must gate identically
- * (plan/15-join-enforcement.md D5); per-hop visibility gating will
- * slot into the hop loop below.
+ * Compile (or fetch the compiled form of) a grant's scope path.
  *
  * using_path_str is the comma-joined FK column chain ('' or NULL
  * for the direct case). The chain may land on the scope table
  * explicitly; otherwise the final hop is inferred, requiring
  * exactly one FK from the last table to the scope table.
  *
- * Misconfiguration (non-FK hop, missing/ambiguous final hop) raises
- * an error — an unresolvable grant must fail loudly, never enforce
- * as unscoped. NULL FK values or missing rows along the chain are
- * data states, not errors: the grant simply does not apply to the
- * row (SCOPE_PATH_NULL → deny, decision D4).
+ * Misconfiguration (non-FK hop, missing/ambiguous final hop, no
+ * primary key on a fetched table) raises an error — an unresolvable
+ * grant must fail loudly, never enforce as unscoped.
+ *
+ * Must be called within an SPI connection.
+ * ---------------------------------------------------------------- */
+static CompiledScopePath *
+get_compiled_scope_path(const char *schema_name, const char *table_name,
+						const char *scope_qualified, const char *using_path_str)
+{
+	char		key[SCOPE_PATH_KEY_LEN];
+	CompiledScopePath *cp;
+	bool		found;
+	bool		have_path = (using_path_str != NULL && using_path_str[0] != '\0');
+	char	   *scope_schema;
+	char	   *scope_name;
+	char	   *cur_schema;
+	char	   *cur_table;
+	int			capacity = 4;
+
+	if (!scope_path_callbacks_registered)
+	{
+		CacheRegisterRelcacheCallback(scope_path_relcache_callback, (Datum) 0);
+		RegisterXactCallback(scope_memo_xact_callback, NULL);
+		RegisterSubXactCallback(scope_memo_subxact_callback, NULL);
+		scope_path_callbacks_registered = true;
+	}
+
+	/* Never free paths out from under a walk in progress. */
+	if (scope_path_stale && scope_walk_depth == 0)
+		scope_path_flush();
+
+	if (scope_path_hash == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (scope_path_cxt == NULL)
+			scope_path_cxt = AllocSetContextCreate(TopMemoryContext,
+												   "letter compiled scope paths",
+												   ALLOCSET_DEFAULT_SIZES);
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = SCOPE_PATH_KEY_LEN;
+		ctl.entrysize = sizeof(CompiledScopePath);
+		ctl.hcxt = scope_path_cxt;
+		scope_path_hash = hash_create("letter compiled scope paths", 64, &ctl,
+									  HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+
+	if (snprintf(key, sizeof(key), "%s.%s|%s|%s", schema_name, table_name,
+				 scope_qualified, have_path ? using_path_str : "") >= (int) sizeof(key))
+		ereport(ERROR,
+				(errcode(ERRCODE_NAME_TOO_LONG),
+				 errmsg("letter: scope path on %s.%s is too long", schema_name, table_name)));
+
+	cp = (CompiledScopePath *) hash_search(scope_path_hash, key, HASH_FIND, NULL);
+	if (cp != NULL)
+		return cp;
+
+	/*
+	 * Compile. Build into a local struct and enter it into the hash only
+	 * once complete, so an error part-way leaves no half-built entry.
+	 */
+	{
+		CompiledScopePath build;
+
+		memset(&build, 0, sizeof(build));
+		build.hops = MemoryContextAlloc(scope_path_cxt, sizeof(ScopePathHop) * capacity);
+
+		split_table_name(scope_qualified, &scope_schema, &scope_name);
+		cur_schema = pstrdup(schema_name);
+		cur_table = pstrdup(table_name);
+
+		if (have_path)
+		{
+			char	   *path = pstrdup(using_path_str);
+			char	   *saveptr = NULL;
+			char	   *col;
+
+			for (col = strtok_r(path, ",", &saveptr); col != NULL;
+				 col = strtok_r(NULL, ",", &saveptr))
+			{
+				char	   *target = lookup_fk_target(cur_schema, cur_table, col);
+
+				if (target == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("letter: using_path column \"%s\" is not a foreign key on %s.%s — the grant's scope path cannot be resolved",
+									col, cur_schema, cur_table)));
+
+				/* First hop is read from the tuple; later hops are fetched. */
+				scope_path_add_hop(&build, &capacity, cur_schema, cur_table, col,
+								   build.nhops > 0);
+				split_table_name(target, &cur_schema, &cur_table);
+			}
+		}
+
+		if (strcmp(cur_schema, scope_schema) == 0 && strcmp(cur_table, scope_name) == 0)
+		{
+			/* The chain landed on the scope table. With no path, the
+			 * protected table IS the scope table: the row's own PK is the
+			 * scope id. */
+			if (!have_path)
+			{
+				char	   *pk_col;
+				char	   *pk_type;
+
+				if (!lookup_pk_column(cur_schema, cur_table, &pk_col, &pk_type))
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("letter: no primary key on %s.%s — required for scope path resolution",
+									cur_schema, cur_table)));
+				scope_path_add_hop(&build, &capacity, cur_schema, cur_table, pk_col, false);
+			}
+		}
+		else
+		{
+			/* Final hop is inferred: exactly one FK from here to the scope table */
+			int			nfks = 0;
+			char	   *fk_col;
+
+			fk_col = lookup_fk_to_table(cur_schema, cur_table, scope_schema, scope_name, &nfks);
+
+			if (nfks == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("letter: no foreign key from %s.%s to scope \"%s\" — the grant's scope path cannot be resolved",
+								cur_schema, cur_table, scope_qualified)));
+			if (nfks > 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_AMBIGUOUS_COLUMN),
+						 errmsg("letter: %s.%s has more than one foreign key to scope \"%s\" — extend the grant's using_path to name the final hop column",
+								cur_schema, cur_table, scope_qualified)));
+
+			scope_path_add_hop(&build, &capacity, cur_schema, cur_table, fk_col,
+							   build.nhops > 0);
+		}
+
+		cp = (CompiledScopePath *) hash_search(scope_path_hash, key, HASH_ENTER, &found);
+		cp->id = scope_path_next_id++;
+		cp->nhops = build.nhops;
+		cp->hops = build.hops;
+	}
+
+	return cp;
+}
+
+/* ----------------------------------------------------------------
+ * The shared path-walker: resolve a row's scope_id for a grant.
+ *
+ * This is the single implementation of scope resolution — used
+ * today by the write-enforcement triggers and letter.read(). Both
+ * must gate identically (plan/15-join-enforcement.md D5); per-hop
+ * visibility gating will slot into the hop loop below. The planner
+ * hook expresses the same walk as joins (plan/16 §3).
+ *
+ * Misconfiguration raises an error (see get_compiled_scope_path).
+ * NULL FK values or missing rows along the chain are data states,
+ * not errors: the grant simply does not apply to the row
+ * (SCOPE_PATH_NULL → deny, decision D4).
  *
  * Must be called within an SPI connection.
  * ---------------------------------------------------------------- */
@@ -1577,116 +1939,94 @@ walk_scope_path(const char *schema_name, const char *table_name,
 				HeapTuple tuple, TupleDesc tupdesc,
 				char **scope_id_out)
 {
-	char	   *scope_schema;
-	char	   *scope_name;
-	char	   *cur_schema = pstrdup(schema_name);
-	char	   *cur_table = pstrdup(table_name);
-	char	   *key = NULL;
-	bool		have_path = (using_path_str != NULL && using_path_str[0] != '\0');
+	CompiledScopePath *cp;
+	ScopeMemoEntry *memo = NULL;
+	char	   *key;
+	int			i;
 
 	*scope_id_out = NULL;
-	split_table_name(scope_qualified, &scope_schema, &scope_name);
 
-	if (have_path)
+	cp = get_compiled_scope_path(schema_name, table_name, scope_qualified, using_path_str);
+
+	/* Hop 0 always comes from the tuple itself. */
+	if (!tuple_column_text(tuple, tupdesc, cp->hops[0].schema_name,
+						   cp->hops[0].table_name, cp->hops[0].col_name, &key))
+		return SCOPE_PATH_NULL;
+
+	if (cp->nhops == 1)
 	{
-		char	   *path = pstrdup(using_path_str);
-		char	   *saveptr = NULL;
-		char	   *col;
-		bool		first = true;
-
-		for (col = strtok_r(path, ",", &saveptr); col != NULL;
-			 col = strtok_r(NULL, ",", &saveptr))
-		{
-			char	   *target;
-			char	   *val;
-
-			/* Read this hop's FK value: from the tuple for the first hop,
-			 * from the previous hop's row after that. */
-			if (first)
-			{
-				if (!tuple_column_text(tuple, tupdesc, cur_schema, cur_table, col, &val))
-					return SCOPE_PATH_NULL;
-				first = false;
-			}
-			else
-			{
-				if (!fetch_row_column(cur_schema, cur_table, col, key, &val))
-					return SCOPE_PATH_NULL;
-			}
-			key = val;
-
-			target = lookup_fk_target(cur_schema, cur_table, col);
-			if (target == NULL)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("letter: using_path column \"%s\" is not a foreign key on %s.%s — the grant's scope path cannot be resolved",
-								col, cur_schema, cur_table)));
-
-			split_table_name(target, &cur_schema, &cur_table);
-		}
-	}
-
-	/* Chain landed on the scope table */
-	if (strcmp(cur_schema, scope_schema) == 0 && strcmp(cur_table, scope_name) == 0)
-	{
-		if (have_path)
-		{
-			*scope_id_out = key;
-			return SCOPE_PATH_RESOLVED;
-		}
-
-		/* The protected table IS the scope table: the row's own PK is
-		 * the scope id. */
-		{
-			char	   *pk_col;
-			char	   *pk_type;
-			char	   *val;
-
-			if (!lookup_pk_column(cur_schema, cur_table, &pk_col, &pk_type))
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("letter: no primary key on %s.%s — required for scope path resolution",
-								cur_schema, cur_table)));
-			if (!tuple_column_text(tuple, tupdesc, cur_schema, cur_table, pk_col, &val))
-				return SCOPE_PATH_NULL;
-			*scope_id_out = val;
-			return SCOPE_PATH_RESOLVED;
-		}
-	}
-
-	/* Final hop is inferred: exactly one FK from here to the scope table */
-	{
-		int			nfks = 0;
-		char	   *fk_col;
-		char	   *val;
-
-		fk_col = lookup_fk_to_table(cur_schema, cur_table, scope_schema, scope_name, &nfks);
-
-		if (nfks == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("letter: no foreign key from %s.%s to scope \"%s\" — the grant's scope path cannot be resolved",
-							cur_schema, cur_table, scope_qualified)));
-		if (nfks > 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_AMBIGUOUS_COLUMN),
-					 errmsg("letter: %s.%s has more than one foreign key to scope \"%s\" — extend the grant's using_path to name the final hop column",
-							cur_schema, cur_table, scope_qualified)));
-
-		if (!have_path)
-		{
-			if (!tuple_column_text(tuple, tupdesc, cur_schema, cur_table, fk_col, &val))
-				return SCOPE_PATH_NULL;
-		}
-		else
-		{
-			if (!fetch_row_column(cur_schema, cur_table, fk_col, key, &val))
-				return SCOPE_PATH_NULL;
-		}
-
-		*scope_id_out = val;
+		*scope_id_out = key;
 		return SCOPE_PATH_RESOLVED;
 	}
+
+	/* Fetched hops follow: consult the statement-local memo first. */
+	{
+		char		memo_key[SCOPE_MEMO_KEY_LEN];
+		bool		found;
+
+		if (snprintf(memo_key, sizeof(memo_key), "%d|%s", cp->id, key) < (int) sizeof(memo_key))
+		{
+			memo = (ScopeMemoEntry *) hash_search(scope_memo_table(), memo_key,
+												  HASH_ENTER, &found);
+			if (found)
+			{
+				if (!memo->resolved)
+					return SCOPE_PATH_NULL;
+				*scope_id_out = pstrdup(memo->scope_id);
+				return SCOPE_PATH_RESOLVED;
+			}
+			/* Until the walk completes, the entry reads as "does not apply". */
+			memo->resolved = false;
+			memo->scope_id = NULL;
+		}
+	}
+
+	scope_walk_depth++;
+	PG_TRY();
+	{
+		for (i = 1; i < cp->nhops; i++)
+		{
+			Datum		values[1];
+			int			ret;
+			char	   *val;
+
+			values[0] = CStringGetTextDatum(key);
+			ret = SPI_execute_plan(cp->hops[i].plan, values, NULL, true, 1);
+			if (ret != SPI_OK_SELECT)
+				elog(ERROR, "letter: scope path lookup failed on %s.%s",
+					 cp->hops[i].schema_name, cp->hops[i].table_name);
+
+			if (SPI_processed == 0)
+			{
+				key = NULL;
+				break;
+			}
+			val = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+			if (val == NULL)
+			{
+				key = NULL;
+				break;
+			}
+			key = pstrdup(val);
+		}
+	}
+	PG_FINALLY();
+	{
+		scope_walk_depth--;
+	}
+	PG_END_TRY();
+
+	if (key == NULL)
+		return SCOPE_PATH_NULL;
+
+	if (memo != NULL)
+	{
+		memo->scope_id = MemoryContextStrdup(scope_memo_cxt, key);
+		memo->resolved = true;
+	}
+
+	*scope_id_out = key;
+	return SCOPE_PATH_RESOLVED;
 }
 
 /* ----------------------------------------------------------------
