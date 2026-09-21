@@ -11,6 +11,12 @@ Reads on from `14-enforcement-gaps.md` §1 (the leak), `09-scope-resolution.md`
 (`using_path`), `10-query-hooks.md` (planner-hook design), `13-multihop-issues.md`
 (multi-hop `using_path`, item 2.4.4). Gates Phase 5.
 
+> **Amended 2026-09-21 by `16-scope-resolution-direction.md`:** open decision 4 is
+> decided (B2 directly, no B1 — `16` §2–§3), decisions 2 and 5 are reframed (`16` §7,
+> §3.3), the scope-index cache is replaced by intermediate-table materialisation
+> (`16` §5), and the sequencing from step 2 onward is superseded (`16` §9). The
+> enforcement model in §2–§8 here is unchanged.
+
 ---
 
 ## 1. The problem, restated
@@ -356,6 +362,10 @@ writability concern and therefore feeds the trigger, per the rule above.
    the current user's grants; a cached plan for user A must never be reused for user B.
    Key the plan cache on the user id or mark these plans non-cacheable. Correctness
    landmine — decide up front. (Also flagged in `14-enforcement-gaps.md`.)
+   **REFRAMED — see `16` §7:** if the rewritten tree reads the user id and the user's
+   scope sets at *execution* time, it contains nothing user-specific and the plan
+   depends only on `letter.grants`. Recommended: generic plans, invalidated on grant
+   changes; the entry criterion becomes "prove nothing user-specific is in the tree".
 3. **`SELECT *` and the `_redacted` companion.** Transparent rewriting can't cleanly append
    a phantom `_redacted` column to arbitrary query shapes. The transparent path likely
    *loses* the NULL-vs-redacted distinction. Options: keep `letter.read()` for callers who
@@ -373,18 +383,26 @@ writability concern and therefore feeds the trigger, per the rule above.
 4. **Scope evaluation build (axis 3): B1 vs B2.** B1 = a C function `letter_visible(...)`
    that resolves scope and checks cached grants — simple, one call per protected column
    per row. B2 = inject FK joins + set-based grant check — planner-optimizable but more
-   generation complexity, must be many-to-one/`EXISTS` to avoid row multiplication. Start
-   B1, optimize to B2; scope-index cache absorbs deep paths.
+   generation complexity, must be many-to-one/`EXISTS` to avoid row multiplication. ~~Start
+   B1, optimize to B2; scope-index cache absorbs deep paths.~~
+   **DECIDED 2026-09-21 — B2 directly (`16` §2–§3).** B1 is O(candidate rows) by
+   construction and opaque to the planner; it cannot meet the criterion that read cost
+   scales with the user's scope set. The generated form is "join up the chain once,
+   expose the scope id, test it in `WHERE` and every `CASE`" — not an `EXISTS` per column.
 5. **`security_barrier` + injected joins can defeat join reordering** (force nested loops).
    So the scope-index cache is not only a "deep paths" optimization — it is also the
    fallback when the planner picks a bad plan. Treat as load-bearing, not optional.
+   **REFRAMED — see `16` §3.3, §5:** the scope predicate sits *inside* the barrier, so
+   the barrier should not stop the planner driving from the scope side; to be verified
+   by the `16` §8 Q1 experiment before any hook code. Pending that, materialisation is
+   an optimisation again, and takes the intermediate-tables-only form of `16` §5.
 
 ---
 
 ## 10. Recommended direction (summary)
 
-- **Option B** (per-table redacting barrier subquery) at `planner_hook`, scope via **B1**
-  function first.
+- **Option B** (per-table redacting barrier subquery) at `planner_hook`, scope via **B2**
+  joins directly (amended 2026-09-21 — was "B1 function first"; see `16` §2–§3).
 - **B + targeted substitution on the write path** (§8): result-relation Vars in quals,
   SET RHS, `RETURNING`, and ON CONFLICT/MERGE conditions get the same redaction
   expression. Write *privileges* stay trigger-enforced — triggers decide writability,
@@ -398,6 +416,11 @@ writability concern and therefore feeds the trigger, per the rule above.
   defensive "fail loud on multi-hop" fix from `13` lands regardless, immediately.
 
 ### Suggested sequencing
+
+> Steps 2–6 below are **superseded by `16` §9** (experiment first, walker performance,
+> FK-index warning, then the hook generating the B2 form directly; materialisation
+> last and only if measured). Kept for the record.
+
 1. ~~Shared scope/visibility path-walker (also unblocks the write-path multi-hop fix). Make
    multi-hop fail loud until this lands.~~ **DONE (2026-07-08)** — `walk_scope_path` in
    `letter.c`, used by triggers and `letter.read()`; real multi-hop, fail-loud validation

@@ -102,6 +102,13 @@ connection, effectively forever. No cross-backend signal (no `pg_notify`, no
 catalog-xmin check). `07-open-questions.md` files this under "mid-session grant changes,
 deferred," which undersells it: it is cross-session and unbounded.
 
+**Partial route to closure (2026-09-21):** the planner-hook read path will read the
+user's scope sets from `letter.roles` inside the rewritten query, under MVCC, not from
+the backend cache (`16-scope-resolution-direction.md` §3.2 rule 3) — so *role*
+staleness closes for reads when Phase 5a lands. Still open: the trigger (write) path,
+and *grant* staleness (the rewrite's shape and the trigger cache both derive from
+`letter.grants`).
+
 ### 4.2 Role changes never invalidate the cache — **FIXED (backend-local, 2026-07-08)**
 Statement-level C triggers (`letter.cache_inval`) on `letter.roles` and
 `letter.grants` invalidate the backend's session cache on any write — including the

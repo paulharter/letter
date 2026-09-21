@@ -10,6 +10,11 @@
 > SPI cost (issue 4) is accepted for the trigger path — the planner hook expresses the
 > same walk as joins, and Phase 4's scope-index cache remains the deep-path fallback.
 > Kept for the analysis record; tests in `test/sql/multihop.sql`.
+>
+> **Update 2026-09-21:** issue 4's cost on the trigger path is now scheduled work, not
+> just accepted — saved plans, compiled paths and a statement-local memo
+> (`16-scope-resolution-direction.md` §6, checklist 2.7). The scope-index fallback is
+> replaced by intermediate-table materialisation (`16` §5).
 
 Analysis of the issues blocking implementation of item 2.4.4 (multi-hop `using_path` resolution). Captured as a record before committing to implementation work. See `09-scope-resolution.md` for the original design, `11-implementation-phases.md` §2.4.4 for the phase status.
 

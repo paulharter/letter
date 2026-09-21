@@ -4,7 +4,9 @@ Single source of truth for implementation status. Each phase has high-level scop
 
 > **Before Phase 5:** see `14-enforcement-gaps.md` for a structural review of enforcement gaps and data-leak vectors. As of 2026-07-08 the foundational holes are closed (bypass is SUSET, trust boundary documented, runtime injection paths parameterized, UPDATE checks OLD+NEW scope, multi-hop resolves for real, backend-local cache invalidation on role/grant writes — tests in `test/sql/hardening.sql` and `test/sql/multihop.sql`). Still open: §1 predicate/join leak (**gates Phase 5**, design in `15-join-enforcement.md`), §4.1 cross-backend cache incoherence, §4.3 stringified read.
 >
-> **Join/predicate enforcement design:** see `15-join-enforcement.md` for the chosen direction — source-redaction via per-table barrier subqueries (Option B), targeted result-relation redaction on the write path (quals, SET RHS, RETURNING, ON CONFLICT/MERGE — §8), per-hop conjunctive gating on transient join steps, and the decision to stay bounded (no recursion / many-to-many). Write privileges remain trigger-enforced: triggers decide writability, the hook decides visibility. Reframes item 2.4.4 (multi-hop) as the prerequisite. D2 is decided: per-hop gating is opt-in via an explicit `enforce_path_visibility` flag on the grant (§7.4). Remaining open decisions: plan-cache keying, `_redacted` under transparent reads.
+> **Join/predicate enforcement design:** see `15-join-enforcement.md` for the chosen direction — source-redaction via per-table barrier subqueries (Option B), targeted result-relation redaction on the write path (quals, SET RHS, RETURNING, ON CONFLICT/MERGE — §8), per-hop conjunctive gating on transient join steps, and the decision to stay bounded (no recursion / many-to-many). Write privileges remain trigger-enforced: triggers decide writability, the hook decides visibility. Reframes item 2.4.4 (multi-hop) as the prerequisite. D2 is decided: per-hop gating is opt-in via an explicit `enforce_path_visibility` flag on the grant (§7.4). Remaining open decisions: plan-cache keying (reframed — `16` §7), `_redacted` under transparent reads.
+>
+> **Scope resolution direction (2026-09-21):** see `16-scope-resolution-direction.md`. Read cost must scale with the user's scope set, not candidate rows → the hook generates B2 joins directly (no B1 function), in the "join up once, test in `WHERE` and every `CASE`" form, reading the user's scopes from `letter.roles` at execution time (generic plans; closes `14` §4.1 for reads). Non-authoritative / per-backend / per-user expansion caches are rejected (stale-allow). Phase 4 is redefined as intermediate-table materialisation. New independent work: walker performance (2.7) and the FK-index warning (1.7). Sequencing: `16` §9 — **the EXPLAIN experiment (5.0) comes before any hook code.**
 
 ## Phase 1: Core Tables and Functions (COMPLETE)
 
@@ -32,6 +34,7 @@ Items that build on the completed Phase 1 but don't require enforcement.
 - [x] **1.4** Add index on `grants(on_table, role)` for enforcement query performance
 - [x] **1.5** Validate in `letter.grant()` that `using_path` FK columns actually exist (query `pg_constraint`) — error at grant time rather than enforcement time. Skipped silently when the target table doesn't exist yet (preserves the ability to declare grants before their target table, per item 2.3.3).
 - [ ] **1.6** Consider: should `letter.grant()` validate that the `on_table` exists? Decision: no — by design `letter.grant()` tolerates missing tables (item 2.3.3) so grants can be declared before their target table is created. Close as won't-do.
+- [ ] **1.7** `letter.grant()` raises a `WARNING` when a `using_path` column (or the final-hop FK column) has no usable btree index — reads cannot be driven from the scope side without it (`16` §3.4). Warning, not error. Test: warning fires, grant still succeeds.
 
 ## Issues to Resolve Before Phase 2
 
@@ -110,6 +113,14 @@ These are generic C trigger functions installed on protected tables. They read g
 ### 2.6 Known Gaps
 - [ ] **2.6.1** INSERT column-level enforcement — deferred to Phase 5 (see Issue B and items 5.11–5.19)
 
+### 2.7 Path-Walker Performance (`16` §6)
+No semantic change — the existing regression suite is the test. Independent of Phase 5.
+
+- [ ] **2.7.1** `SPI_prepare` + `SPI_keepplan` for each `(table, column)` hop query in `fetch_row_column`, held in a backend-local hash (today every hop re-parses and re-plans)
+- [ ] **2.7.2** Compile `using_path` once per cached grant into `[(table, fk_col, target, pk_col, pk_type)…]` — no `pg_constraint` lookups per row; dropped on cache invalidation and on relcache invalidation of any table in the path
+- [ ] **2.7.3** Statement-local memo `(compiled path, first-hop FK value) → scope_id | NULL`, shared across rows and across grants with the same path; keyed on command id or reset at executor end
+- [ ] **2.7.4** Micro-benchmark: bulk insert of 10k rows into a 2-hop table, before/after
+
 ## Phase 3: Read Enforcement via Function (COMPLETE)
 
 A `letter.read()` function that performs enforced reads, returning JSONB.
@@ -137,15 +148,15 @@ A `letter.read()` function that performs enforced reads, returning JSONB.
 - [x] **3.3.7** Test: user with no roles sees only PK columns
 - [x] **3.3.8** Test: fails closed when `letter.current_user_id` not set
 
-## Phase 4: Scope Index Cache (Optional)
+## Phase 4: Intermediate-Table Materialisation (Optional, after Phase 5a)
 
-Performance optimisation for tables with deep scope paths (3+ FK hops). See `09-scope-resolution.md` for the design.
+Redefined 2026-09-21 — see `16-scope-resolution-direction.md` §5. Replaces the leaf-keyed, lazily-populated `letter.scope_index` of `09-scope-resolution.md` (superseded: database-sized, amplifies every leaf write, and lazy population means the read path writes). Build only if the 5.0 / 5a measurements ask for it, and only for chains with ≥ 2 hops above the leaf's parent.
 
-- [ ] **4.1** `letter.scope_index` table with Russian-doll path caching
-- [ ] **4.2** Lazy population on cache miss (falls back to runtime joins)
-- [ ] **4.3** Invalidation triggers on intermediate tables (DELETE only)
-- [ ] **4.4** Opt-in per table via a configuration mechanism
-- [ ] **4.5** Tests for cache hit, cache miss, invalidation, repopulation
+- [ ] **4.1** `letter.row_scopes (table_name, row_id, scope_table, scope_id)` + index `(scope_table, scope_id, table_name)`
+- [ ] **4.2** `letter.materialize('schema.table')` / `letter.dematerialize()` — opt-in, **intermediate tables only**; reject (or warn loudly) for a table that is only ever a leaf
+- [ ] **4.3** Eager trigger maintenance in the writing transaction: insert/delete of the table's rows, and re-parenting of the row or any ancestor (no lazy population — stale-allow is not acceptable, `16` §4)
+- [ ] **4.4** Generator uses the closure when present; grants with `enforce_path_visibility` ignore it (`16` §5)
+- [ ] **4.5** Tests: result-equivalence with and without materialisation; re-parent an intermediate node mid-transaction; concurrent re-parent vs read
 
 ## Phase 5: Parse/Plan Hooks
 
@@ -155,12 +166,13 @@ Extension hooks that operate on the parse tree and plan tree. Two related workst
 
 Replace `letter.read()` with invisible enforcement on normal SELECT queries.
 
+- [ ] **5.0** **Experiment before any hook code (`16` §8 Q1):** hand-write the `16` §3.1 barrier as a `security_barrier` view over a 2-hop schema with ~1M leaf rows; `EXPLAIN (ANALYZE)` the three forms of the user's scope set (single-row FROM item, InitPlan params, semijoin on `letter.roles`). Confirms the planner drives from the scope side inside the barrier, and informs 5.6. Record results in `16`.
 - [ ] **5.1** Register planner hook in `_PG_init()`
 - [ ] **5.2** Detect queries targeting tables that have grants
-- [ ] **5.3** Rewrite column references to include redaction CASE expressions
-- [ ] **5.4** Add `_redacted` column to query target list
-- [ ] **5.5** Add scope resolution JOINs where needed
-- [ ] **5.6** Transaction-local C-level cache for roles and grants
+- [ ] **5.3** Replace each protected RTE with a redacting barrier subquery (`15` Option B) — per-column `CASE` expressions testing the exposed scope-id column(s), plus Var fix-up
+- [ ] **5.4** Add `_redacted` column to query target list (open — `15` §9 decision 3)
+- [ ] **5.5** Scope resolution as `LEFT JOIN`s up the FK chain inside the barrier, once per distinct `(scope, using_path)`; row-visibility `WHERE`; role-side cast to the PK type (`16` §3.2)
+- [ ] **5.6** User's scope sets read from `letter.roles` at execution time — nothing user-specific in the rewritten tree (`16` §3.2 rule 3, §7 option a). Test asserts it. Cached plans reset when `letter.grants` changes. Injected `letter.roles` RTE must not require the caller to hold `SELECT` on it.
 - [ ] **5.7** Handle: SELECT *, subqueries, CTEs, joins across enforced/non-enforced tables
 - [ ] **5.8** Fast early exit for queries not touching tables with grants
 - [ ] **5.9** Version compatibility testing (PG16, PG17)

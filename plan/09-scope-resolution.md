@@ -86,7 +86,11 @@ Scope resolution uses runtime joins along the FK chain. For a query returning ma
 - 2-3 hops: typically 1-5ms additional
 - These are PK/FK index lookups, which PostgreSQL excels at
 
+**Index requirement (added 2026-09-21):** PostgreSQL indexes the *referenced* PK side of an FK automatically, but not the *referencing* column. For reads to be driven from the user's scopes downward (`16-scope-resolution-direction.md` §2, §3.4), every `using_path` column and the final-hop FK column needs a btree index. `letter.grant()` warns when one is missing.
+
 ## Optional: Scope Index Cache
+
+> **SUPERSEDED 2026-09-21 by `16-scope-resolution-direction.md` §4–§5.** The design below keys the cache by *leaf* row (database-sized, one extra write per leaf row, re-parenting rewrites every leaf) and populates lazily on read (the read path writes — impossible from the planner hook in read-only transactions, and a stale entry is a stale-*allow*). Its replacement is `letter.row_scopes`: the same ancestors table, but eagerly trigger-maintained and materialised for **intermediate tables only**, never leaves. Kept for the record.
 
 For tables with deep paths (3+ hops) and high read volume, an optional scope index provides Russian-doll caching. See below.
 
