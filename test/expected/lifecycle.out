@@ -1,0 +1,429 @@
+-- Test: object identity and lifecycle (plan/18-object-identity-and-lifecycle.md §3)
+--
+-- Tables are identified by OID, so protection follows a rename. Dropping
+-- something letter depends on removes the dependent letter state with a
+-- NOTICE; altering something so that letter state no longer makes sense is
+-- refused. One case per row of the mutation matrix (18 §3.1) that a
+-- regression test can exercise.
+CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.enforce_reads = off;   -- this test is not about the read hook
+CREATE SCHEMA other;
+CREATE TABLE users (id uuid PRIMARY KEY, name TEXT);
+CREATE TABLE projects (id uuid PRIMARY KEY, name TEXT);
+CREATE TABLE tasks (
+    id uuid PRIMARY KEY,
+    project_id uuid NOT NULL REFERENCES projects(id),
+    title TEXT
+);
+CREATE INDEX tasks_project_id_idx ON tasks (project_id);
+CREATE TABLE comments (
+    id uuid PRIMARY KEY,
+    task_id uuid REFERENCES tasks(id),
+    author TEXT,
+    body TEXT
+);
+CREATE INDEX comments_task_id_idx ON comments (task_id);
+CREATE TABLE reactions (
+    id uuid PRIMARY KEY,
+    comment_id uuid REFERENCES comments(id),
+    emoji TEXT
+);
+CREATE INDEX reactions_comment_id_idx ON reactions (comment_id);
+CREATE TABLE team_members (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id),
+    project_id uuid NOT NULL REFERENCES projects(id),
+    role TEXT NOT NULL
+);
+CREATE TABLE auditors (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL);
+INSERT INTO users VALUES
+    ('a0000000-0000-0000-0000-000000000001', 'Alice'),
+    ('a0000000-0000-0000-0000-000000000002', 'Bob');
+INSERT INTO projects VALUES
+    ('b0000000-0000-0000-0000-000000000001', 'Alpha'),
+    ('b0000000-0000-0000-0000-000000000002', 'Beta');
+INSERT INTO tasks VALUES
+    ('c0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'task-Alpha');
+INSERT INTO comments VALUES
+    ('d0000000-0000-0000-0000-000000000001', 'c0000000-0000-0000-0000-000000000001', 'ann', 'on Alpha');
+INSERT INTO reactions VALUES
+    ('e0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000001', 'r1');
+SET letter.bypass = on;
+SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
+    role_name := NULL, role_column := 'role', if_fn := NULL);
+ assign 
+--------
+ t
+(1 row)
+
+SELECT letter.assign('public.auditors', 'user_id', NULL,
+    role_name := 'auditor', role_column := NULL, if_fn := NULL);
+ assign 
+--------
+ t
+(1 row)
+
+RESET letter.bypass;
+INSERT INTO team_members (user_id, project_id, role) VALUES
+    ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor'),
+    ('a0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000002', 'editor');
+INSERT INTO auditors (user_id) VALUES ('a0000000-0000-0000-0000-000000000002');
+SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
+    'public.projects', ARRAY['task_id'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('update', 'public.comments', 'editor', ARRAY['body'],
+    'public.projects', ARRAY['task_id'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('select', 'public.comments', 'auditor', ARRAY['author'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('select', 'public.reactions', 'editor', ARRAY['emoji'],
+    'public.projects', ARRAY['comment_id', 'task_id'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('select', 'public.tasks', 'editor', ARRAY['title'],
+    'public.projects', NULL, NULL);
+ grant 
+-------
+ t
+(1 row)
+
+-- letter's state, as text; OIDs and assignment ids are normalised away so
+-- the expected output is stable.
+CREATE VIEW state AS
+    SELECT 'grant' AS kind, g.on_table::text AS tbl, g.role || '/' || g.privilege || '/' || g.column_name AS detail
+    FROM letter.grants g
+    UNION ALL
+    SELECT 'assignment', a.table_name::text, COALESCE(a.scope_table::text, '-')
+    FROM letter.assignments a
+    UNION ALL
+    SELECT 'role', COALESCE(r.scope_table::text, '-'), r.role || '@' || left(r.user_id, 8)
+    FROM letter.roles r
+    UNION ALL
+    SELECT 'trigger', t.tgrelid::regclass::text, regexp_replace(t.tgname, '_[0-9a-f_]{36}$', '_<id>')
+    FROM pg_trigger t WHERE t.tgname LIKE 'letter\_%' AND NOT t.tgisinternal
+    UNION ALL
+    SELECT 'function', 'letter', regexp_replace(p.proname, '_[0-9a-f_]{36}$', '_<id>')
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'letter' AND p.proname LIKE 'source\_%' OR n.nspname = 'letter' AND p.proname LIKE 'scope\_%';
+SELECT * FROM state ORDER BY 1, 2, 3;
+    kind    |     tbl      |          detail          
+------------+--------------+--------------------------
+ assignment | auditors     | -
+ assignment | team_members | projects
+ function   | letter       | scope_delete_<id>
+ function   | letter       | source_delete_<id>
+ function   | letter       | source_delete_<id>
+ function   | letter       | source_upsert_<id>
+ function   | letter       | source_upsert_<id>
+ grant      | comments     | auditor/select/author
+ grant      | comments     | editor/select/body
+ grant      | comments     | editor/update/body
+ grant      | reactions    | editor/select/emoji
+ grant      | tasks        | editor/select/title
+ role       | -            | auditor@a0000000
+ role       | projects     | editor@a0000000
+ role       | projects     | editor@a0000000
+ trigger    | auditors     | letter_delete_<id>
+ trigger    | auditors     | letter_insert_<id>
+ trigger    | auditors     | letter_update_<id>
+ trigger    | comments     | letter_enforce_delete
+ trigger    | comments     | letter_enforce_insert
+ trigger    | comments     | letter_enforce_truncate
+ trigger    | comments     | letter_enforce_update
+ trigger    | projects     | letter_scope_delete_<id>
+ trigger    | reactions    | letter_enforce_delete
+ trigger    | reactions    | letter_enforce_insert
+ trigger    | reactions    | letter_enforce_truncate
+ trigger    | reactions    | letter_enforce_update
+ trigger    | tasks        | letter_enforce_delete
+ trigger    | tasks        | letter_enforce_insert
+ trigger    | tasks        | letter_enforce_truncate
+ trigger    | tasks        | letter_enforce_update
+ trigger    | team_members | letter_delete_<id>
+ trigger    | team_members | letter_insert_<id>
+ trigger    | team_members | letter_update_<id>
+(34 rows)
+
+\set VERBOSITY terse
+-- ============================================================
+-- 1. Rename / set schema: protection follows the table.
+-- ============================================================
+ALTER TABLE comments RENAME TO remarks;
+ALTER TABLE remarks SET SCHEMA other;
+SELECT tbl, detail FROM state WHERE kind = 'grant' AND tbl LIKE '%remarks' ORDER BY 2;
+      tbl      |        detail         
+---------------+-----------------------
+ other.remarks | auditor/select/author
+ other.remarks | editor/select/body
+ other.remarks | editor/update/body
+(3 rows)
+
+-- write enforcement still applies under the new name
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+UPDATE other.remarks SET body = 'edited by alice' WHERE id = 'd0000000-0000-0000-0000-000000000001';
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+UPDATE other.remarks SET body = 'edited by bob' WHERE id = 'd0000000-0000-0000-0000-000000000001';
+ERROR:  letter: UPDATE denied on "other.remarks" column "body" for user "a0000000-0000-0000-0000-000000000002" — requires 'update' privilege
+RESET letter.current_user_id;
+SELECT body FROM other.remarks;
+      body       
+-----------------
+ edited by alice
+(1 row)
+
+-- and the planner hook still substitutes it (no user id set: zero rows, 17 D2)
+SET letter.enforce_reads = on;
+SET client_min_messages = debug1;
+SELECT count(*) FROM other.remarks;
+DEBUG:  letter: planner hook: substituting protected table "other.remarks"
+ count 
+-------
+     0
+(1 row)
+
+RESET client_min_messages;
+SET letter.enforce_reads = off;
+ALTER TABLE other.remarks SET SCHEMA public;
+ALTER TABLE remarks RENAME TO comments;
+-- ============================================================
+-- 2. Altering so that letter state stops making sense is refused.
+-- ============================================================
+-- a granted column
+ALTER TABLE comments RENAME COLUMN body TO text;
+ERROR:  letter: the select grant to "editor" on public.comments (column "body") would no longer be valid: column "body" of public.comments no longer exists
+-- a using_path column
+ALTER TABLE comments RENAME COLUMN task_id TO task;
+ERROR:  letter: the select grant to "editor" on public.comments (column "body") would no longer be valid: letter.grant: using_path column "task_id" is not a foreign key on public.comments
+-- an assignment's user column
+ALTER TABLE team_members RENAME COLUMN user_id TO member_id;
+ERROR:  letter: the assignment on public.team_members would no longer be valid: column "user_id" of public.team_members no longer exists
+-- an FK on a path (explicit hop, then inferred final hop)
+ALTER TABLE comments DROP CONSTRAINT comments_task_id_fkey;
+ERROR:  letter: the select grant to "editor" on public.comments (column "body") would no longer be valid: letter.grant: using_path column "task_id" is not a foreign key on public.comments
+ALTER TABLE tasks DROP CONSTRAINT tasks_project_id_fkey;
+ERROR:  letter: the select grant to "editor" on public.tasks (column "title") would no longer be valid: letter.grant: no foreign key path from public.tasks to scope "public.projects" — this grant's scope could never be resolved
+-- a second FK that makes an inferred final hop ambiguous
+ALTER TABLE tasks ADD COLUMN alt_project uuid REFERENCES projects(id);
+ERROR:  letter: the select grant to "editor" on public.tasks (column "title") would no longer be valid: letter.grant: public.tasks has more than one foreign key to scope "public.projects" — extend using_path to name the final hop column
+-- a composite PK on a hop table
+ALTER TABLE tasks DROP CONSTRAINT tasks_pkey CASCADE, ADD PRIMARY KEY (id, project_id);
+NOTICE:  drop cascades to constraint comments_task_id_fkey on table comments
+ERROR:  letter: the select grant to "editor" on public.comments (column "body") would no longer be valid: letter.grant: using_path column "task_id" is not a foreign key on public.comments
+-- an assignment's scope FK
+ALTER TABLE team_members DROP CONSTRAINT team_members_project_id_fkey;
+ERROR:  letter: the assignment on public.team_members would no longer be valid: public.team_members has no foreign key to its scope table public.projects
+-- nothing changed
+SELECT attname FROM pg_attribute WHERE attrelid = 'comments'::regclass AND attnum > 0 ORDER BY attnum;
+ attname 
+---------
+ id
+ task_id
+ author
+ body
+(4 rows)
+
+SELECT conname FROM pg_constraint WHERE conrelid IN ('comments'::regclass, 'tasks'::regclass) ORDER BY 1;
+        conname        
+-----------------------
+ comments_pkey
+ comments_task_id_fkey
+ tasks_pkey
+ tasks_project_id_fkey
+(4 rows)
+
+-- columns can be added, and an ungranted column renamed
+ALTER TABLE comments ADD COLUMN extra TEXT;
+ALTER TABLE comments RENAME COLUMN extra TO spare;
+-- a leaf may lose its PK (only scope and hop tables need one)
+ALTER TABLE reactions DROP CONSTRAINT reactions_pkey;
+ALTER TABLE reactions ADD PRIMARY KEY (id);
+-- dropping an index on a path column is allowed, with the grant-time warning
+DROP INDEX comments_task_id_idx;
+WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+CREATE INDEX comments_task_id_idx ON comments (task_id);
+-- ============================================================
+-- 3. TRUNCATE on a protected table requires bypass (18 D3).
+-- ============================================================
+TRUNCATE reactions;
+ERROR:  letter: TRUNCATE denied on "public.reactions" — requires letter.bypass
+SET letter.bypass = on;
+TRUNCATE reactions;
+RESET letter.bypass;
+SELECT count(*) FROM reactions;
+ count 
+-------
+     0
+(1 row)
+
+-- ============================================================
+-- 4. Dropping a column removes the grants on it; dropping a
+--    using_path column removes the grants through it.
+-- ============================================================
+ALTER TABLE comments DROP COLUMN author;
+NOTICE:  letter: dropped column public.comments.author: removed 1 grant(s)
+SELECT tbl, detail FROM state WHERE kind = 'grant' ORDER BY 1, 2;
+    tbl    |       detail        
+-----------+---------------------
+ comments  | editor/select/body
+ comments  | editor/update/body
+ reactions | editor/select/emoji
+ tasks     | editor/select/title
+(4 rows)
+
+ALTER TABLE reactions DROP COLUMN comment_id;
+NOTICE:  letter: removed the select grant to "editor" on public.reactions (column "emoji"): letter.grant: using_path column "comment_id" is not a foreign key on public.reactions
+SELECT tbl, detail FROM state WHERE kind IN ('grant', 'trigger') AND tbl = 'reactions' ORDER BY 1, 2;
+ tbl | detail 
+-----+--------
+(0 rows)
+
+-- ============================================================
+-- 5. Dropping a hop table removes the grants whose paths cross it,
+--    and the enforcement triggers of a table left with no grants.
+-- ============================================================
+DROP TABLE tasks CASCADE;
+NOTICE:  drop cascades to constraint comments_task_id_fkey on table comments
+NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: removed the select grant to "editor" on public.comments (column "body"): letter.grant: using_path column "task_id" is not a foreign key on public.comments
+NOTICE:  letter: removed the update grant to "editor" on public.comments (column "body"): letter.grant: using_path column "task_id" is not a foreign key on public.comments
+SELECT * FROM state WHERE kind IN ('grant', 'trigger') ORDER BY 1, 2, 3;
+  kind   |     tbl      |          detail          
+---------+--------------+--------------------------
+ trigger | auditors     | letter_delete_<id>
+ trigger | auditors     | letter_insert_<id>
+ trigger | auditors     | letter_update_<id>
+ trigger | projects     | letter_scope_delete_<id>
+ trigger | team_members | letter_delete_<id>
+ trigger | team_members | letter_insert_<id>
+ trigger | team_members | letter_update_<id>
+(7 rows)
+
+-- ============================================================
+-- 6. Dropping a source table removes its assignment, functions,
+--    triggers and roles.
+-- ============================================================
+DROP TABLE auditors;
+NOTICE:  letter: dropped table public.auditors: removed 0 grant(s), 1 assignment(s), 0 role(s)
+SELECT * FROM state WHERE kind IN ('assignment', 'role', 'function') ORDER BY 1, 2, 3;
+    kind    |     tbl      |       detail       
+------------+--------------+--------------------
+ assignment | team_members | projects
+ function   | letter       | scope_delete_<id>
+ function   | letter       | source_delete_<id>
+ function   | letter       | source_upsert_<id>
+ role       | projects     | editor@a0000000
+ role       | projects     | editor@a0000000
+(6 rows)
+
+-- ============================================================
+-- 7. Dropping a scope table removes the assignments scoped to it
+--    (with their triggers on the surviving source table), the roles
+--    scoped to it, and the grants scoped to it.
+-- ============================================================
+SELECT letter.grant('select', 'public.team_members', 'editor', ARRAY['role'],
+    'public.projects', NULL, NULL);
+WARNING:  letter.grant: scope path column "project_id" on public.team_members has no index — reads scoped through it will scan the whole table
+ grant 
+-------
+ t
+(1 row)
+
+DROP TABLE projects CASCADE;
+NOTICE:  drop cascades to constraint team_members_project_id_fkey on table team_members
+NOTICE:  letter: dropped table public.projects: removed 1 grant(s), 1 assignment(s), 0 role(s)
+SELECT * FROM state ORDER BY 1, 2, 3;
+  kind   |     tbl      |         detail          
+---------+--------------+-------------------------
+ trigger | team_members | letter_enforce_delete
+ trigger | team_members | letter_enforce_insert
+ trigger | team_members | letter_enforce_truncate
+ trigger | team_members | letter_enforce_update
+(4 rows)
+
+-- ============================================================
+-- 8. Hygiene: a role row with an empty user id is refused
+--    (it would match sessions with no letter.current_user_id).
+-- ============================================================
+INSERT INTO letter.roles (role, user_id) VALUES ('editor', '');
+ERROR:  new row for relation "roles" violates check constraint "roles_user_id_check"
+-- ============================================================
+-- 9. DROP EXTENSION … CASCADE takes the assignment machinery with
+--    it (18 D5): no letter trigger or function is left on user
+--    tables, and writes to a former source table just work.
+-- ============================================================
+SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'], NULL);
+ grant 
+-------
+ t
+(1 row)
+
+SET letter.bypass = on;
+SELECT letter.assign('public.team_members', 'user_id', NULL,
+    role_name := 'member', role_column := NULL, if_fn := NULL);
+ assign 
+--------
+ t
+(1 row)
+
+RESET letter.bypass;
+SELECT count(*) AS letter_triggers FROM pg_trigger WHERE tgname LIKE 'letter\_%';
+ letter_triggers 
+-----------------
+              11
+(1 row)
+
+-- without CASCADE: refused, as for the enforcement triggers
+DROP EXTENSION letter;
+ERROR:  cannot drop extension letter because other objects depend on it
+DROP EXTENSION letter CASCADE;
+NOTICE:  drop cascades to 14 other objects
+SELECT count(*) AS letter_triggers FROM pg_trigger WHERE tgname LIKE 'letter\_%';
+ letter_triggers 
+-----------------
+               0
+(1 row)
+
+SELECT count(*) AS letter_functions FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'letter';
+ letter_functions 
+------------------
+                0
+(1 row)
+
+SELECT count(*) AS letter_event_triggers FROM pg_event_trigger WHERE evtname LIKE 'letter\_%';
+ letter_event_triggers 
+-----------------------
+                     0
+(1 row)
+
+INSERT INTO team_members (user_id, project_id, role)
+    VALUES ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'x');
+SELECT count(*) FROM team_members;
+ count 
+-------
+     3
+(1 row)
+
+\set VERBOSITY default
+-- Cleanup (the state view went with the extension)
+DROP TABLE team_members, reactions, comments, users CASCADE;
+DROP SCHEMA other;

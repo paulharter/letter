@@ -5,6 +5,7 @@ add# Letter — Enforcement Overview
 1. **Fully runtime** — enforcement always reads from the live `roles` and `grants` tables. No policies, views, or rules are generated from the permission data. Roles and grants can be changed at any time and enforcement immediately reflects the current state.
 
 2. **Fail closed** — if `letter.current_user_id` is not set, all operations on tables with grants are denied (for app users). Table owners may bypass enforcement for migrations and admin operations.
+   > **Amended 2026-09-22 (`17` D14):** enforcement is default-deny across the *whole database*, not only tables with grants — without `letter.bypass`, a table with no grants can be neither read nor written. Exempt: `pg_catalog`, `information_schema`, `pg_toast`, own temp tables, schema `letter`.
 
 3. **No enable/disable** — there is no `letter.enable()` or `letter.disable()` function. A table is implicitly enforced if it has any grants in `letter.grants`. Write enforcement triggers are installed automatically by `letter.grant()` when the first grant is added to a table, and removed by `letter.revoke()` when the last grant is removed.
 

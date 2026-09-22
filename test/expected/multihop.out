@@ -11,6 +11,10 @@
 --   5. Fail-loud grant-time validation: ambiguous final hop, no FK
 --      path to the scope, using_path on an unscoped grant.
 CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 CREATE TABLE users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL
@@ -57,6 +61,7 @@ INSERT INTO reactions (id, comment_id, emoji) VALUES
     ('f0000000-0000-0000-0000-000000000001', 'e0000000-0000-0000-0000-000000000001', 'thumbsup'),
     ('f0000000-0000-0000-0000-000000000002', 'e0000000-0000-0000-0000-000000000003', 'wave');
 -- Roles: Alice is editor on Alpha, Bob is editor on Beta.
+SET letter.bypass = on;
 SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
     role_name := NULL, role_column := 'role', if_fn := NULL);
  assign 
@@ -64,6 +69,7 @@ SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
  t
 (1 row)
 
+RESET letter.bypass;
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor'),
     ('a0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000002', 'editor');
@@ -226,7 +232,7 @@ ERROR:  letter.grant: no foreign key path from public.isolated to scope "public.
 -- Test 10: grant-time fail-loud — using_path on an unscoped grant.
 -- ============================================================
 SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
-    '', ARRAY['task_id'], NULL);
+    NULL, ARRAY['task_id'], NULL);
 ERROR:  letter.grant: using_path requires a scoped grant
 \set VERBOSITY default
 -- Clean up
@@ -234,9 +240,13 @@ RESET letter.current_user_id;
 SET letter.bypass = true;
 DROP TABLE isolated;
 DROP TABLE links CASCADE;
+NOTICE:  letter: dropped table public.links: removed 1 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE team_members CASCADE;
+NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 assignment(s), 0 role(s)
 DROP TABLE reactions CASCADE;
+NOTICE:  letter: dropped table public.reactions: removed 1 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE comments CASCADE;
+NOTICE:  letter: dropped table public.comments: removed 2 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE tasks CASCADE;
 DROP TABLE projects CASCADE;
 DROP TABLE users CASCADE;

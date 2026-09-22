@@ -1,6 +1,7 @@
 -- Test: info/debug functions
 
 CREATE EXTENSION letter;
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 
 -- Bypass enforcement for this test (we're testing info functions, not enforcement)
 SET letter.bypass = true;
@@ -32,11 +33,11 @@ INSERT INTO projects (id, name) VALUES
     ('b0000000-0000-0000-0000-000000000002', 'Project Beta');
 
 -- Set up grants
-SELECT letter.grant('select', 'public.projects', 'viewer', ARRAY['*'], '', NULL, NULL);
-SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('select', 'public.projects', 'viewer', ARRAY['*'], NULL, NULL, NULL);
+SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['*'], NULL, NULL, NULL);
 SELECT letter.grant('update', 'public.projects', 'editor', ARRAY['name', 'status'], 'public.projects', NULL, NULL);
-SELECT letter.grant('delete', 'public.projects', 'admin', ARRAY['*'], '', NULL, NULL);
-SELECT letter.grant('insert', 'public.projects', 'admin', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('delete', 'public.projects', 'admin', ARRAY['*'], NULL, NULL, NULL);
+SELECT letter.grant('insert', 'public.projects', 'admin', ARRAY['*'], NULL, NULL, NULL);
 SELECT letter.grant('select', 'public.team_members', 'editor', ARRAY['*'], 'public.projects', NULL, NULL);
 
 -- Set up assignments

@@ -13,10 +13,14 @@
 --      second statement.
 --   3. An error inside a savepoint leaves the walker usable after
 --      ROLLBACK TO.
---   4. Compiled paths are invalidated by DDL: dropping an FK on the
---      path fails loudly at enforcement time (never enforces as
---      unscoped); restoring it restores enforcement.
+--   4. DDL that would break a compiled path (dropping an FK on it) is
+--      refused outright (plan/18 D2), so a path can never enforce as
+--      unscoped.
 CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 CREATE TABLE users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL
@@ -59,6 +63,7 @@ INSERT INTO comments (id, task_id, body) VALUES
     ('e0000000-0000-0000-0000-000000000002', 'd0000000-0000-0000-0000-000000000001', 'alpha comment 2'),
     ('e0000000-0000-0000-0000-000000000003', 'd0000000-0000-0000-0000-000000000002', 'beta comment');
 -- Alice is editor on Alpha only.
+SET letter.bypass = on;
 SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
     role_name := NULL, role_column := 'role', if_fn := NULL);
  assign 
@@ -66,6 +71,7 @@ SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
  t
 (1 row)
 
+RESET letter.bypass;
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
 -- Two grants sharing one two-hop path (they share a compiled path and memo).
@@ -168,21 +174,16 @@ SELECT emoji FROM reactions WHERE emoji LIKE '%move%' OR emoji LIKE 'after-%' OR
 (2 rows)
 
 -- ============================================================
--- Test 4: DDL invalidates the compiled path. With the first hop's
--- FK dropped the path cannot be resolved: fail loudly, even for a
--- row that was allowed a moment ago.
+-- Test 4: DDL that would break a compiled path is refused
+-- (plan/18 D2), so the walker never runs against a path that no
+-- longer resolves. Enforcement continues unchanged.
 -- ============================================================
 ALTER TABLE reactions DROP CONSTRAINT reactions_comment_fk;
+ERROR:  letter: the insert grant to "editor" on public.reactions (column "*") would no longer be valid: letter.grant: using_path column "comment_id" is not a foreign key on public.reactions
 INSERT INTO reactions (comment_id, emoji)
-    VALUES ('e0000000-0000-0000-0000-000000000001', 'fk-dropped');
-ERROR:  letter: using_path column "comment_id" is not a foreign key on public.reactions — the grant's scope path cannot be resolved
--- Restored: enforcement works again, in scope and out of scope.
-ALTER TABLE reactions ADD CONSTRAINT reactions_comment_fk
-    FOREIGN KEY (comment_id) REFERENCES comments(id);
+    VALUES ('e0000000-0000-0000-0000-000000000001', 'fk-kept');
 INSERT INTO reactions (comment_id, emoji)
-    VALUES ('e0000000-0000-0000-0000-000000000001', 'fk-restored');
-INSERT INTO reactions (comment_id, emoji)
-    VALUES ('e0000000-0000-0000-0000-000000000003', 'fk-restored-beta');
+    VALUES ('e0000000-0000-0000-0000-000000000003', 'fk-kept-beta');
 ERROR:  letter: INSERT denied on "public.reactions" for user "a0000000-0000-0000-0000-000000000001"
 SELECT count(*) FROM reactions WHERE emoji LIKE 'fk-%';
  count 
@@ -193,7 +194,9 @@ SELECT count(*) FROM reactions WHERE emoji LIKE 'fk-%';
 \set VERBOSITY default
 -- Cleanup
 DROP TABLE team_members CASCADE;
+NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 assignment(s), 0 role(s)
 DROP TABLE reactions CASCADE;
+NOTICE:  letter: dropped table public.reactions: removed 2 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE comments CASCADE;
 DROP TABLE tasks CASCADE;
 DROP TABLE projects CASCADE;

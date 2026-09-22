@@ -17,6 +17,7 @@
 --   4. letter.bypass = true returns everything untouched.
 
 CREATE EXTENSION letter;
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 SET letter.bypass = true;
 
 CREATE TABLE users (
@@ -97,11 +98,11 @@ INSERT INTO reporters (user_id) VALUES ('a0000000-0000-0000-0000-000000000003');
 --   auditor: select name only, unscoped
 SELECT letter.grant('select', 'public.projects', 'editor',  ARRAY['*'],              'public.projects', NULL, NULL);
 SELECT letter.grant('select', 'public.projects', 'viewer',  ARRAY['name', 'status'], 'public.projects', NULL, NULL);
-SELECT letter.grant('select', 'public.projects', 'auditor', ARRAY['name'],           '',                NULL, NULL);
+SELECT letter.grant('select', 'public.projects', 'auditor', ARRAY['name'],           NULL,                NULL, NULL);
 
 -- reporter has select on users only — used to test "user has grants, but not
 -- on this table".
-SELECT letter.grant('select', 'public.users', 'reporter', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('select', 'public.users', 'reporter', ARRAY['*'], NULL, NULL, NULL);
 
 SET letter.bypass = false;
 
@@ -114,9 +115,8 @@ RESET letter.current_user_id;
 SELECT * FROM letter.read('public.projects');
 
 -- ============================================================
--- Test 2: Table with no letter grants at all → zero rows
--- widgets is a real table but letter is not protecting it; letter.read must
--- still return nothing, because no grant permits access.
+-- Test 2: Table with no letter grants at all → an error (plan/17 D14:
+-- a missing grant is a configuration mistake, not an authorization outcome).
 -- ============================================================
 SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
 SELECT count(*) AS row_count FROM letter.read('public.widgets');

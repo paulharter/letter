@@ -33,7 +33,7 @@ Items that build on the completed Phase 1 but don't require enforcement.
 - [x] **1.3** Add indexes on `roles(user_id)` and `roles(role)` for enforcement query performance
 - [x] **1.4** Add index on `grants(on_table, role)` for enforcement query performance
 - [x] **1.5** Validate in `letter.grant()` that `using_path` FK columns actually exist (query `pg_constraint`) — error at grant time rather than enforcement time. Skipped silently when the target table doesn't exist yet (preserves the ability to declare grants before their target table, per item 2.3.3).
-- [ ] **1.6** Consider: should `letter.grant()` validate that the `on_table` exists? Decision: no — by design `letter.grant()` tolerates missing tables (item 2.3.3) so grants can be declared before their target table is created. Close as won't-do.
+- [x] **1.6** `letter.grant()` validates that the `on_table` exists. ~~Decision: no — tolerate missing tables (item 2.3.3).~~ **Reversed 2026-09-21 (`17` D10):** a grant declared before its table left the table, once created, without enforcement triggers, path validation or the index warning. Now an error (`ERRCODE_UNDEFINED_TABLE`); test in `grant_revoke.sql`. Item 1.5's "skipped silently when the target table doesn't exist yet" no longer applies.
 - [x] **1.7** `letter.grant()` raises a `WARNING` (with a `CREATE INDEX` hint) when a `using_path` column or the inferred final-hop FK column has no usable btree index — reads cannot be driven from the scope side without it (`16` §3.4). Warning, not error; **`select` grants only** (the write path never needs the index). "Usable" = valid, non-partial btree with the column leading. Done 2026-09-21 (`warn_if_unindexed`); tests: `test/sql/index_warning.sql`. Existing tests now show the warning wherever their schemas lack FK indexes.
 
 ## Issues to Resolve Before Phase 2
@@ -83,7 +83,7 @@ These are generic C trigger functions installed on protected tables. They read g
 ### 2.3 Automatic Trigger Management
 - [x] **2.3.1** `letter.grant()` auto-installs enforcement triggers on first grant to a table
 - [x] **2.3.2** `letter.revoke()` auto-removes enforcement triggers when last grant is removed
-- [x] **2.3.3** Graceful when table doesn't exist yet (stores grant, skips trigger install)
+- [x] **2.3.3** ~~Graceful when table doesn't exist yet (stores grant, skips trigger install)~~ — **withdrawn 2026-09-21 (`17` D10):** `letter.grant()` now errors on a missing table.
 
 ### 2.4 Scope Resolution for Write Enforcement
 - [x] **2.4.1** Scope resolution for direct FK (0 hops) and table-is-scope cases
@@ -166,19 +166,21 @@ Extension hooks that operate on the parse tree and plan tree. Two related workst
 
 Replace `letter.read()` with invisible enforcement on normal SELECT queries.
 
+**Status 2026-09-22 (night): `17` complete (H0–H6) and `18` complete — transparent read enforcement ON by default (planner hook, D14 universal default-deny, cross-backend invalidation, D12 preload warning, ProcessUtility hook), `letter.read()` deprecated, `letter.visible_columns()` added; 17 tests green. Left: 5.9 PG16 build, H5.9 bench comparison, `15` §8 write-path redaction, MERGE, `18` R1 (dump/restore), U1.**
+
 **Implementation plan: `17-planner-hook-implementation.md`** — steps H0 (spike) → H1 (infrastructure: 5.1, 5.2, 5.8) → H2 (SQL generator: 5.3, 5.5, 5.6) → H3 (substitution, nested from day one: 5.3, 5.7) → H4 (plan/cache invalidation: 5.6) → H5 (behavioural tests, flip `letter.enforce_reads` on) → H6 (`COPY TO` side door, `letter.read()` fate: 5.10). Key simplifications: convert the RTE *in place* like view expansion (no Var fix-up), and generate the barrier as SQL text parsed by the real parser. Decided 2026-09-21: unset user id → reads return zero rows (D2); composite PKs rejected at grant time for scope/hop tables, allowed on leaves (D4). `letter.read()`/`_redacted` (D3) deferred to H6.
 
 - [x] **5.0** **Experiment before any hook code (`16` §8 Q1)** — done 2026-09-21, harness + write-up in `bench/barrier/` (`RESULTS.md`). Planner does drive from the scope side inside the barrier (0.6 ms vs 4.6 s for a B1-style function, 698 of 1M rows). Chosen form: `IN (SELECT … FROM letter.roles)` for `WHERE` (semijoin) and each `CASE` (hashed SubPlan) — **no arrays**; `OR`-shaped visibility must be generated as mutually exclusive `UNION ALL` branches.
-- [ ] **5.1** Register planner hook in `_PG_init()`
-- [ ] **5.2** Detect queries targeting tables that have grants
-- [ ] **5.3** Replace each protected RTE with a redacting barrier subquery (`15` Option B) — per-column `CASE` expressions testing the exposed scope-id column(s), plus Var fix-up
+- [x] **5.1** Register planner hook in `_PG_init()` — done 2026-09-21 (`17` H1), chained; `letter.enforce_reads` switch (default off) + `ResetPlanCache()` assign hooks on it and `letter.bypass`. Test: `hook_infra.sql`.
+- [x] **5.2** Detect queries targeting tables that have grants — done 2026-09-21 (`17` H1): backend-local set of **names** with ≥ 1 `select` grant (`17` D8), whole-tree walk.
+- [x] **5.3** Replace each protected RTE with a redacting barrier subquery (`15` Option B) — done 2026-09-22 (`17` H3): in-place RTE conversion, no Var fix-up (`17` §1.1).
 - [ ] **5.4** Add `_redacted` column to query target list (open — `15` §9 decision 3)
-- [ ] **5.5** Scope resolution as `LEFT JOIN`s up the FK chain inside the barrier; one `UNION ALL` branch per distinct `(scope, using_path)` group with a strict `IN (SELECT …)` row-visibility test, plus a `One-Time Filter`-gated branch for unscoped grants; role-side cast to the PK type (`16` §3.2 rules 1, 4, 5)
-- [ ] **5.6** User's scope sets read from `letter.roles` at execution time — nothing user-specific in the rewritten tree (`16` §3.2 rule 3, §7 option a). Test asserts it. Cached plans reset when `letter.grants` changes. Injected `letter.roles` RTE must not require the caller to hold `SELECT` on it.
-- [ ] **5.7** Handle: SELECT *, subqueries, CTEs, joins across enforced/non-enforced tables
-- [ ] **5.8** Fast early exit for queries not touching tables with grants
+- [x] **5.5** *(done 2026-09-22, `17` H2+H3)* Scope resolution as `LEFT JOIN`s up the FK chain inside the barrier; one `UNION ALL` branch per distinct `(scope, using_path)` group with a strict `IN (SELECT …)` row-visibility test, plus a `One-Time Filter`-gated branch for unscoped grants; role-side cast to the PK type (`16` §3.2 rules 1, 4, 5)
+- [x] **5.6** *(done 2026-09-22, `17` H2–H4; `hook_cache.sql`)* User's scope sets read from `letter.roles` at execution time — nothing user-specific in the rewritten tree (`16` §3.2 rule 3, §7 option a). Test asserts it. Cached plans reset when `letter.grants` changes. Injected `letter.roles` RTE must not require the caller to hold `SELECT` on it. *(Generator side done 2026-09-21, `17` H2: `build_barrier_sql` / `letter.barrier_sql()`, entry-criterion test in `barrier_sql.sql`. Ticks for 5.3/5.5/5.6 wait for H3–H4 to wire it into the hook.)*
+- [x] **5.7** Handle: SELECT *, subqueries, CTEs, joins across enforced/non-enforced tables — done 2026-09-22 (`17` H3, `hook_infra.sql`); hardening continues in H5
+- [x] **5.8** Fast early exit for queries not touching tables with grants — done 2026-09-21 (`17` H1): switch off / bypass / internal guard / RI query / utility / empty set / no protected RTE.
 - [ ] **5.9** Version compatibility testing (PG16, PG17)
-- [ ] **5.10** Deprecate `letter.read()` or keep as explicit alternative — if kept, it must be rebuilt on the hook's barrier-subquery machinery; it cannot survive unchanged. Once the planner hook lands, `letter.read()` is the leakier path (raw-interpolated `condition` + sink redaction = injection + predicate oracle). See `15-join-enforcement.md` §9 decision 3.
+- [x] **5.10** *(`17` D3, 2026-09-22: deprecated; `letter.visible_columns()` added for the hidden-vs-NULL distinction)* Deprecate `letter.read()` or keep as explicit alternative — if kept, it must be rebuilt on the hook's barrier-subquery machinery; it cannot survive unchanged. Once the planner hook lands, `letter.read()` is the leakier path (raw-interpolated `condition` + sink redaction = injection + predicate oracle). See `15-join-enforcement.md` §9 decision 3.
 
 ### 5b. INSERT Column-Level Enforcement via post_parse_analyze_hook
 
@@ -196,27 +198,29 @@ Captures the explicit INSERT column list at parse time so the row trigger can en
 
 ## Phase 6: Cleanup and Lifecycle
 
+> **2026-09-22:** superseded by `18-object-identity-and-lifecycle.md` §3 (mutation matrix) and §5 I3/I4, which cover every item below and more. Kept for the record.
+
 Ensuring that letter cleans up properly when grants are removed, tables are dropped, or the extension is uninstalled. This is critical for production use — dangling triggers or orphaned state can break user tables.
 
 ### 6.1 Extension Drop
 When `DROP EXTENSION letter` runs, enforcement trigger functions in the `letter` schema are destroyed. Triggers on user tables that reference these functions become dangling and will error on any subsequent write to those tables.
 
-- [ ] **6.1.1** Investigate: does `DROP EXTENSION letter CASCADE` automatically clean up triggers on user tables that reference letter's functions? (It may, via pg_depend entries.)
+- [x] **6.1.1** Investigate: does `DROP EXTENSION letter CASCADE` automatically clean up triggers on user tables that reference letter's functions? **Answered 2026-09-22 (`18` S1): the enforcement triggers yes (pg_depend on the C functions); the generated assignment functions and their triggers no.**
 - [ ] **6.1.2** If not automatic: implement cleanup. Options:
   - An event trigger (`sql_drop`) that fires on extension drop and removes enforcement triggers from all tables that have them
   - A `letter.cleanup()` function that users call before dropping the extension
   - Register proper pg_depend entries when triggers are created so CASCADE handles them
-- [ ] **6.1.3** Test: `DROP EXTENSION letter CASCADE` leaves user tables in a clean state with no dangling triggers
+- [x] **6.1.3** Test: `DROP EXTENSION letter CASCADE` leaves user tables in a clean state with no dangling triggers — `lifecycle.sql` §9 (`18` D5, 2026-09-22)
 
 ### 6.2 Table Drop
 When a user drops a table that has enforcement triggers and grants:
 
 - [ ] **6.2.1** Investigate: does PostgreSQL automatically clean up the grants in `letter.grants` when the table is dropped? (No — grants are just data rows, they won't cascade.)
-- [ ] **6.2.2** Options:
+- [x] **6.2.2** Done 2026-09-22 (`18` I3): a `sql_drop` event trigger cascades. Options were:
   - An event trigger on `DROP TABLE` that cleans up `letter.grants` rows for the dropped table
   - Accept orphaned grant rows — they're harmless data but messy
   - A `letter.cleanup_orphans()` maintenance function
-- [ ] **6.2.3** Test: dropping a table with grants doesn't leave broken state
+- [x] **6.2.3** Test: dropping a table with grants doesn't leave broken state — `lifecycle.sql` §5–7
 
 ### 6.3 Grant/Revoke Trigger Lifecycle
 Already partially covered in Phase 2, but edge cases:
@@ -229,13 +233,13 @@ Already partially covered in Phase 2, but edge cases:
 When `letter.unassign()` is called, it drops triggers and functions. Edge cases:
 
 - [ ] **6.4.1** Test: unassign while rows exist that have active roles — roles should be cleaned up
-- [ ] **6.4.2** Test: dropping an assignment source table while assignments exist
-- [ ] **6.4.3** Test: dropping the extension cleans up assignment triggers on user tables
+- [x] **6.4.2** Test: dropping an assignment source table while assignments exist — `lifecycle.sql` §6
+- [x] **6.4.3** Test: dropping the extension cleans up assignment triggers on user tables — `lifecycle.sql` §9
 
 ### 6.5 Consistency Checks
 A maintenance function to verify the system is in a consistent state:
 
-- [ ] **6.5.1** `letter.check_health()` — reports:
+- [x] **6.5.1** `letter.check_health()` — done 2026-09-22 (`18` I4, `check_health.sql`); reports all of the below plus preload status, disabled/stale triggers, bypass-default roles, missing path indexes:
   - Grants referencing tables that don't exist
   - Enforcement triggers missing for tables that have grants
   - Enforcement triggers present for tables that have no grants

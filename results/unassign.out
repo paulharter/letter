@@ -1,5 +1,9 @@
 -- Test: unassign() removes assignment rules and cleans up
 CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 -- Set up application tables
 CREATE TABLE users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -21,6 +25,7 @@ INSERT INTO users (id, name) VALUES
 INSERT INTO projects (id, name) VALUES
     ('b0000000-0000-0000-0000-000000000001', 'Project Alpha');
 -- Create a scoped assignment
+SET letter.bypass = on;
 SELECT letter.assign(
     'public.team_members', 'user_id', 'public.projects',
     role_name := NULL, role_column := 'role', if_fn := NULL
@@ -30,6 +35,7 @@ SELECT letter.assign(
  t
 (1 row)
 
+RESET letter.bypass;
 -- Add a team member to generate a role
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
@@ -46,6 +52,7 @@ SELECT count(*) AS assignments_before FROM letter.assignments;
 (1 row)
 
 -- Unassign the rule
+SET letter.bypass = on;
 SELECT letter.unassign(
     'public.team_members', 'user_id', 'public.projects',
     role_name := NULL, role_column := 'role'
@@ -55,6 +62,7 @@ SELECT letter.unassign(
  t
 (1 row)
 
+RESET letter.bypass;
 -- Assignment rule should be gone
 SELECT count(*) AS assignments_after FROM letter.assignments;
  assignments_after 
@@ -91,6 +99,7 @@ CREATE TABLE admins (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE
 );
+SET letter.bypass = on;
 SELECT letter.assign(
     'public.admins', 'user_id', NULL,
     role_name := 'superadmin', role_column := NULL, if_fn := NULL
@@ -100,6 +109,7 @@ SELECT letter.assign(
  t
 (1 row)
 
+RESET letter.bypass;
 INSERT INTO admins (user_id) VALUES ('a0000000-0000-0000-0000-000000000001');
 SELECT count(*) AS roles_before_unscp FROM letter.roles;
  roles_before_unscp 
@@ -107,6 +117,7 @@ SELECT count(*) AS roles_before_unscp FROM letter.roles;
                   1
 (1 row)
 
+SET letter.bypass = on;
 SELECT letter.unassign(
     'public.admins', 'user_id', NULL,
     role_name := 'superadmin', role_column := NULL
@@ -116,6 +127,7 @@ SELECT letter.unassign(
  t
 (1 row)
 
+RESET letter.bypass;
 SELECT count(*) AS roles_after_unscp FROM letter.roles;
  roles_after_unscp 
 -------------------

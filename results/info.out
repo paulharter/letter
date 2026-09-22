@@ -1,5 +1,9 @@
 -- Test: info/debug functions
 CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 -- Bypass enforcement for this test (we're testing info functions, not enforcement)
 SET letter.bypass = true;
 -- Set up application tables and data
@@ -24,13 +28,13 @@ INSERT INTO projects (id, name) VALUES
     ('b0000000-0000-0000-0000-000000000001', 'Project Alpha'),
     ('b0000000-0000-0000-0000-000000000002', 'Project Beta');
 -- Set up grants
-SELECT letter.grant('select', 'public.projects', 'viewer', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('select', 'public.projects', 'viewer', ARRAY['*'], NULL, NULL, NULL);
  grant 
 -------
  t
 (1 row)
 
-SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['*'], NULL, NULL, NULL);
  grant 
 -------
  t
@@ -42,13 +46,13 @@ SELECT letter.grant('update', 'public.projects', 'editor', ARRAY['name', 'status
  t
 (1 row)
 
-SELECT letter.grant('delete', 'public.projects', 'admin', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('delete', 'public.projects', 'admin', ARRAY['*'], NULL, NULL, NULL);
  grant 
 -------
  t
 (1 row)
 
-SELECT letter.grant('insert', 'public.projects', 'admin', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('insert', 'public.projects', 'admin', ARRAY['*'], NULL, NULL, NULL);
  grant 
 -------
  t
@@ -79,27 +83,27 @@ INSERT INTO team_members (user_id, project_id, role) VALUES
 -- Test 1: list_grants() - all grants grouped by role
 -- ============================================================
 SELECT * FROM letter.list_grants() ORDER BY role, on_table, privilege, column_name;
-  role  | privilege |      on_table       | column_name |      scope      | using_path | check_fn 
---------+-----------+---------------------+-------------+-----------------+------------+----------
- admin  | delete    | public.projects     | *           |                 |            | 
- admin  | insert    | public.projects     | *           |                 |            | 
- editor | select    | public.projects     | *           |                 |            | 
- editor | update    | public.projects     | name        | public.projects |            | 
- editor | update    | public.projects     | status      | public.projects |            | 
- editor | select    | public.team_members | *           | public.projects |            | 
- viewer | select    | public.projects     | *           |                 |            | 
+  role  | privilege |   on_table   | column_name |  scope   | using_path | check_fn 
+--------+-----------+--------------+-------------+----------+------------+----------
+ admin  | delete    | projects     | *           |          |            | 
+ admin  | insert    | projects     | *           |          |            | 
+ editor | select    | projects     | *           |          |            | 
+ editor | update    | projects     | name        | projects |            | 
+ editor | update    | projects     | status      | projects |            | 
+ editor | select    | team_members | *           | projects |            | 
+ viewer | select    | projects     | *           |          |            | 
 (7 rows)
 
 -- ============================================================
 -- Test 2: list_grants(role) - grants for a specific role
 -- ============================================================
 SELECT * FROM letter.list_grants('editor') ORDER BY on_table, privilege, column_name;
-  role  | privilege |      on_table       | column_name |      scope      | using_path | check_fn 
---------+-----------+---------------------+-------------+-----------------+------------+----------
- editor | select    | public.projects     | *           |                 |            | 
- editor | update    | public.projects     | name        | public.projects |            | 
- editor | update    | public.projects     | status      | public.projects |            | 
- editor | select    | public.team_members | *           | public.projects |            | 
+  role  | privilege |   on_table   | column_name |  scope   | using_path | check_fn 
+--------+-----------+--------------+-------------+----------+------------+----------
+ editor | select    | projects     | *           |          |            | 
+ editor | update    | projects     | name        | projects |            | 
+ editor | update    | projects     | status      | projects |            | 
+ editor | select    | team_members | *           | projects |            | 
 (4 rows)
 
 -- ============================================================
@@ -107,25 +111,21 @@ SELECT * FROM letter.list_grants('editor') ORDER BY on_table, privilege, column_
 -- ============================================================
 SELECT * FROM letter.user_permissions('a0000000-0000-0000-0000-000000000001')
     ORDER BY on_table, privilege, column_name, scope_table, scope_id;
-  role  | privilege |      on_table       | column_name |      scope      |   scope_table   |               scope_id               | using_path | check_fn 
---------+-----------+---------------------+-------------+-----------------+-----------------+--------------------------------------+------------+----------
- editor | select    | public.projects     | *           |                 | public.projects | b0000000-0000-0000-0000-000000000001 |            | 
- viewer | select    | public.projects     | *           |                 | public.projects | b0000000-0000-0000-0000-000000000002 |            | 
- editor | update    | public.projects     | name        | public.projects | public.projects | b0000000-0000-0000-0000-000000000001 |            | 
- editor | update    | public.projects     | status      | public.projects | public.projects | b0000000-0000-0000-0000-000000000001 |            | 
- editor | select    | public.team_members | *           | public.projects | public.projects | b0000000-0000-0000-0000-000000000001 |            | 
-(5 rows)
+  role  | privilege |   on_table   | column_name |  scope   | scope_table |               scope_id               | using_path | check_fn 
+--------+-----------+--------------+-------------+----------+-------------+--------------------------------------+------------+----------
+ editor | update    | projects     | name        | projects | projects    | b0000000-0000-0000-0000-000000000001 |            | 
+ editor | update    | projects     | status      | projects | projects    | b0000000-0000-0000-0000-000000000001 |            | 
+ editor | select    | team_members | *           | projects | projects    | b0000000-0000-0000-0000-000000000001 |            | 
+(3 rows)
 
 -- ============================================================
 -- Test 4: user_permissions for Bob (admin on Alpha only)
 -- ============================================================
 SELECT * FROM letter.user_permissions('a0000000-0000-0000-0000-000000000002')
     ORDER BY on_table, privilege, column_name, scope_table, scope_id;
- role  | privilege |    on_table     | column_name | scope |   scope_table   |               scope_id               | using_path | check_fn 
--------+-----------+-----------------+-------------+-------+-----------------+--------------------------------------+------------+----------
- admin | delete    | public.projects | *           |       | public.projects | b0000000-0000-0000-0000-000000000001 |            | 
- admin | insert    | public.projects | *           |       | public.projects | b0000000-0000-0000-0000-000000000001 |            | 
-(2 rows)
+ role | privilege | on_table | column_name | scope | scope_table | scope_id | using_path | check_fn 
+------+-----------+----------+-------------+-------+-------------+----------+------------+----------
+(0 rows)
 
 -- ============================================================
 -- Test 5: user with no roles
@@ -138,6 +138,9 @@ SELECT count(*) AS no_perms FROM letter.user_permissions('a0000000-0000-0000-000
 
 -- Clean up
 DROP TABLE team_members CASCADE;
+NOTICE:  letter: dropped table public.team_members: removed 1 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: removed the update grant to "editor" on public.projects (column "status"): column "status" of public.projects no longer exists
 DROP TABLE projects CASCADE;
+NOTICE:  letter: dropped table public.projects: removed 5 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE users CASCADE;
 DROP EXTENSION letter CASCADE;

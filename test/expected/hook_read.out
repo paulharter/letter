@@ -1,0 +1,561 @@
+-- Test: transparent read enforcement, behaviourally
+-- (plan/17-planner-hook-implementation.md H5)
+--
+-- With the hook on, an ordinary SELECT sees exactly what letter.read()
+-- shows (plan/15 D5 — the trigger/walker and the hook must agree), with
+-- native types; the predicate leak of plan/14 §1 is closed; every query
+-- shape reaches the same subquery; cached and generic plans are safe
+-- across users; the switches behave inside one transaction; and RI keeps
+-- seeing the truth.
+--
+-- Users (via assignments):
+--   alice  editor@Alpha, viewer@Beta, global logger
+--   bob    viewer@Alpha
+--   carol  global reporter (select on users only)
+--   dora   global auditor  (select name on projects)
+CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.bypass = on;
+CREATE TABLE users (id uuid PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE projects (
+    id uuid PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    budget INTEGER,
+    notes TEXT
+);
+CREATE TABLE tasks (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id uuid NOT NULL REFERENCES projects(id),
+    title TEXT NOT NULL
+);
+CREATE INDEX ON tasks (project_id);
+CREATE TABLE team_members (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id),
+    project_id uuid NOT NULL REFERENCES projects(id),
+    role TEXT NOT NULL
+);
+CREATE TABLE auditors (user_id uuid PRIMARY KEY);
+CREATE TABLE reporters (user_id uuid PRIMARY KEY);
+CREATE TABLE loggers (user_id uuid PRIMARY KEY);
+CREATE TABLE log (id serial PRIMARY KEY, line TEXT);
+INSERT INTO users VALUES
+    ('a0000000-0000-0000-0000-000000000001', 'Alice'),
+    ('a0000000-0000-0000-0000-000000000002', 'Bob'),
+    ('a0000000-0000-0000-0000-000000000003', 'Carol'),
+    ('a0000000-0000-0000-0000-000000000004', 'Dora');
+INSERT INTO projects VALUES
+    ('b0000000-0000-0000-0000-000000000001', 'Alpha', 'active', 50000, 'alpha notes'),
+    ('b0000000-0000-0000-0000-000000000002', 'Beta',  'draft',  NULL,  NULL),
+    ('b0000000-0000-0000-0000-000000000003', 'Gamma', 'done',   10000, 'gamma notes');
+INSERT INTO tasks (id, project_id, title) VALUES
+    ('d0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'Alpha task'),
+    ('d0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000002', 'Beta task'),
+    ('d0000000-0000-0000-0000-000000000003', 'b0000000-0000-0000-0000-000000000003', 'Gamma task');
+SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
+    role_name := NULL, role_column := 'role', if_fn := NULL);
+ assign 
+--------
+ t
+(1 row)
+
+SELECT letter.assign('public.auditors',  'user_id', NULL, role_name := 'auditor');
+ assign 
+--------
+ t
+(1 row)
+
+SELECT letter.assign('public.reporters', 'user_id', NULL, role_name := 'reporter');
+ assign 
+--------
+ t
+(1 row)
+
+SELECT letter.assign('public.loggers',   'user_id', NULL, role_name := 'logger');
+ assign 
+--------
+ t
+(1 row)
+
+INSERT INTO team_members (user_id, project_id, role) VALUES
+    ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor'),
+    ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000002', 'viewer'),
+    ('a0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'viewer');
+INSERT INTO auditors  VALUES ('a0000000-0000-0000-0000-000000000004');
+INSERT INTO reporters VALUES ('a0000000-0000-0000-0000-000000000003');
+INSERT INTO loggers   VALUES ('a0000000-0000-0000-0000-000000000001');
+SELECT letter.grant('select', 'public.projects', 'editor',  ARRAY['*'],              'public.projects');
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('select', 'public.projects', 'viewer',  ARRAY['name', 'status'], 'public.projects');
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('select', 'public.projects', 'auditor', ARRAY['name']);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('select', 'public.users',    'reporter', ARRAY['*']);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('select', 'public.tasks',    'editor',  ARRAY['title'],          'public.projects');
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('insert', 'public.tasks',    'logger',  ARRAY['*']);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('insert', 'public.log',      'logger',  ARRAY['*']);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('select', 'public.log',      'logger',  ARRAY['*']);
+ grant 
+-------
+ t
+(1 row)
+
+SELECT letter.grant('update', 'public.log',      'logger',  ARRAY['line']);
+ grant 
+-------
+ t
+(1 row)
+
+-- rows found by a plain SELECT (through the hook) and not by letter.read(),
+-- and vice versa; values compared as text
+CREATE FUNCTION parity(tbl regclass, OUT only_in_select bigint, OUT only_in_read bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE format($q$
+        WITH sel AS (
+            SELECT (SELECT jsonb_object_agg(e.key,
+                               CASE WHEN jsonb_typeof(e.value) = 'null' THEN e.value
+                                    ELSE to_jsonb(e.value #>> '{}') END)
+                    FROM jsonb_each(to_jsonb(x)) e) AS j
+            FROM %s x),
+        rd AS (SELECT r - '_redacted' AS j FROM letter.read(%L) r)
+        SELECT (SELECT count(*) FROM (SELECT j FROM sel EXCEPT SELECT j FROM rd) a),
+               (SELECT count(*) FROM (SELECT j FROM rd EXCEPT SELECT j FROM sel) b)
+    $q$, tbl, letter._qualname(tbl)) INTO only_in_select, only_in_read;
+END $$;
+CREATE VIEW project_budgets AS SELECT name, budget FROM projects;
+CREATE VIEW project_budgets_inv WITH (security_invoker) AS SELECT name, budget FROM projects;
+CREATE FUNCTION project_names() RETURNS SETOF text LANGUAGE sql AS 'SELECT name FROM projects ORDER BY name';
+CREATE FUNCTION project_names_plpgsql() RETURNS SETOF text LANGUAGE plpgsql AS $$
+BEGIN RETURN QUERY SELECT name FROM projects ORDER BY name; END $$;
+CREATE TEMP TABLE scratch (name TEXT);
+INSERT INTO scratch VALUES ('Alpha'), ('Gamma');
+SET letter.bypass = off;
+SET letter.enforce_reads = on;
+\set VERBOSITY terse
+-- ============================================================
+-- 1. Parity with letter.read(), native types.
+-- ============================================================
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT name, status, budget, notes FROM projects ORDER BY name;
+ name  | status | budget |    notes    
+-------+--------+--------+-------------
+ Alpha | active |  50000 | alpha notes
+ Beta  | draft  |        | 
+(2 rows)
+
+SELECT * FROM parity('public.projects');
+ only_in_select | only_in_read 
+----------------+--------------
+              0 |            0
+(1 row)
+
+SELECT * FROM parity('public.tasks');
+ only_in_select | only_in_read 
+----------------+--------------
+              0 |            0
+(1 row)
+
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+SELECT name, status, budget, notes FROM projects ORDER BY name;
+ name  | status | budget | notes 
+-------+--------+--------+-------
+ Alpha | active |        | 
+(1 row)
+
+SELECT * FROM parity('public.projects');
+ only_in_select | only_in_read 
+----------------+--------------
+              0 |            0
+(1 row)
+
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000004';
+SELECT name, status, budget, notes FROM projects ORDER BY name;
+ name  | status | budget | notes 
+-------+--------+--------+-------
+ Alpha |        |        | 
+ Beta  |        |        | 
+ Gamma |        |        | 
+(3 rows)
+
+SELECT * FROM parity('public.projects');
+ only_in_select | only_in_read 
+----------------+--------------
+              0 |            0
+(1 row)
+
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000003';
+SELECT name FROM users ORDER BY name;
+ name  
+-------
+ Alice
+ Bob
+ Carol
+ Dora
+(4 rows)
+
+SELECT * FROM parity('public.users');
+ only_in_select | only_in_read 
+----------------+--------------
+              0 |            0
+(1 row)
+
+SELECT name FROM projects;
+ name 
+------
+(0 rows)
+
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT pg_typeof(budget) AS budget_type, pg_typeof(id) AS id_type FROM projects LIMIT 1;
+ budget_type | id_type 
+-------------+---------
+ integer     | uuid
+(1 row)
+
+-- ============================================================
+-- 2. The leak is closed: for bob, budget and notes are hidden and
+--    nothing distinguishes "no match" from "can't see".
+-- ============================================================
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+SELECT name FROM projects WHERE budget > 0;
+ name 
+------
+(0 rows)
+
+SELECT name FROM projects WHERE budget IS NULL ORDER BY name;
+ name  
+-------
+ Alpha
+(1 row)
+
+SELECT name FROM projects ORDER BY budget, name;
+ name  
+-------
+ Alpha
+(1 row)
+
+SELECT budget, count(*) FROM projects GROUP BY budget;
+ budget | count 
+--------+-------
+        |     1
+(1 row)
+
+SELECT max(budget), min(notes) FROM projects;
+ max | min 
+-----+-----
+     | 
+(1 row)
+
+SELECT p.name FROM projects p JOIN scratch s ON s.name = p.notes;
+ name 
+------
+(0 rows)
+
+SELECT name FROM projects WHERE notes LIKE 'alpha%';
+ name 
+------
+(0 rows)
+
+-- ============================================================
+-- 3. Shapes.
+-- ============================================================
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+-- two protected tables: tasks.project_id is not granted, so it is NULL in
+-- the join condition and nothing matches — an FK used to join must be granted
+SELECT p.name, t.title FROM projects p JOIN tasks t ON t.project_id = p.id ORDER BY 1;
+ name | title 
+------+-------
+(0 rows)
+
+-- protected + exempt (a temp table)
+SELECT p.name, p.budget FROM projects p JOIN scratch s USING (name) ORDER BY 1;
+ name  | budget 
+-------+--------
+ Alpha |  50000
+(1 row)
+
+-- subquery in FROM, CTE, sublink, UNION
+SELECT count(*) FROM (SELECT budget FROM projects WHERE budget IS NOT NULL) s;
+ count 
+-------
+     1
+(1 row)
+
+WITH b AS (SELECT name, budget FROM projects) SELECT * FROM b WHERE budget IS NOT NULL ORDER BY 1;
+ name  | budget 
+-------+--------
+ Alpha |  50000
+(1 row)
+
+SELECT name FROM projects WHERE id IN (SELECT project_id FROM tasks) ORDER BY 1;
+ name 
+------
+(0 rows)
+
+SELECT name FROM projects UNION SELECT title FROM tasks ORDER BY 1;
+    name    
+------------
+ Alpha
+ Alpha task
+ Beta
+(3 rows)
+
+-- views: plain and security_invoker both expand to the protected table
+SELECT * FROM project_budgets ORDER BY 1;
+ name  | budget 
+-------+--------
+ Alpha |  50000
+ Beta  |       
+(2 rows)
+
+SELECT * FROM project_budgets_inv ORDER BY 1;
+ name  | budget 
+-------+--------
+ Alpha |  50000
+ Beta  |       
+(2 rows)
+
+-- function bodies
+SELECT project_names();
+ project_names 
+---------------
+ Alpha
+ Beta
+(2 rows)
+
+SELECT project_names_plpgsql();
+ project_names_plpgsql 
+-----------------------
+ Alpha
+ Beta
+(2 rows)
+
+-- whole-row references
+SELECT to_jsonb(p) - 'id' FROM projects p ORDER BY p.name;
+                                    ?column?                                    
+--------------------------------------------------------------------------------
+ {"name": "Alpha", "notes": "alpha notes", "budget": 50000, "status": "active"}
+ {"name": "Beta", "notes": null, "budget": null, "status": "draft"}
+(2 rows)
+
+-- INSERT … SELECT and UPDATE … FROM reading a protected table
+INSERT INTO log (line) SELECT name || ':' || coalesce(budget::text, '-') FROM projects ORDER BY name;
+SELECT line FROM log ORDER BY id;
+    line     
+-------------
+ Alpha:50000
+ Beta:-
+(2 rows)
+
+UPDATE log SET line = line || ' (' || p.status || ')' FROM projects p WHERE log.line LIKE p.name || ':%';
+SELECT line FROM log ORDER BY id;
+         line         
+----------------------
+ Alpha:50000 (active)
+ Beta:- (draft)
+(2 rows)
+
+-- ============================================================
+-- 4. Generic-plan safety: one plan, many users.
+-- ============================================================
+SET plan_cache_mode = force_generic_plan;
+PREPARE q AS SELECT name, budget FROM projects ORDER BY name;
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+EXECUTE q;
+ name  | budget 
+-------+--------
+ Alpha |  50000
+ Beta  |       
+(2 rows)
+
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+EXECUTE q;
+ name  | budget 
+-------+--------
+ Alpha |       
+(1 row)
+
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000004';
+EXECUTE q;
+ name  | budget 
+-------+--------
+ Alpha |       
+ Beta  |       
+ Gamma |       
+(3 rows)
+
+SELECT project_names_plpgsql();
+ project_names_plpgsql 
+-----------------------
+ Alpha
+ Beta
+ Gamma
+(3 rows)
+
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+SELECT project_names_plpgsql();
+ project_names_plpgsql 
+-----------------------
+ Alpha
+(1 row)
+
+RESET plan_cache_mode;
+-- ============================================================
+-- 5. Switches, inside one transaction, with a prepared statement.
+-- ============================================================
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+BEGIN;
+EXECUTE q;
+ name  | budget 
+-------+--------
+ Alpha |       
+(1 row)
+
+SET LOCAL letter.bypass = on;
+EXECUTE q;
+ name  | budget 
+-------+--------
+ Alpha |  50000
+ Beta  |       
+ Gamma |  10000
+(3 rows)
+
+SET LOCAL letter.bypass = off;
+EXECUTE q;
+ name  | budget 
+-------+--------
+ Alpha |       
+(1 row)
+
+SET LOCAL letter.current_user_id = '';
+EXECUTE q;
+ name | budget 
+------+--------
+(0 rows)
+
+ROLLBACK;
+DEALLOCATE q;
+-- ============================================================
+-- 6. letter.visible_columns(): which NULLs are redactions.
+-- ============================================================
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT name, letter.visible_columns('public.projects', id) FROM projects ORDER BY name;
+ name  |        visible_columns        
+-------+-------------------------------
+ Alpha | {id,name,status,budget,notes}
+ Beta  | {id,name,status}
+(2 rows)
+
+SELECT letter.visible_columns('public.projects', 'b0000000-0000-0000-0000-000000000003'::uuid) AS gamma_hidden;
+ gamma_hidden 
+--------------
+ 
+(1 row)
+
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+SELECT name, letter.visible_columns('public.projects', id) FROM projects ORDER BY name;
+ name  | visible_columns  
+-------+------------------
+ Alpha | {id,name,status}
+(1 row)
+
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000004';
+SELECT name, letter.visible_columns('public.projects', id) FROM projects ORDER BY name;
+ name  | visible_columns 
+-------+-----------------
+ Alpha | {id,name}
+ Beta  | {id,name}
+ Gamma | {id,name}
+(3 rows)
+
+SELECT letter.visible_columns('public.projects', 'b0000000-0000-0000-0000-0000000000ff'::uuid) AS no_such_row;
+ no_such_row 
+-------------
+ 
+(1 row)
+
+SELECT letter.visible_columns('public.team_members', gen_random_uuid());
+ERROR:  letter: no grants on "public.team_members"
+SET letter.bypass = on;
+SELECT letter.visible_columns('public.projects', 'b0000000-0000-0000-0000-000000000003'::uuid) AS bypass_sees_all;
+        bypass_sees_all        
+-------------------------------
+ {id,name,status,budget,notes}
+(1 row)
+
+SET letter.bypass = off;
+-- ============================================================
+-- 7. RI still sees the truth: alice, as logger, may insert a task
+--    into Gamma, a project she cannot read.
+-- ============================================================
+SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT count(*) FROM projects WHERE name = 'Gamma';
+ count 
+-------
+     0
+(1 row)
+
+INSERT INTO tasks (project_id, title) VALUES ('b0000000-0000-0000-0000-000000000003', 'logged into Gamma');
+INSERT INTO tasks (project_id, title) VALUES ('b0000000-0000-0000-0000-0000000000ff', 'no such project');
+ERROR:  insert or update on table "tasks" violates foreign key constraint "tasks_project_id_fkey"
+SET letter.bypass = on;
+SELECT title FROM tasks ORDER BY title;
+       title       
+-------------------
+ Alpha task
+ Beta task
+ Gamma task
+ logged into Gamma
+(4 rows)
+
+\set VERBOSITY default
+-- Cleanup
+RESET letter.current_user_id;
+RESET letter.enforce_reads;
+DROP FUNCTION parity(regclass), project_names(), project_names_plpgsql();
+DROP VIEW project_budgets, project_budgets_inv;
+DROP TABLE scratch;
+DROP TABLE log, loggers, reporters, auditors, team_members, tasks, projects, users CASCADE;
+NOTICE:  letter: dropped table public.users: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.projects: removed 5 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.auditors: removed 0 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.reporters: removed 0 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.loggers: removed 0 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.log: removed 3 grant(s), 0 assignment(s), 0 role(s)
+DROP EXTENSION letter CASCADE;

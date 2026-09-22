@@ -10,6 +10,10 @@
 --      only if the path column leads it; partial indexes do not count.
 --   4. Unscoped grants and table-is-scope grants never warn.
 CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 CREATE TABLE projects (id uuid PRIMARY KEY, name TEXT);
 CREATE TABLE tasks (
     id uuid PRIMARY KEY,
@@ -83,7 +87,7 @@ SELECT letter.grant('select', 'public.comments', 'reader', ARRAY['body'],
 (1 row)
 
 -- 4. Unscoped, and table-is-scope: nothing to index.
-SELECT letter.grant('select', 'public.comments', 'admin', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('select', 'public.comments', 'admin', ARRAY['*'], NULL, NULL, NULL);
  grant 
 -------
  t
@@ -98,6 +102,9 @@ SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['name'],
 
 -- Cleanup
 DROP TABLE comments CASCADE;
+NOTICE:  letter: dropped table public.comments: removed 5 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE tasks CASCADE;
+NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE projects CASCADE;
+NOTICE:  letter: dropped table public.projects: removed 1 grant(s), 0 assignment(s), 0 role(s)
 DROP EXTENSION letter CASCADE;

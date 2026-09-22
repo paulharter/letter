@@ -11,6 +11,7 @@
 --   4. Unscoped grants and table-is-scope grants never warn.
 
 CREATE EXTENSION letter;
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 
 CREATE TABLE projects (id uuid PRIMARY KEY, name TEXT);
 CREATE TABLE tasks (
@@ -51,7 +52,7 @@ SELECT letter.grant('select', 'public.comments', 'reader', ARRAY['body'],
     'public.projects', ARRAY['task_id'], NULL);
 
 -- 4. Unscoped, and table-is-scope: nothing to index.
-SELECT letter.grant('select', 'public.comments', 'admin', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('select', 'public.comments', 'admin', ARRAY['*'], NULL, NULL, NULL);
 SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['name'],
     'public.projects', NULL, NULL);
 

@@ -16,6 +16,10 @@
 --      visible on any returned row.
 --   4. letter.bypass = true returns everything untouched.
 CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 SET letter.bypass = true;
 CREATE TABLE users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -106,7 +110,7 @@ SELECT letter.grant('select', 'public.projects', 'viewer',  ARRAY['name', 'statu
  t
 (1 row)
 
-SELECT letter.grant('select', 'public.projects', 'auditor', ARRAY['name'],           '',                NULL, NULL);
+SELECT letter.grant('select', 'public.projects', 'auditor', ARRAY['name'],           NULL,                NULL, NULL);
  grant 
 -------
  t
@@ -114,7 +118,7 @@ SELECT letter.grant('select', 'public.projects', 'auditor', ARRAY['name'],      
 
 -- reporter has select on users only — used to test "user has grants, but not
 -- on this table".
-SELECT letter.grant('select', 'public.users', 'reporter', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('select', 'public.users', 'reporter', ARRAY['*'], NULL, NULL, NULL);
  grant 
 -------
  t
@@ -129,17 +133,12 @@ RESET letter.current_user_id;
 SELECT * FROM letter.read('public.projects');
 ERROR:  letter: SELECT denied on "public.projects" — letter.current_user_id is not set
 -- ============================================================
--- Test 2: Table with no letter grants at all → zero rows
--- widgets is a real table but letter is not protecting it; letter.read must
--- still return nothing, because no grant permits access.
+-- Test 2: Table with no letter grants at all → an error (plan/17 D14:
+-- a missing grant is a configuration mistake, not an authorization outcome).
 -- ============================================================
 SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
 SELECT count(*) AS row_count FROM letter.read('public.widgets');
- row_count 
------------
-         0
-(1 row)
-
+ERROR:  letter: no grants on "public.widgets"
 -- ============================================================
 -- Test 3: User has select grants, but none on this table → zero rows
 -- Carol has 'reporter' with select on users only.
@@ -329,9 +328,14 @@ SET letter.bypass = false;
 -- Clean up
 SET letter.bypass = true;
 DROP TABLE reporters CASCADE;
+NOTICE:  letter: dropped table public.reporters: removed 0 grant(s), 1 assignment(s), 0 role(s)
 DROP TABLE auditors CASCADE;
+NOTICE:  letter: dropped table public.auditors: removed 0 grant(s), 1 assignment(s), 0 role(s)
 DROP TABLE widgets CASCADE;
 DROP TABLE team_members CASCADE;
+NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 assignment(s), 0 role(s)
 DROP TABLE projects CASCADE;
+NOTICE:  letter: dropped table public.projects: removed 4 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE users CASCADE;
+NOTICE:  letter: dropped table public.users: removed 1 grant(s), 0 assignment(s), 0 role(s)
 DROP EXTENSION letter CASCADE;

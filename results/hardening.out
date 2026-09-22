@@ -12,6 +12,10 @@
 --      a role name containing quotes/SQL must not break enforcement.
 --   5. letter.read() quotes identifiers — a table name cannot smuggle SQL.
 CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 CREATE TABLE users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL
@@ -49,6 +53,7 @@ INSERT INTO tasks (id, project_id, title) VALUES
 INSERT INTO comments (id, task_id, body) VALUES
     ('e0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000001', 'alpha comment'),
     ('e0000000-0000-0000-0000-000000000002', 'd0000000-0000-0000-0000-000000000002', 'beta comment');
+SET letter.bypass = on;
 SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
     role_name := NULL, role_column := 'role', if_fn := NULL);
  assign 
@@ -56,6 +61,7 @@ SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
  t
 (1 row)
 
+RESET letter.bypass;
 -- Alice: editor on Alpha only.
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
@@ -199,7 +205,7 @@ SELECT count(*) AS users_intact FROM users;
 -- ============================================================
 \set VERBOSITY terse
 SELECT * FROM letter.read('public.comments"; DROP TABLE users;--') t(row_data);
-ERROR:  relation "public.comments"; DROP TABLE users;--" does not exist at character 15
+ERROR:  relation "public.comments"; DROP TABLE users;--" does not exist
 \set VERBOSITY default
 SELECT count(*) AS users_still_intact FROM users;
  users_still_intact 
@@ -211,7 +217,9 @@ SELECT count(*) AS users_still_intact FROM users;
 RESET letter.current_user_id;
 SET letter.bypass = true;
 DROP TABLE team_members CASCADE;
+NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 assignment(s), 0 role(s)
 DROP TABLE comments CASCADE;
+NOTICE:  letter: dropped table public.comments: removed 4 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE tasks CASCADE;
 DROP TABLE projects CASCADE;
 DROP TABLE users CASCADE;

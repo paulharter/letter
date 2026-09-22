@@ -13,6 +13,8 @@ the hook inherits and widens it.
 
 ## 1. Predicate / join leaks (projection-only redaction)
 
+> **FIXED for the read path 2026-09-22 (`17` H3–H5):** the planner hook redacts at the source (a `security_barrier` subquery per protected table), so predicates, joins, ordering and aggregates over hidden columns see NULL and cannot distinguish "no match" from "can't see" — `hook_read.sql` §2. `letter.read()`'s raw `condition` remains the leaky path until `17` D3 is decided.
+
 Both `letter.read()` today and the Phase 5 planner-hook design filter the *output
 columns*. Neither touches `WHERE`, `ORDER BY`, `JOIN`, `GROUP BY`, or aggregates.
 Those evaluate against the true row values *before* redaction, so a hidden value is
@@ -95,6 +97,8 @@ table; any other table with no FK path to its scope is a loud error.
 ## 4. Cache coherence and correctness
 
 ### 4.1 Cache is incoherent across backends
+
+> **Closed 2026-09-22 (`17` H4):** grants and roles writes raise relcache invalidations (`letter.grants`, `letter.roles_epoch`) that reach every backend at commit; `hook_cache.sql` demonstrates it with a second connection.
 `invalidate_cache()` is only called inside `grant()`/`revoke()` (`letter.c:190, 292`)
 and clears only the *local* backend's cache. A grant/revoke on connection A leaves
 connection B's cache stale until B's `user_id` changes — on a pooled, long-lived

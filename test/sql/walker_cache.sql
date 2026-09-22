@@ -13,11 +13,12 @@
 --      second statement.
 --   3. An error inside a savepoint leaves the walker usable after
 --      ROLLBACK TO.
---   4. Compiled paths are invalidated by DDL: dropping an FK on the
---      path fails loudly at enforcement time (never enforces as
---      unscoped); restoring it restores enforcement.
+--   4. DDL that would break a compiled path (dropping an FK on it) is
+--      refused outright (plan/18 D2), so a path can never enforce as
+--      unscoped.
 
 CREATE EXTENSION letter;
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 
 CREATE TABLE users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -71,8 +72,10 @@ INSERT INTO comments (id, task_id, body) VALUES
     ('e0000000-0000-0000-0000-000000000003', 'd0000000-0000-0000-0000-000000000002', 'beta comment');
 
 -- Alice is editor on Alpha only.
+SET letter.bypass = on;
 SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
     role_name := NULL, role_column := 'role', if_fn := NULL);
+RESET letter.bypass;
 
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
@@ -149,23 +152,16 @@ COMMIT;
 SELECT emoji FROM reactions WHERE emoji LIKE '%move%' OR emoji LIKE 'after-%' ORDER BY emoji;
 
 -- ============================================================
--- Test 4: DDL invalidates the compiled path. With the first hop's
--- FK dropped the path cannot be resolved: fail loudly, even for a
--- row that was allowed a moment ago.
+-- Test 4: DDL that would break a compiled path is refused
+-- (plan/18 D2), so the walker never runs against a path that no
+-- longer resolves. Enforcement continues unchanged.
 -- ============================================================
 ALTER TABLE reactions DROP CONSTRAINT reactions_comment_fk;
 
 INSERT INTO reactions (comment_id, emoji)
-    VALUES ('e0000000-0000-0000-0000-000000000001', 'fk-dropped');
-
--- Restored: enforcement works again, in scope and out of scope.
-ALTER TABLE reactions ADD CONSTRAINT reactions_comment_fk
-    FOREIGN KEY (comment_id) REFERENCES comments(id);
-
+    VALUES ('e0000000-0000-0000-0000-000000000001', 'fk-kept');
 INSERT INTO reactions (comment_id, emoji)
-    VALUES ('e0000000-0000-0000-0000-000000000001', 'fk-restored');
-INSERT INTO reactions (comment_id, emoji)
-    VALUES ('e0000000-0000-0000-0000-000000000003', 'fk-restored-beta');
+    VALUES ('e0000000-0000-0000-0000-000000000003', 'fk-kept-beta');
 
 SELECT count(*) FROM reactions WHERE emoji LIKE 'fk-%';
 \set VERBOSITY default

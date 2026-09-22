@@ -1,11 +1,14 @@
 -- Test: extension creates the letter schema and core tables
 
 CREATE EXTENSION letter;
+SET letter.enforce_reads = off;   -- this test is not about the read hook
+
+CREATE TABLE t (id int PRIMARY KEY);
 
 -- Verify schema exists
 SELECT nspname FROM pg_namespace WHERE nspname = 'letter';
 
--- Verify the four core tables exist
+-- Verify the core tables (and the roles_epoch signal table) exist
 SELECT tablename FROM pg_tables
     WHERE schemaname = 'letter'
     ORDER BY tablename;
@@ -41,13 +44,13 @@ INSERT INTO letter.assignments (table_name, user_column)
 
 -- Verify FK cascade: deleting assignment cascades to role_assignments
 INSERT INTO letter.assignments (table_name, user_column, role_name)
-    VALUES ('test_table', 'user_id', 'admin')
+    VALUES ('t', 'user_id', 'admin')
     RETURNING id \gset assign_
 
 INSERT INTO letter.roles (role, user_id) VALUES ('admin', 'user1') RETURNING id \gset role_
 
 INSERT INTO letter.role_assignments (assignment_id, role_id, source_table, source_id, user_id)
-    VALUES (:'assign_id', :'role_id', 'test_table', '1', 'user1');
+    VALUES (:'assign_id', :'role_id', 't', '1', 'user1');
 
 SELECT count(*) AS before_delete FROM letter.role_assignments;
 
@@ -58,4 +61,5 @@ SELECT count(*) AS after_delete FROM letter.role_assignments;
 -- Verify cleanup trigger also removed the role
 SELECT count(*) AS orphaned_roles FROM letter.roles WHERE id = :'role_id';
 
+DROP TABLE t;
 DROP EXTENSION letter CASCADE;

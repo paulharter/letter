@@ -12,6 +12,7 @@
 --      path to the scope, using_path on an unscoped grant.
 
 CREATE EXTENSION letter;
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 
 CREATE TABLE users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -70,8 +71,10 @@ INSERT INTO reactions (id, comment_id, emoji) VALUES
     ('f0000000-0000-0000-0000-000000000002', 'e0000000-0000-0000-0000-000000000003', 'wave');
 
 -- Roles: Alice is editor on Alpha, Bob is editor on Beta.
+SET letter.bypass = on;
 SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
     role_name := NULL, role_column := 'role', if_fn := NULL);
+RESET letter.bypass;
 
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor'),
@@ -185,7 +188,7 @@ SELECT letter.grant('select', 'public.isolated', 'editor', ARRAY['note'],
 -- Test 10: grant-time fail-loud — using_path on an unscoped grant.
 -- ============================================================
 SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
-    '', ARRAY['task_id'], NULL);
+    NULL, ARRAY['task_id'], NULL);
 \set VERBOSITY default
 
 -- Clean up

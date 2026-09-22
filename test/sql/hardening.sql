@@ -13,6 +13,7 @@
 --   5. letter.read() quotes identifiers — a table name cannot smuggle SQL.
 
 CREATE EXTENSION letter;
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 
 CREATE TABLE users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -60,8 +61,10 @@ INSERT INTO comments (id, task_id, body) VALUES
     ('e0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000001', 'alpha comment'),
     ('e0000000-0000-0000-0000-000000000002', 'd0000000-0000-0000-0000-000000000002', 'beta comment');
 
+SET letter.bypass = on;
 SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
     role_name := NULL, role_column := 'role', if_fn := NULL);
+RESET letter.bypass;
 
 -- Alice: editor on Alpha only.
 INSERT INTO team_members (user_id, project_id, role) VALUES

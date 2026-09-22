@@ -1,6 +1,7 @@
 -- Test: assign() creates rules that denormalize roles
 
 CREATE EXTENSION letter;
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 
 -- Set up application tables
 CREATE TABLE users (
@@ -25,6 +26,7 @@ CREATE TABLE team_members (
 -- "rows in team_members assign the role in the 'role' column, scoped to projects"
 -- ============================================================
 
+SET letter.bypass = on;
 SELECT letter.assign(
     'public.team_members',  -- source table
     'user_id',              -- user column
@@ -33,6 +35,7 @@ SELECT letter.assign(
     role_column := 'role',
     if_fn := NULL
 );
+RESET letter.bypass;
 
 -- Verify the assignment rule was created
 SELECT table_name, scope_table, user_column, role_name, role_column
@@ -111,6 +114,7 @@ CREATE TABLE admins (
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE
 );
 
+SET letter.bypass = on;
 SELECT letter.assign(
     'public.admins',
     'user_id',
@@ -119,6 +123,7 @@ SELECT letter.assign(
     role_column := NULL,
     if_fn := NULL
 );
+RESET letter.bypass;
 
 INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000003', 'Charlie');
 INSERT INTO admins (user_id) VALUES ('a0000000-0000-0000-0000-000000000003');

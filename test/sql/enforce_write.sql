@@ -1,6 +1,7 @@
 -- Test: write enforcement triggers
 
 CREATE EXTENSION letter;
+SET letter.enforce_reads = off;   -- this test is not about the read hook
 
 -- Set up application tables
 CREATE TABLE users (
@@ -33,8 +34,10 @@ INSERT INTO projects (id, name) VALUES
     ('b0000000-0000-0000-0000-000000000002', 'Project Beta');
 
 -- Set up assignments so users get roles
+SET letter.bypass = on;
 SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
     role_name := NULL, role_column := 'role', if_fn := NULL);
+RESET letter.bypass;
 
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor'),
@@ -46,9 +49,9 @@ SELECT letter.grant('update', 'public.projects', 'editor', ARRAY['name', 'status
 -- editor can set budget (only when NULL), scoped to projects
 SELECT letter.grant('set', 'public.projects', 'editor', ARRAY['budget'], 'public.projects', NULL, NULL);
 -- editor can insert projects (unscoped)
-SELECT letter.grant('insert', 'public.projects', 'editor', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('insert', 'public.projects', 'editor', ARRAY['*'], NULL, NULL, NULL);
 -- editor can delete projects (unscoped — applies to any project)
-SELECT letter.grant('delete', 'public.projects', 'editor', ARRAY['*'], '', NULL, NULL);
+SELECT letter.grant('delete', 'public.projects', 'editor', ARRAY['*'], NULL, NULL, NULL);
 -- viewer can only select (no write grants)
 
 -- Verify GUC works
@@ -107,6 +110,15 @@ SELECT name FROM projects WHERE id = 'b0000000-0000-0000-0000-000000000002';
 -- Test 7: INSERT allowed with insert grant (row-level check)
 -- ============================================================
 
+-- The insert grant is unscoped, and Alice holds 'editor' only in
+-- project Alpha's scope. An unscoped grant needs the role in the global
+-- scope (plan/17 D11): denied.
+INSERT INTO projects (id, name) VALUES ('b0000000-0000-0000-0000-000000000003', 'Project Gamma');
+
+-- Give Alice the global 'editor' role: allowed.
+INSERT INTO letter.roles (role, user_id)
+    VALUES ('editor', 'a0000000-0000-0000-0000-000000000001');
+
 INSERT INTO projects (id, name) VALUES ('b0000000-0000-0000-0000-000000000003', 'Project Gamma');
 
 SELECT name FROM projects WHERE id = 'b0000000-0000-0000-0000-000000000003';
@@ -145,8 +157,8 @@ SELECT count(*) AS trigger_count FROM pg_trigger
 
 SELECT letter.revoke('update', 'public.projects', 'editor', ARRAY['*'], 'public.projects');
 SELECT letter.revoke('set', 'public.projects', 'editor', ARRAY['*'], 'public.projects');
-SELECT letter.revoke('insert', 'public.projects', 'editor', ARRAY['*'], '');
-SELECT letter.revoke('delete', 'public.projects', 'editor', ARRAY['*'], '');
+SELECT letter.revoke('insert', 'public.projects', 'editor', ARRAY['*'], NULL);
+SELECT letter.revoke('delete', 'public.projects', 'editor', ARRAY['*'], NULL);
 
 SELECT count(*) AS trigger_count_after FROM pg_trigger
     WHERE tgname LIKE 'letter_enforce_%'

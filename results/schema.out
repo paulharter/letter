@@ -1,5 +1,10 @@
 -- Test: extension creates the letter schema and core tables
 CREATE EXTENSION letter;
+WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+SET letter.enforce_reads = off;   -- this test is not about the read hook
+CREATE TABLE t (id int PRIMARY KEY);
 -- Verify schema exists
 SELECT nspname FROM pg_namespace WHERE nspname = 'letter';
  nspname 
@@ -7,7 +12,7 @@ SELECT nspname FROM pg_namespace WHERE nspname = 'letter';
  letter
 (1 row)
 
--- Verify the four core tables exist
+-- Verify the core tables (and the roles_epoch signal table) exist
 SELECT tablename FROM pg_tables
     WHERE schemaname = 'letter'
     ORDER BY tablename;
@@ -17,7 +22,8 @@ SELECT tablename FROM pg_tables
  grants
  role_assignments
  roles
-(4 rows)
+ roles_epoch
+(5 rows)
 
 -- Verify roles table columns
 SELECT column_name, data_type FROM information_schema.columns
@@ -28,7 +34,7 @@ SELECT column_name, data_type FROM information_schema.columns
  id          | uuid
  role        | character varying
  user_id     | character varying
- scope_table | character varying
+ scope_table | regclass
  scope_id    | character varying
 (5 rows)
 
@@ -39,10 +45,10 @@ SELECT column_name, data_type FROM information_schema.columns
  column_name |     data_type     
 -------------+-------------------
  privilege   | character varying
- on_table    | character varying
+ on_table    | regclass
  role        | character varying
  column_name | character varying
- scope       | character varying
+ scope       | regclass
  using_path  | ARRAY
  check_fn    | text
 (7 rows)
@@ -54,8 +60,8 @@ SELECT column_name, data_type FROM information_schema.columns
  column_name |     data_type     
 -------------+-------------------
  id          | uuid
- table_name  | character varying
- scope_table | character varying
+ table_name  | regclass
+ scope_table | regclass
  user_column | character varying
  role_name   | character varying
  role_column | character varying
@@ -66,15 +72,15 @@ SELECT column_name, data_type FROM information_schema.columns
 SELECT column_name, data_type FROM information_schema.columns
     WHERE table_schema = 'letter' AND table_name = 'role_assignments'
     ORDER BY ordinal_position;
-  column_name  |     data_type     
----------------+-------------------
+  column_name  | data_type 
+---------------+-----------
  id            | uuid
  assignment_id | uuid
  role_id       | uuid
- source_table  | character varying
+ source_table  | regclass
  source_id     | text
  user_id       | text
- scope_table   | character varying
+ scope_table   | regclass
  scope_id      | text
 (8 rows)
 
@@ -89,11 +95,11 @@ ERROR:  new row for relation "assignments" violates check constraint "role_name_
 \set VERBOSITY default
 -- Verify FK cascade: deleting assignment cascades to role_assignments
 INSERT INTO letter.assignments (table_name, user_column, role_name)
-    VALUES ('test_table', 'user_id', 'admin')
+    VALUES ('t', 'user_id', 'admin')
     RETURNING id \gset assign_
 INSERT INTO letter.roles (role, user_id) VALUES ('admin', 'user1') RETURNING id \gset role_
 INSERT INTO letter.role_assignments (assignment_id, role_id, source_table, source_id, user_id)
-    VALUES (:'assign_id', :'role_id', 'test_table', '1', 'user1');
+    VALUES (:'assign_id', :'role_id', 't', '1', 'user1');
 SELECT count(*) AS before_delete FROM letter.role_assignments;
  before_delete 
 ---------------
@@ -114,4 +120,5 @@ SELECT count(*) AS orphaned_roles FROM letter.roles WHERE id = :'role_id';
               0
 (1 row)
 
+DROP TABLE t;
 DROP EXTENSION letter CASCADE;
