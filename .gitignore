@@ -3,3 +3,6 @@ cmake-build-debug/
 *.dylib
 .claude/
 .idea/
+
+letter.o
+results/*.out
