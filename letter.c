@@ -219,6 +219,7 @@ typedef enum IfForm
 } IfForm;
 static IfForm validate_if_expr(Oid relid, const char *privilege, const char *if_text);
 static void require_superuser(const char *fn);
+static bool is_builtin_role(const char *role);
 static char *deparse_if_as(Oid relid, const char *if_expr, const char *out_alias, bool qualify);
 static bool try_in_subxact(void (*fn) (void *), void *arg, char **errmsg_out);
 static void letter_replan_assign_hook(bool newval, void *extra);
@@ -437,6 +438,11 @@ letter_grant(PG_FUNCTION_ARGS)
 	const char *scope_name;
 
 	require_superuser("letter.grant_global/grant_scoped");
+	if (OidIsValid(scope) && is_builtin_role(text_to_cstring(role)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("letter: %s holds in the global scope only", text_to_cstring(role)),
+				 errhint("anyone and any_user are held by every session; use grant_global.")));
 	deconstruct_array(columns, TEXTOID, -1, false, TYPALIGN_INT,
 					  &col_datums, &col_nulls, &col_count);
 
@@ -494,6 +500,34 @@ letter_grant(PG_FUNCTION_ARGS)
 
 		if (ret != SPI_OK_INSERT)
 			elog(ERROR, "letter: SPI_execute_with_args failed: %d", ret);
+	}
+
+	/* A write reaches only the rows the writer can see (plan/19 D1): an
+	 * update, delete or fill grant for a role with no select grant on the
+	 * table — its own, or one everyone holds — changes nothing, silently.
+	 * Say so now (plan/21 finding 6); check_health() says it again. */
+	{
+		const char *priv = text_to_cstring(privilege);
+
+		if (strcmp(priv, "update") == 0 || strcmp(priv, "delete") == 0 || strcmp(priv, "fill") == 0)
+		{
+			Oid		argtypes[2] = {REGCLASSOID, TEXTOID};
+			Datum	values[2];
+
+			values[0] = ObjectIdGetDatum(on_table);
+			values[1] = PointerGetDatum(role);
+			ret = SPI_execute_with_args(
+				"SELECT 1 FROM letter.grants WHERE on_table = $1 AND privilege = 'select' "
+				"AND role IN ($2, 'anyone', 'any_user')",
+				2, argtypes, values, NULL, true, 1);
+			if (ret != SPI_OK_SELECT)
+				elog(ERROR, "letter: failed to look up select grants");
+			if (SPI_processed == 0)
+				ereport(WARNING,
+						(errmsg("letter: \"%s\" has no select grant on %s — it can see no row, so it can change none",
+								text_to_cstring(role), on_table_name),
+						 errhint("A write reaches only the rows the writer can see: grant select on the columns the role must see first.")));
+		}
 	}
 
 	/* Install enforcement triggers if this is the first grant on the table */
@@ -1202,6 +1236,14 @@ rel_quoted_name(Oid relid)
 					quote_identifier(relname));
 }
 
+/* The built-in roles of plan/22: held by every session (any_user: with a
+ * user set; anyone: even without), never a membership row, global only. */
+static bool
+is_builtin_role(const char *role)
+{
+	return strcmp(role, "anyone") == 0 || strcmp(role, "any_user") == 0;
+}
+
 /* Configuration — grants and membership rules — is done by a superuser
  * (plan/21 D9): the calls write letter's tables and create functions in
  * its schema, and a half-privileged migrator would fail with a bare
@@ -1348,6 +1390,11 @@ letter_assign(PG_FUNCTION_ARGS)
 	/* Validate: must have role or role_column but not both */
 	if ((role == NULL) == (role_column == NULL))
 		elog(ERROR, "letter: must provide exactly one of role or role_column");
+	if (role != NULL && is_builtin_role(role))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("letter: a rule cannot confer %s", role),
+				 errhint("anyone and any_user are held by every session already (plan/22).")));
 
 	/* The if is an expression over the source row (plan/20 §3). The rule
 	 * functions run SECURITY DEFINER with search_path pinned to pg_catalog,
@@ -1778,7 +1825,10 @@ populate_cache(const char *user_id)
 	uint64		i;
 
 	/* Check if cache is already valid for this user */
-	if (letter_cache.valid && strcmp(letter_cache.user_id, user_id) == 0)
+	/* NULL: an anonymous session (plan/22) — no memberships, only anyone. */
+	const char *uid = user_id ? user_id : "";
+
+	if (letter_cache.valid && strcmp(letter_cache.user_id, uid) == 0)
 		return;
 
 	/* Reset cache */
@@ -1790,15 +1840,18 @@ populate_cache(const char *user_id)
 												 ALLOCSET_SMALL_SIZES);
 	else
 		MemoryContextReset(letter_cache_cxt);
-	strlcpy(letter_cache.user_id, user_id, sizeof(letter_cache.user_id));
+	strlcpy(letter_cache.user_id, uid, sizeof(letter_cache.user_id));
 
 	/* Load roles for this user. Parameterized: the user id comes from a
 	 * user-settable GUC and must never be interpolated into SQL. */
+	if (uid[0] == '\0')
+		ret = SPI_OK_SELECT;			/* nothing to load: SPI_processed stays 0 */
+	else
 	{
 		Oid		argtypes[1] = {TEXTOID};
 		Datum	values[1];
 
-		values[0] = CStringGetTextDatum(user_id);
+		values[0] = CStringGetTextDatum(uid);
 		ret = guarded_spi_execute_with_args(
 			"SELECT role, scope_table, scope_id FROM letter.memberships "
 			"WHERE user_id = $1",
@@ -1807,7 +1860,7 @@ populate_cache(const char *user_id)
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "letter: failed to load roles for cache");
 
-	for (i = 0; i < SPI_processed && letter_cache.nroles < LETTER_MAX_ROLES; i++)
+	for (i = 0; i < (uid[0] ? SPI_processed : 0) && letter_cache.nroles < LETTER_MAX_ROLES; i++)
 	{
 		LetterRole *r = &letter_cache.roles[letter_cache.nroles];
 		char	   *val;
@@ -1853,16 +1906,21 @@ populate_cache(const char *user_id)
 	 * role names originate in application table data (assignment rules with
 	 * role_column), so they are user-controlled and must never be
 	 * interpolated into SQL. */
-	if (letter_cache.nroles > 0)
+	/* The built-in roles (plan/22) are held without a row: anyone by every
+	 * session, any_user by every session with a user. */
 	{
-		Datum	   *role_datums = (Datum *) palloc(sizeof(Datum) * letter_cache.nroles);
+		int			nroles = 0;
+		Datum	   *role_datums = (Datum *) palloc(sizeof(Datum) * (letter_cache.nroles + 2));
 		ArrayType  *role_arr;
 		Oid			argtypes[1] = {TEXTARRAYOID};
 		Datum		values[1];
 
 		for (i = 0; i < (uint64) letter_cache.nroles; i++)
-			role_datums[i] = CStringGetTextDatum(letter_cache.roles[i].role);
-		role_arr = construct_array(role_datums, letter_cache.nroles,
+			role_datums[nroles++] = CStringGetTextDatum(letter_cache.roles[i].role);
+		role_datums[nroles++] = CStringGetTextDatum("anyone");
+		if (uid[0])
+			role_datums[nroles++] = CStringGetTextDatum("any_user");
+		role_arr = construct_array(role_datums, nroles,
 								   TEXTOID, -1, false, TYPALIGN_INT);
 		values[0] = PointerGetDatum(role_arr);
 
@@ -3277,10 +3335,14 @@ walk_scope_path(Oid relid, Oid scope_oid, const char *via_str,
  * ---------------------------------------------------------------- */
 
 /* The generated SQL reads the user through letter._user_id(), which
- * errors when letter.user_id is unset (D2 as amended 2026-09-23):
- * a run-time call, so a plan cached with a user set fails correctly when
- * executed without one. */
-#define BARRIER_USER_ID "letter._user_id()"
+ * errors when letter.user_id is unset (D2 as amended 2026-09-23): a
+ * run-time call, so a plan cached with a user set fails correctly when
+ * executed without one. A table with an `anyone` select grant (plan/22
+ * D2) serves an anonymous session its anonymous view instead: there the
+ * tests read letter.user_id(), NULL when unset, so a membership test
+ * simply matches nothing. Chosen once per generation, for every group. */
+#define USER_FN_STRICT "letter._user_id()"
+#define USER_FN_LENIENT "letter.user_id()"
 
 typedef struct BarrierGroup
 {
@@ -3303,6 +3365,7 @@ typedef struct BarrierGroup
 								 * if it renders its own */
 	char	   *if_test;		/* rendered: a scalar sublink over the row; NULL if none */
 	bool		used_by_columns;	/* some column's CASE tests this group */
+	const char *user_fn;		/* USER_FN_STRICT or USER_FN_LENIENT (plan/22) */
 } BarrierGroup;
 
 /* A rule's `if` as an ordinary expression over the base alias b (plan/17
@@ -3474,6 +3537,9 @@ barrier_append_test(StringInfo buf, BarrierGroup *g, const char *column_name)
 	ListCell   *lr;
 	ListCell   *lc;
 
+	bool		anyone = false;
+	bool		any_user = false;
+
 	initStringInfo(&roles);
 	forboth(lr, g->roles, lc, g->columns)
 	{
@@ -3486,8 +3552,14 @@ barrier_append_test(StringInfo buf, BarrierGroup *g, const char *column_name)
 			continue;
 		if (last != NULL && strcmp(last, role) == 0)
 			continue;
-		appendStringInfo(&roles, "%s%s", last ? ", " : "", quote_literal_cstr(role));
 		last = role;
+		/* The built-in roles (plan/22) need no membership row. */
+		if (strcmp(role, "anyone") == 0)
+			anyone = true;
+		else if (strcmp(role, "any_user") == 0)
+			any_user = true;
+		else
+			appendStringInfo(&roles, "%s%s", roles.len ? ", " : "", quote_literal_cstr(role));
 	}
 	if (last == NULL)
 		return false;
@@ -3496,20 +3568,32 @@ barrier_append_test(StringInfo buf, BarrierGroup *g, const char *column_name)
 	 * §3.2 rule 5) — a NULL if hides the row like a failed scope. */
 	if (g->if_test)
 		appendStringInfoChar(buf, '(');
-	if (g->scope[0] == '\0')
-		/* the global scope: the role must be held unscoped (plan/17 D11) */
-		appendStringInfo(buf,
-						 "(SELECT EXISTS (SELECT 1 FROM letter.memberships r"
-						 " WHERE r.user_id = " BARRIER_USER_ID
-						 " AND r.role IN (%s) AND r.scope_table IS NULL))",
-						 roles.data);
+	if (anyone)
+		appendStringInfoString(buf, "TRUE");
+	else if (g->scope[0] == '\0')
+	{
+		/* the global scope: the role must be held unscoped (plan/17 D11);
+		 * any_user is held by every session with a user set */
+		if (any_user && roles.len)
+			appendStringInfoChar(buf, '(');
+		if (any_user)
+			appendStringInfo(buf, "%s IS NOT NULL", g->user_fn);
+		if (roles.len)
+			appendStringInfo(buf,
+							 "%s(SELECT EXISTS (SELECT 1 FROM letter.memberships r"
+							 " WHERE r.user_id = %s"
+							 " AND r.role IN (%s) AND r.scope_table IS NULL))",
+							 any_user ? " OR " : "", g->user_fn, roles.data);
+		if (any_user && roles.len)
+			appendStringInfoChar(buf, ')');
+	}
 	else
 		appendStringInfo(buf,
 						 "%s IN (SELECT r.scope_id::%s FROM letter.memberships r"
-						 " WHERE r.user_id = " BARRIER_USER_ID
+						 " WHERE r.user_id = %s"
 						 " AND r.role IN (%s) AND r.scope_table = %u)",
 						 g->correlated ? g->scope_expr_corr : g->scope_expr,
-						 g->cast_type, roles.data, g->scope_oid);
+						 g->cast_type, g->user_fn, roles.data, g->scope_oid);
 	if (g->if_test)
 		appendStringInfo(buf, " AND %s)", g->if_test);
 	pfree(roles.data);
@@ -3564,6 +3648,7 @@ build_barrier_sql_ext(Oid relid, BarrierMode mode, char **pk_col_out, char **pk_
 	int			nscoped = 0;
 	int			i;
 	uint64		r;
+	bool		anonymous_ok = false;
 
 	rel = table_open(relid, AccessShareLock);
 	tupdesc = RelationGetDescr(rel);
@@ -3623,7 +3708,14 @@ build_barrier_sql_ext(Oid relid, BarrierMode mode, char **pk_col_out, char **pk_
 		}
 		g->roles = lappend(g->roles, SPI_getvalue(tup, td, 4));
 		g->columns = lappend(g->columns, SPI_getvalue(tup, td, 5));
+		if (strcmp((const char *) llast(g->roles), "anyone") == 0)
+			anonymous_ok = true;
 	}
+
+	/* A table with an anyone select grant serves anonymous sessions (plan/22
+	 * D2); every other table errors when no user is set. */
+	foreach(lc, groups)
+		((BarrierGroup *) lfirst(lc))->user_fn = anonymous_ok ? USER_FN_LENIENT : USER_FN_STRICT;
 
 	/* Render each distinct chain once: groups that differ only in their
 	 * if (or roles) share the joins and the aliases (D17). */
@@ -3999,9 +4091,6 @@ Datum
 letter_visible_columns(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Oid			pk_argtype = get_fn_expr_argtype(fcinfo->flinfo, 1);
-	Oid			typoutput;
-	bool		typisvarlena;
 	char	   *pk_text;
 	char	   *pk_col;
 	char	   *pk_type;
@@ -4026,8 +4115,9 @@ letter_visible_columns(PG_FUNCTION_ARGS)
 							rel_qualified_name(relid))));
 	}
 
-	getTypeOutputInfo(pk_argtype, &typoutput, &typisvarlena);
-	pk_text = OidOutputFunctionCall(typoutput, PG_GETARG_DATUM(1));
+	/* The key as text (plan/21 D13): the generated SQL casts it to the
+	 * column's type, so any key type and any driver's string will do. */
+	pk_text = text_to_cstring(PG_GETARG_TEXT_PP(1));
 
 	SPI_connect();
 
@@ -4268,6 +4358,12 @@ holds_role(const char *role, Oid scope_table, const char *scope_id)
 {
 	int			ri;
 
+	/* The built-in roles (plan/22): no row, global only. */
+	if (strcmp(role, "anyone") == 0)
+		return true;
+	if (strcmp(role, "any_user") == 0)
+		return letter_cache.user_id[0] != '\0';
+
 	for (ri = 0; ri < letter_cache.nroles; ri++)
 	{
 		LetterRole *r = &letter_cache.roles[ri];
@@ -4408,6 +4504,29 @@ row_has_any_select_grant(const char *user_id, Oid relid,
 	return false;
 }
 
+/* A write refused by the triggers. With no user set only anyone rules
+ * could have applied (plan/22); when none did, the message is the one
+ * an unidentified session has always had. */
+static void
+write_denied(const char *op, const char *schema_name, const char *table_name,
+			 const char *col_name, const char *requires, const char *user_id)
+{
+	if (user_id == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("letter: %s denied on \"%s.%s\" — letter.user_id is not set",
+						op, schema_name, table_name)));
+	if (col_name != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("letter: %s denied on \"%s.%s\" column \"%s\" for user \"%s\" — requires %s",
+						op, schema_name, table_name, col_name, user_id, requires)));
+	ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("letter: %s denied on \"%s.%s\" for user \"%s\"",
+					op, schema_name, table_name, user_id)));
+}
+
 /* ----------------------------------------------------------------
  * letter_enforce_insert() — BEFORE INSERT trigger
  * ---------------------------------------------------------------- */
@@ -4428,13 +4547,7 @@ letter_enforce_insert(PG_FUNCTION_ARGS)
 	if (should_bypass())
 		return PointerGetDatum(trigdata->tg_trigtuple);
 
-	user_id = get_current_user_id();
-	if (user_id == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("letter: INSERT denied on \"%s.%s\" — letter.user_id is not set",
-						get_namespace_name(rel->rd_rel->relnamespace),
-						RelationGetRelationName(rel))));
+	user_id = get_current_user_id();	/* NULL: anonymous — only anyone rules apply (plan/22) */
 
 	schema_name = get_namespace_name(rel->rd_rel->relnamespace);
 	table_name = RelationGetRelationName(rel);
@@ -4445,10 +4558,7 @@ letter_enforce_insert(PG_FUNCTION_ARGS)
 						trigdata->tg_trigtuple, rel->rd_att))
 	{
 		SPI_finish();
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("letter: INSERT denied on \"%s.%s\" for user \"%s\"",
-						schema_name, table_name, user_id)));
+		write_denied("INSERT", schema_name, table_name, NULL, NULL, user_id);
 	}
 
 	SPI_finish();
@@ -4481,13 +4591,7 @@ letter_enforce_update(PG_FUNCTION_ARGS)
 	if (should_bypass())
 		return PointerGetDatum(trigdata->tg_newtuple);
 
-	user_id = get_current_user_id();
-	if (user_id == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("letter: UPDATE denied on \"%s.%s\" — letter.user_id is not set",
-						get_namespace_name(rel->rd_rel->relnamespace),
-						RelationGetRelationName(rel))));
+	user_id = get_current_user_id();	/* NULL: anonymous — only anyone rules apply (plan/22) */
 
 	schema_name = get_namespace_name(rel->rd_rel->relnamespace);
 	table_name = RelationGetRelationName(rel);
@@ -4544,10 +4648,7 @@ letter_enforce_update(PG_FUNCTION_ARGS)
 			if (!ok_old || !ok_new)
 			{
 				SPI_finish();
-				ereport(ERROR,
-						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						 errmsg("letter: UPDATE denied on \"%s.%s\" column \"%s\" for user \"%s\" — requires 'fill' or 'update' privilege",
-								schema_name, table_name, col_name, user_id)));
+				write_denied("UPDATE", schema_name, table_name, col_name, "'fill' or 'update' privilege", user_id);
 			}
 		}
 		else
@@ -4557,10 +4658,7 @@ letter_enforce_update(PG_FUNCTION_ARGS)
 				!check_grant(user_id, "update", relid, col_name, newtuple, tupdesc, oldtuple, newtuple))
 			{
 				SPI_finish();
-				ereport(ERROR,
-						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						 errmsg("letter: UPDATE denied on \"%s.%s\" column \"%s\" for user \"%s\" — requires 'update' privilege",
-								schema_name, table_name, col_name, user_id)));
+				write_denied("UPDATE", schema_name, table_name, col_name, "'update' privilege", user_id);
 			}
 		}
 	}
@@ -4589,13 +4687,7 @@ letter_enforce_delete(PG_FUNCTION_ARGS)
 	if (should_bypass())
 		return PointerGetDatum(trigdata->tg_trigtuple);
 
-	user_id = get_current_user_id();
-	if (user_id == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("letter: DELETE denied on \"%s.%s\" — letter.user_id is not set",
-						get_namespace_name(rel->rd_rel->relnamespace),
-						RelationGetRelationName(rel))));
+	user_id = get_current_user_id();	/* NULL: anonymous — only anyone rules apply (plan/22) */
 
 	schema_name = get_namespace_name(rel->rd_rel->relnamespace);
 	table_name = RelationGetRelationName(rel);
@@ -4606,10 +4698,7 @@ letter_enforce_delete(PG_FUNCTION_ARGS)
 						trigdata->tg_trigtuple, rel->rd_att))
 	{
 		SPI_finish();
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("letter: DELETE denied on \"%s.%s\" for user \"%s\"",
-						schema_name, table_name, user_id)));
+		write_denied("DELETE", schema_name, table_name, NULL, NULL, user_id);
 	}
 
 	SPI_finish();
@@ -5467,6 +5556,29 @@ letter_require_user(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(user_id));
 }
 
+/* Does the table have an anyone select grant (plan/22 D2)? Then an
+ * anonymous session gets its anonymous view rather than an error. */
+static bool
+table_serves_anonymous(const char *qualified_table)
+{
+	Oid			argtypes[1] = {TEXTOID};
+	Datum		values[1];
+	int			ret;
+	bool		yes;
+
+	values[0] = CStringGetTextDatum(qualified_table);
+	SPI_connect();
+	ret = guarded_spi_execute_with_args(
+		"SELECT 1 FROM letter.grants WHERE on_table = $1::regclass "
+		"AND privilege = 'select' AND role = 'anyone'",
+		1, argtypes, values, NULL, true, 1);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "letter: failed to look up anyone grants");
+	yes = SPI_processed > 0;
+	SPI_finish();
+	return yes;
+}
+
 /* ----------------------------------------------------------------
  * letter.read(table_name text, condition text DEFAULT NULL)
  * Returns SETOF jsonb.
@@ -5506,7 +5618,7 @@ letter_read(PG_FUNCTION_ARGS)
 		 * Every other access failure (no applicable grant, row out of scope,
 		 * WHERE that picks an unreadable row) is represented by absent rows. */
 		user_id = get_current_user_id();
-		if (!bypass && user_id == NULL)
+		if (!bypass && user_id == NULL && !table_serves_anonymous(qualified_table))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("letter: SELECT denied on \"%s\" — letter.user_id is not set",

@@ -207,16 +207,16 @@ DEALLOCATE q;
 -- 6. letter.visible_columns(): which NULLs are redactions.
 -- ============================================================
 SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
-SELECT name, letter.visible_columns('public.projects', id) FROM projects ORDER BY name;
-SELECT letter.visible_columns('public.projects', 'b0000000-0000-0000-0000-000000000003'::uuid) AS gamma_hidden;
+SELECT name, letter.visible_columns('public.projects', id::text) FROM projects ORDER BY name;
+SELECT letter.visible_columns('public.projects', 'b0000000-0000-0000-0000-000000000003') AS gamma_hidden;
 SET letter.user_id = 'a0000000-0000-0000-0000-000000000002';
-SELECT name, letter.visible_columns('public.projects', id) FROM projects ORDER BY name;
+SELECT name, letter.visible_columns('public.projects', id::text) FROM projects ORDER BY name;
 SET letter.user_id = 'a0000000-0000-0000-0000-000000000004';
-SELECT name, letter.visible_columns('public.projects', id) FROM projects ORDER BY name;
-SELECT letter.visible_columns('public.projects', 'b0000000-0000-0000-0000-0000000000ff'::uuid) AS no_such_row;
-SELECT letter.visible_columns('public.team_members', gen_random_uuid());
+SELECT name, letter.visible_columns('public.projects', id::text) FROM projects ORDER BY name;
+SELECT letter.visible_columns('public.projects', 'b0000000-0000-0000-0000-0000000000ff') AS no_such_row;
+SELECT letter.visible_columns('public.team_members', gen_random_uuid()::text);
 SET letter.bypass = on;
-SELECT letter.visible_columns('public.projects', 'b0000000-0000-0000-0000-000000000003'::uuid) AS bypass_sees_all;
+SELECT letter.visible_columns('public.projects', 'b0000000-0000-0000-0000-000000000003') AS bypass_sees_all;
 SET letter.bypass = off;
 
 -- ============================================================
@@ -238,9 +238,32 @@ SELECT letter.grant_global('select', 'public.projects', 'auditor', ARRAY['budget
 SET letter.bypass = off;
 SET letter.user_id = 'a0000000-0000-0000-0000-000000000004';
 SELECT name, budget FROM projects ORDER BY name;
-SELECT name, letter.visible_columns('public.projects', id) FROM projects ORDER BY name;
+SELECT name, letter.visible_columns('public.projects', id::text) FROM projects ORDER BY name;
 SELECT name FROM projects WHERE budget > 0 ORDER BY name;
 SET letter.bypass = on;
+
+-- ============================================================
+-- 9. The built-in roles through the hook (plan/22): a public table
+--    (anyone: titles of published pages) read with no user set; bodies
+--    for any signed-in user, membership or not; and a table without an
+--    anyone grant, alone or joined, still errors for the anonymous session.
+-- ============================================================
+CREATE TABLE pages (id int PRIMARY KEY, project_id uuid REFERENCES projects(id), title TEXT, body TEXT, draft boolean NOT NULL DEFAULT false);
+INSERT INTO pages VALUES
+    (1, 'b0000000-0000-0000-0000-000000000001', 'Alpha page',  'alpha body', false),
+    (2, 'b0000000-0000-0000-0000-000000000001', 'Alpha draft', 'draft body', true);
+SELECT letter.grant_global('select', 'public.pages', 'anyone',   ARRAY['title'],         if := 'NOT draft');
+SELECT letter.grant_global('select', 'public.pages', 'any_user', ARRAY['title', 'body'], if := 'NOT draft');
+SET letter.bypass = off;
+RESET letter.user_id;
+SELECT title, body FROM pages ORDER BY title;
+SELECT name FROM projects ORDER BY name;   -- no anyone grant on projects: still an error
+SELECT p.title, pr.name FROM pages p JOIN projects pr ON pr.id = p.project_id;
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000009';   -- no membership anywhere
+SELECT title, body FROM pages ORDER BY title;
+SELECT name FROM projects ORDER BY name;
+SET letter.bypass = on;
+DROP TABLE pages;
 
 \set VERBOSITY default
 -- Cleanup

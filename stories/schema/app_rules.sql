@@ -1,16 +1,18 @@
 -- The story application's membership rules and grants. Run as story_admin.
--- Memberships come from the application's own writes (plan/21 D7): whoever
--- authors an org or a project owns it, and owners invite.
+-- Memberships come from the application's own writes (plan/21 D7): a user
+-- signs up as themselves (any_user, plan/22), whoever authors an org or a
+-- project owns it, and owners invite.
 
-SELECT letter.assign('public.users',        'id',       role := 'user');                               -- every account: the global role 'user'
 SELECT letter.assign('public.orgs',         'owner_id', role := 'org_admin', scope := 'public.orgs');   -- the author of an org runs it (D8)
 SELECT letter.assign('public.org_members',  'user_id',  role_column := 'role', scope := 'public.orgs');
 SELECT letter.assign('public.projects',     'owner_id', role := 'owner', scope := 'public.projects');   -- the author of a project owns it (D8)
 SELECT letter.assign('public.team_members', 'user_id',  role_column := 'role', scope := 'public.projects');
 
--- Everyone signed in can see who else exists — names only — and can start an org they own.
-SELECT letter.grant_global('select', 'public.users', 'user', ARRAY['id', 'name']);
-SELECT letter.grant_global('insert', 'public.orgs',  'user', if := 'owner_id = letter.user_id()::uuid');
+-- Sign-up: any session with a user may insert its own users row (plan/22). Then
+-- anyone signed in can see who else exists — names only — and start an org they own.
+SELECT letter.grant_global('insert', 'public.users', 'any_user', if := 'id = letter.user_id()::uuid');
+SELECT letter.grant_global('select', 'public.users', 'any_user', ARRAY['id', 'name']);
+SELECT letter.grant_global('insert', 'public.orgs',  'any_user', if := 'owner_id = letter.user_id()::uuid');
 
 -- Orgs: admins run them and invite members; members see them and start projects in them.
 SELECT letter.grant_scoped('select', 'public.orgs',        'org_admin',  ARRAY['*'],            'public.orgs');

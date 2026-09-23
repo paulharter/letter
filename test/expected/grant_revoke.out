@@ -22,6 +22,57 @@ ERROR:  letter: letter.unassign requires a superuser
 RESET ROLE;
 REVOKE USAGE ON SCHEMA letter FROM letter_test_nobody;
 DROP ROLE letter_test_nobody;
+-- The built-in roles anyone and any_user (plan/22 A1): global only, never a
+-- membership row, never conferred by a rule; granted like any role globally.
+CREATE TABLE public_pages (id int PRIMARY KEY, body text);
+\set VERBOSITY terse
+SELECT letter.grant_scoped('select', 'public.public_pages', 'anyone', ARRAY['*'], 'public.public_pages');
+ERROR:  letter: anyone holds in the global scope only
+SELECT letter.grant_scoped('select', 'public.public_pages', 'any_user', ARRAY['*'], 'public.public_pages');
+ERROR:  letter: any_user holds in the global scope only
+INSERT INTO letter.memberships (role, user_id) VALUES ('anyone', 'someone');
+ERROR:  new row for relation "memberships" violates check constraint "memberships_role_check"
+INSERT INTO letter.memberships (role, user_id) VALUES ('any_user', 'someone');
+ERROR:  new row for relation "memberships" violates check constraint "memberships_role_check"
+SET letter.bypass = on;
+SELECT letter.assign('public.public_pages', 'body', role := 'anyone');
+ERROR:  letter: a rule cannot confer anyone
+SELECT letter.assign('public.public_pages', 'body', role := 'any_user');
+ERROR:  letter: a rule cannot confer any_user
+RESET letter.bypass;
+\set VERBOSITY default
+SELECT letter.grant_global('select', 'public.public_pages', 'anyone', ARRAY['*']);
+ grant_global 
+--------------
+ t
+(1 row)
+
+SELECT letter.grant_global('insert', 'public.public_pages', 'any_user', if := 'id > 0');
+ grant_global 
+--------------
+ t
+(1 row)
+
+SELECT role, privilege, column_name, "if" FROM letter.grants WHERE on_table = 'public.public_pages'::regclass ORDER BY 1, 2;
+   role   | privilege | column_name |   if   
+----------+-----------+-------------+--------
+ any_user | insert    | *           | id > 0
+ anyone   | select    | *           | 
+(2 rows)
+
+SELECT letter.revoke_global('select', 'public.public_pages', 'anyone');
+ revoke_global 
+---------------
+ t
+(1 row)
+
+SELECT letter.revoke_global('insert', 'public.public_pages', 'any_user');
+ revoke_global 
+---------------
+ t
+(1 row)
+
+DROP TABLE public_pages;
 -- Tables are regclass (plan/18 D1): letter.grant_global() refuses one that does
 -- not exist (plan/17 D10) and handles names that need quoting.
 CREATE TABLE orgs (id uuid PRIMARY KEY DEFAULT gen_random_uuid());
@@ -69,6 +120,8 @@ SELECT privilege, on_table, role, column_name, scope
 
 -- grant with via and if
 SELECT letter.grant_scoped('update', 'public.projects', 'member', ARRAY['status'], 'public.orgs', ARRAY['org_id'], 'status <> ''archived''');
+WARNING:  letter: "member" has no select grant on public.projects — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_scoped 
 --------------
  t
@@ -84,12 +137,16 @@ SELECT privilege, on_table, role, column_name, scope, via, if
 -- a grant's identity is the whole rule (plan/17 D15): the same rule again is
 -- one rule; a rule that differs in its path is another rule alongside it
 SELECT letter.grant_scoped('update', 'public.projects', 'member', ARRAY['status'], 'public.orgs', ARRAY['org_id'], 'status <> ''archived''');
+WARNING:  letter: "member" has no select grant on public.projects — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_scoped 
 --------------
  t
 (1 row)
 
 SELECT letter.grant_scoped('update', 'public.projects', 'member', ARRAY['status'], 'public.orgs', ARRAY['alt_org_id'], 'status <> ''archived''');
+WARNING:  letter: "member" has no select grant on public.projects — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_scoped 
 --------------
  t

@@ -79,11 +79,12 @@ def test_offboarding_forgets_every_membership(seeded, app, dave):
         app.execute("INSERT INTO team_members (project_id, user_id, role) VALUES (%s, %s, 'editor')", (ALPHA, DAVE))
     assert dave.execute(Q).fetchall() == [("Alpha", 1000)]
     assert dave.execute("SELECT count(*) FROM orgs").fetchone()[0] == 1
-    assert truth(seeded, "SELECT count(*) FROM letter.memberships WHERE user_id = %s", (DAVE,))[0][0] == 3   # user, org_member, editor
-    assert truth(seeded, "SELECT letter.forget_user(%s)", (DAVE,))[0][0] == 3
+    assert truth(seeded, "SELECT count(*) FROM letter.memberships WHERE user_id = %s", (DAVE,))[0][0] == 2   # org_member, editor
+    assert truth(seeded, "SELECT letter.forget_user(%s)", (DAVE,))[0][0] == 2
     assert dave.execute(Q).fetchall() == []
-    # not even the 'user' membership: the users table is granted, but not to him — empty, not an error
-    assert dave.execute("SELECT count(*) FROM users").fetchone()[0] == 0
+    assert dave.execute("SELECT count(*) FROM orgs").fetchone()[0] == 0
+    # what needs no membership stays: any signed-in user sees who exists
+    assert dave.execute("SELECT count(*) FROM users").fetchone()[0] == 4
     # his rows in the application's tables are the application's to clean up
     assert truth(seeded, "SELECT count(*) FROM team_members WHERE user_id = %s", (DAVE,))[0][0] == 1
 

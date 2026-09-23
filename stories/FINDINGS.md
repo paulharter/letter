@@ -3,6 +3,9 @@
 What the stories found the API could not express, or needed the admin role
 for. Source of the README's "Known gaps" at beta (plan/21 D6).
 
+Findings 1–9 were gone through one by one with Paul on 2026-09-23 (plan/21 D9–D13,
+plan/22); each entry says how it was resolved.
+
 1. **The extension grants no privileges on its own schema** (P1, scaffolding —
    ✅ resolved 2026-09-23 → D9: configuration is a superuser's; the four
    configuration calls refuse any other role with a letter message). A
@@ -50,7 +53,8 @@ for. Source of the README's "Known gaps" at beta (plan/21 D6).
    hook is loaded should run `letter.check_health()` as the admin role, or
    simply rely on the behaviour: a SELECT with no user set errors.
 
-5. **Sign-up is a privileged step** (story 3). A user who does not exist yet
+5. **Sign-up was a privileged step** (story 3 — ✅ 2026-09-23 → plan 22: the
+   built-in roles `any_user` and `anyone`; Dave now signs up as himself). A user who does not exist yet
    holds no role, so no grant can let them insert their own `users` row; the
    application inserts it with bypass (or a backend process does). From then
    on everything follows from rules: the `users` row confers the global role
@@ -58,25 +62,30 @@ for. Source of the README's "Known gaps" at beta (plan/21 D6).
    whose author is its admin, who starts projects, whose author owns them
    (D7, D8). Documentation.
 
-6. **A write reaches only the rows the writer can see** (story 4, `19` D1).
+6. **A write reaches only the rows the writer can see** (story 4, `19` D1 —
+   ✅ 2026-09-23 → D11: `grant_*` warns when an update/delete/fill grant has no
+   select grant beside it, `check_health()` reports it, README "Writes" says it).
    An owner with insert and delete grants on `team_members` but no select
    grant issues a `DELETE` that matches nothing — silently. Managing a
    membership source table needs a select grant on it too. Documentation,
    and an argument for a "manage" idiom in the README.
 
 7. **Under a global grant, a join needs the key columns granted** (story 6;
-   README "Known gaps"). The auditor's `projects ⋈ tasks` matched nothing
+   README "Known gaps" — ✅ 2026-09-23, Paul: stays as documented; a foreign key
+   can be information on its own, `tasks.assignee_id` says who is assigned). The auditor's `projects ⋈ tasks` matched nothing
    until `tasks.project_id` was granted. Scoped grants disclose their own path
    column (`17` D16); global ones have no path. Documentation.
 
-8. **`visible_columns(rel, pk anyelement)` needs a cast from a driver**
-   (story 3): a parameter sent as unknown cannot resolve the polymorphic
+8. **`visible_columns(rel, pk anyelement)` needed a cast from a driver**
+   (story 3 — ✅ 2026-09-23 → D13: the key is `text`; pass the string, or
+   `id::text` in SQL): a parameter sent as unknown cannot resolve the polymorphic
    argument — `could not determine polymorphic type`. Write
    `letter.visible_columns('public.projects', $1::uuid)`. The function turns
    the key into text and casts it to the column's type itself, so `$1::text`
    works for any key type. A `(regclass, text)` overload would remove the
    surprise. API rough edge — for Paul.
 
-9. **An emptied user reads nothing, not an error** (story 4). After
+9. **An emptied user reads nothing, not an error** (story 4 — ✅ 2026-09-23: as
+   intended; README "Default deny" now states the distinction). After
    `forget_user()` the user's `SELECT` on a granted table returns zero rows;
    only a table with no grants at all errors (`17` D14). Documentation.

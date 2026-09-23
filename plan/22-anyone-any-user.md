@@ -78,19 +78,19 @@ grants `anyone` something.
 
 ## 3. Steps
 
-- [ ] **A1** — Schema CHECK, grant/assign refusals, tests in `grant_revoke.sql`.
-- [ ] **A2** — Generator: the two tests, the per-table user function; `barrier_sql`
-  fixture 11; `hook_read` cases.
-- [ ] **A3** — Triggers, `holds_role`, the unset-user error moved; `enforce_write`
-  cases; `visible_columns()`/`_read()` parity.
-- [ ] **A4** — Story 3 and `app_rules.sql`; README; `FINDINGS.md` #5; PG16 run.
+- [x] **A1** — Schema CHECK, grant/assign refusals, tests in `grant_revoke.sql` *(2026-09-23)*.
+- [x] **A2** — Generator: the two tests, the per-table user function; `barrier_sql`
+  fixture 11; `hook_read` case 9 *(2026-09-23)*.
+- [x] **A3** — Triggers, `holds_role`, the unset-user error moved; `enforce_write`
+  test 13; `visible_columns()`/`_read()` parity in fixture 11 *(2026-09-23)*.
+- [x] **A4** — Story 3 and `app_rules.sql`; README; `FINDINGS.md` #5; PG16 run *(2026-09-23)*.
 
 ## 4. Decisions
 
 - **D1 — names `anyone`, `any_user`** *(Paul, 2026-09-23)*.
 - **D2 — an unset user stays an error**, except on a table with an `anyone` grant,
   which serves the anonymous view *(Paul, 2026-09-23)*.
-- **D3 — global only; reserved in memberships and assign** *(proposed)*.
+- **D3 — global only; reserved in memberships and assign** *(implemented as proposed, A1)*.
 
 ## 5. Stop-and-discuss triggers
 
@@ -104,5 +104,17 @@ grants `anyone` something.
 
 ## 0. Status — resume here
 
-**2026-09-23: DRAFTED.** D1, D2 decided; D3 proposed. Next: A1, then A2–A4; then back
-to plan `21` findings 6–9 and P4.
+**2026-09-23: COMPLETE — A1–A4.** Landed: CHECKs on `memberships.role` and
+`membership_rules.role`; `grant_scoped` and `assign` refuse the two names; the barrier
+renders `anyone` as `TRUE` and `any_user` as `<user_fn> IS NOT NULL` (OR-ed with the
+membership test of the group's other roles), and reads the user through
+`letter.user_id()` on a table with an `anyone` select grant, `letter._user_id()`
+elsewhere; the triggers' cache holds `anyone` always and `any_user` when a user is
+set, `holds_role` answers for both, the "user_id is not set" error is raised only when
+no rule applied (`write_denied`); the walker serves an anonymous session on a table
+with an `anyone` select grant. Tests: grant_revoke (refusals), barrier_sql fixture 11
+(golden text, three sessions incl. anonymous, parity with `visible_columns()` and
+`_read()`), hook_read 9, enforce_write 13 (sign-up, guestbook). Story 3 signs Dave up
+as himself; the story app's `users → user` rule is gone, replaced by `any_user`.
+README: the two roles in Concepts and the deployment model. 18 C tests green on PG
+16 and 17; 35 story tests green. Next: plan `21` findings 6–9, then P4.

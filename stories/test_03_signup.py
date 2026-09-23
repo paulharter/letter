@@ -7,8 +7,8 @@ project owns it, and owners invite.)
 import pytest
 import psycopg
 
-from helpers import (ALICE, CAROL, DAVE, ALPHA, actual_view, as_user, col, denied,
-                     expected_view, rows, seed_basic, truth)
+from helpers import (ALICE, CAROL, DAVE, ERIN, ALPHA, actual_view, as_user, col, denied,
+                     expected_view, rows, seed_basic, truth, unset_user)
 
 
 @pytest.fixture(scope="module")
@@ -17,18 +17,21 @@ def seeded(app_rules):
     return app_rules
 
 
-def test_signup_is_a_privileged_step(seeded, app):
-    """Dave does not exist yet, so no rule can have given him a role and no
-    grant can let him insert his own user row: the sign-up write is the
-    application's privileged step (FINDINGS.md #5)."""
+def test_signup_as_yourself(seeded, app):
+    """Dave does not exist yet and holds no membership, but any session with
+    a user may insert its own users row (any_user, plan/22) — and only its
+    own. With no user set at all, nothing."""
     with as_user(app, DAVE):
         with pytest.raises(psycopg.Error) as e:
-            app.execute("INSERT INTO users (id, name, email) VALUES (%s, 'Dave', 'dave@example.com')", (DAVE,))
+            app.execute("INSERT INTO users (id, name, email) VALUES (%s, 'Not Dave', 'x@example.com')", (ERIN,))
         assert denied(e.value)
-    seeded.execute("INSERT INTO users (id, name, email) VALUES (%s, 'Dave', 'dave@example.com')", (DAVE,))
-    with as_user(app, DAVE):                       # the 'user' rule fired: he can see who exists
+        app.execute("INSERT INTO users (id, name, email) VALUES (%s, 'Dave', 'dave@example.com')", (DAVE,))
         assert col(app, "SELECT name FROM users ORDER BY name") == ["Alice", "Bob", "Carol", "Dave"]
         assert col(app, "SELECT email FROM users WHERE email IS NOT NULL") == []
+    with pytest.raises(psycopg.Error) as e:        # no user: not even sign-up
+        app.execute("INSERT INTO users (id, name, email) VALUES (%s, 'Erin', 'erin@example.com')", (ERIN,))
+    assert unset_user(e.value)
+    assert truth(seeded, "SELECT count(*) FROM users")[0][0] == 4
 
 
 def test_starting_an_org_makes_you_its_admin(seeded, app):
@@ -60,9 +63,9 @@ def test_starting_a_project_makes_you_its_owner(seeded, app):
         (solo,) = app.execute("INSERT INTO projects (org_id, owner_id, name, budget) VALUES (%s, %s, 'Solo', 500) RETURNING id",
                               (org_id, DAVE)).fetchone()
         assert rows(app, "SELECT name, budget FROM projects ORDER BY name") == [("Solo", 500)]
-        assert set(app.execute("SELECT letter.visible_columns('public.projects', %s::uuid)", (str(solo),)).fetchone()[0]) \
+        assert set(app.execute("SELECT letter.visible_columns('public.projects', %s)", (str(solo),)).fetchone()[0]) \
             == {"id", "org_id", "owner_id", "name", "status", "budget", "notes"}
-        assert app.execute("SELECT letter.visible_columns('public.projects', %s::uuid)", (ALPHA,)).fetchone()[0] is None
+        assert app.execute("SELECT letter.visible_columns('public.projects', %s)", (ALPHA,)).fetchone()[0] is None
         app.execute("UPDATE projects SET notes = 'kick-off' WHERE id = %s", (solo,))
         assert app.execute("UPDATE projects SET notes = 'x' WHERE id = %s", (ALPHA,)).rowcount == 0   # not there
 
@@ -78,7 +81,7 @@ def test_owner_invites_and_the_member_sees_the_project(seeded, app):
         assert rows(app, "SELECT role FROM team_members") == [("editor",)]
     with as_user(app, CAROL):
         assert rows(app, "SELECT name, budget FROM projects ORDER BY name") == [("Alpha", None), ("Solo", 500)]
-        assert app.execute("SELECT letter.visible_columns('public.projects', %s::uuid)", (ALPHA,)).fetchone()[0] == ["id", "name", "status"]
+        assert app.execute("SELECT letter.visible_columns('public.projects', %s)", (ALPHA,)).fetchone()[0] == ["id", "name", "status"]
 
 
 def test_select_star_is_what_visible_columns_says(seeded, app):

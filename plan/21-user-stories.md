@@ -213,6 +213,24 @@ sentence.
   probe: call it on a fresh pooled connection, refuse to serve on false. Finding 3 is
   documentation only (README "Using letter from an application").
 
+- **D11 — a write grant without a select grant is warned about** *(decided 2026-09-23,
+  Paul, from finding 6)*: `19` D1 stands (a write reaches only the rows the writer
+  can see); `grant_*` emits a WARNING when an update/delete/fill grant is made for a
+  role with no select grant on the table (its own, `anyone` or `any_user`), and
+  `check_health()` lists the same. Finding 5 → plan `22`.
+
+- **D12 — foreign key columns stay ordinary columns under a global grant** *(decided
+  2026-09-23, Paul, from finding 7)*. Making every key column readable like a primary
+  key was considered and declined: a foreign key can be information on its own
+  (`assignee_id` says who is assigned). `17` D16 stands for scoped grants, whose own
+  path column is visible; a global reader is granted the key columns it needs to
+  join. README "Known gaps" is the documentation.
+
+- **D13 — `visible_columns(rel regclass, pk text)`** *(decided 2026-09-23, Paul, from
+  finding 8)*: the polymorphic key is replaced by text — one signature, never
+  ambiguous, and the C function converted the key to text anyway. SQL callers write
+  `id::text`; drivers pass the string they hold.
+
 ## 5. Stop-and-discuss triggers
 
 1. A story needs `story_admin` for something an application should be able to do.
@@ -231,7 +249,10 @@ sentence.
 (`conftest.py`, `helpers.py`, `schema/app.sql`, `schema/app_rules.sql`,
 `test_03_signup.py` smoke, `FINDINGS.md`, `pytest.ini`, `requirements.txt`), `make
 stories` (venv under `stories/.venv`, python3.13; psycopg 3.3.6, psycopg_pool 3.3.3,
-pytest 9.1.1). **P1 ✅, P2 ✅ (2026-09-23): 11 story tests green.** Story 1: consecutive requests
+pytest 9.1.1). **Findings pass ✅ (2026-09-23, Paul, one by one): 1 → D9, 2 → D7, 3 → README, 4 → D10,
+5 → plan 22, 6 → D11, 7 → D12 (stays), 8 → D13, 9 → README. Next: P4 (stories 7–9).**
+
+**P1 ✅, P2 ✅ (2026-09-23): 11 story tests green.** Story 1: consecutive requests
 on one physical connection see their own rows; a request failing before SET leaves
 nothing behind; a forgotten RESET leaks to the next borrower (the app's bug — pool
 `reset=` hook closes it, finding 3); `SET LOCAL` is transaction-scoped; a session that

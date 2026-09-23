@@ -18,6 +18,26 @@ RESET ROLE;
 REVOKE USAGE ON SCHEMA letter FROM letter_test_nobody;
 DROP ROLE letter_test_nobody;
 
+-- The built-in roles anyone and any_user (plan/22 A1): global only, never a
+-- membership row, never conferred by a rule; granted like any role globally.
+CREATE TABLE public_pages (id int PRIMARY KEY, body text);
+\set VERBOSITY terse
+SELECT letter.grant_scoped('select', 'public.public_pages', 'anyone', ARRAY['*'], 'public.public_pages');
+SELECT letter.grant_scoped('select', 'public.public_pages', 'any_user', ARRAY['*'], 'public.public_pages');
+INSERT INTO letter.memberships (role, user_id) VALUES ('anyone', 'someone');
+INSERT INTO letter.memberships (role, user_id) VALUES ('any_user', 'someone');
+SET letter.bypass = on;
+SELECT letter.assign('public.public_pages', 'body', role := 'anyone');
+SELECT letter.assign('public.public_pages', 'body', role := 'any_user');
+RESET letter.bypass;
+\set VERBOSITY default
+SELECT letter.grant_global('select', 'public.public_pages', 'anyone', ARRAY['*']);
+SELECT letter.grant_global('insert', 'public.public_pages', 'any_user', if := 'id > 0');
+SELECT role, privilege, column_name, "if" FROM letter.grants WHERE on_table = 'public.public_pages'::regclass ORDER BY 1, 2;
+SELECT letter.revoke_global('select', 'public.public_pages', 'anyone');
+SELECT letter.revoke_global('insert', 'public.public_pages', 'any_user');
+DROP TABLE public_pages;
+
 -- Tables are regclass (plan/18 D1): letter.grant_global() refuses one that does
 -- not exist (plan/17 D10) and handles names that need quoting.
 CREATE TABLE orgs (id uuid PRIMARY KEY DEFAULT gen_random_uuid());

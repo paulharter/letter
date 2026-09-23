@@ -241,6 +241,33 @@ SELECT letter.grant_scoped('update', 'public.notes', 'editor', ARRAY['body'], 'p
 RESET letter.user_id;
 DROP TABLE notes;
 
+-- ============================================================
+-- Test 13: the built-in roles on the write path (plan/22). Sign-up: any
+-- session with a user may insert its own users row and no other. A
+-- guestbook: anyone may insert, no user set at all. With no user set, a
+-- table whose write rules all need a user still errors as before.
+-- ============================================================
+SELECT letter.grant_global('insert', 'public.users', 'any_user', if := 'id = letter.user_id()::uuid');
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000009';
+INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000009', 'Ida');     -- herself
+INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000010', 'Jon');     -- somebody else
+RESET letter.user_id;
+INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000010', 'Jon');     -- nobody at all
+SELECT name FROM users ORDER BY name;
+
+CREATE TABLE guestbook (id serial PRIMARY KEY, line text, approved boolean NOT NULL DEFAULT false);
+SELECT letter.grant_global('insert', 'public.guestbook', 'anyone', if := 'NOT approved');
+SELECT letter.grant_global('update', 'public.guestbook', 'any_user', ARRAY['line']);
+INSERT INTO guestbook (line) VALUES ('hello from nobody');                 -- no user set: anyone
+INSERT INTO guestbook (line, approved) VALUES ('sneaky', true);            -- the if
+UPDATE guestbook SET line = 'edited';                                      -- no user: no anyone rule for update
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000009';
+UPDATE guestbook SET line = 'edited by ida';                               -- but any user may
+SELECT line, approved FROM guestbook;
+RESET letter.user_id;
+SELECT letter.revoke_global('insert', 'public.users', 'any_user');
+DROP TABLE guestbook;
+
 -- Clean up
 DROP TABLE team_members CASCADE;
 DROP TABLE projects CASCADE;

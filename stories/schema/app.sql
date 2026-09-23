@@ -1,5 +1,5 @@
 -- The story application (plan/21 §2): a project tracker. Run as story_admin.
--- Every user row confers the global role 'user' (see app_rules.sql). Whoever
+-- A user signs up as themselves (any_user, plan/22; see app_rules.sql). Whoever
 -- authors an org or a project owns it (plan/21 D7, D8); team membership
 -- confers a role in a project, org membership a role in an org.
 CREATE TABLE users (

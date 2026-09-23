@@ -44,6 +44,8 @@ INSERT INTO team_members (user_id, project_id, role) VALUES
 -- Set up grants on projects table
 -- editor can update name and status, scoped to projects
 SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['name', 'status'], 'public.projects');
+WARNING:  letter: "editor" has no select grant on public.projects — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_scoped 
 --------------
  t
@@ -51,6 +53,8 @@ SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['name', 
 
 -- editor can set budget (only when NULL), scoped to projects
 SELECT letter.grant_scoped('fill', 'public.projects', 'editor', ARRAY['budget'], 'public.projects');
+WARNING:  letter: "editor" has no select grant on public.projects — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_scoped 
 --------------
  t
@@ -65,6 +69,8 @@ SELECT letter.grant_global('insert', 'public.projects', 'editor');
 
 -- editor can delete projects (unscoped — applies to any project)
 SELECT letter.grant_global('delete', 'public.projects', 'editor');
+WARNING:  letter: "editor" has no select grant on public.projects — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_global 
 --------------
  t
@@ -234,6 +240,8 @@ CREATE INDEX ON notes (project_id);
 -- may not archive one, since the NEW row would fail.
 SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['status'], 'public.projects',
                            if := 'status <> ''archived''');
+WARNING:  letter: "editor" has no select grant on public.projects — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_scoped 
 --------------
  t
@@ -258,6 +266,8 @@ SELECT status FROM projects WHERE id = 'b0000000-0000-0000-0000-000000000001';
 -- an active project, and nothing else under this rule.
 SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['status'], 'public.projects',
                            if := 'old.status = ''active'' AND new.status = ''archived''');
+WARNING:  letter: "editor" has no select grant on public.projects — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_scoped 
 --------------
  t
@@ -286,6 +296,8 @@ SELECT letter.grant_scoped('insert', 'public.notes', 'editor', NULL, 'public.pro
 
 SELECT letter.grant_scoped('delete', 'public.notes', 'editor', NULL, 'public.projects',
                            if := 'author = letter.user_id()::uuid');
+WARNING:  letter: "editor" has no select grant on public.notes — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_scoped 
 --------------
  t
@@ -293,6 +305,8 @@ SELECT letter.grant_scoped('delete', 'public.notes', 'editor', NULL, 'public.pro
 
 SELECT letter.grant_scoped('fill', 'public.notes', 'editor', ARRAY['reviewed_by'], 'public.projects',
                            if := 'author <> letter.user_id()::uuid');
+WARNING:  letter: "editor" has no select grant on public.notes — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_scoped 
 --------------
  t
@@ -339,6 +353,70 @@ CONTEXT:  PL/pgSQL function letter.grant_scoped(text,regclass,text,text[],regcla
 RESET letter.user_id;
 DROP TABLE notes;
 NOTICE:  letter: dropped table public.notes: removed 3 grant(s), 0 assignment(s), 0 role(s)
+-- ============================================================
+-- Test 13: the built-in roles on the write path (plan/22). Sign-up: any
+-- session with a user may insert its own users row and no other. A
+-- guestbook: anyone may insert, no user set at all. With no user set, a
+-- table whose write rules all need a user still errors as before.
+-- ============================================================
+SELECT letter.grant_global('insert', 'public.users', 'any_user', if := 'id = letter.user_id()::uuid');
+ grant_global 
+--------------
+ t
+(1 row)
+
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000009';
+INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000009', 'Ida');     -- herself
+INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000010', 'Jon');     -- somebody else
+ERROR:  letter: INSERT denied on "public.users" for user "a0000000-0000-0000-0000-000000000009"
+RESET letter.user_id;
+INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000010', 'Jon');     -- nobody at all
+ERROR:  letter: INSERT denied on "public.users" — letter.user_id is not set
+SELECT name FROM users ORDER BY name;
+ name  
+-------
+ Alice
+ Bob
+ Ida
+(3 rows)
+
+CREATE TABLE guestbook (id serial PRIMARY KEY, line text, approved boolean NOT NULL DEFAULT false);
+SELECT letter.grant_global('insert', 'public.guestbook', 'anyone', if := 'NOT approved');
+ grant_global 
+--------------
+ t
+(1 row)
+
+SELECT letter.grant_global('update', 'public.guestbook', 'any_user', ARRAY['line']);
+WARNING:  letter: "any_user" has no select grant on public.guestbook — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
+ grant_global 
+--------------
+ t
+(1 row)
+
+INSERT INTO guestbook (line) VALUES ('hello from nobody');                 -- no user set: anyone
+INSERT INTO guestbook (line, approved) VALUES ('sneaky', true);            -- the if
+ERROR:  letter: INSERT denied on "public.guestbook" — letter.user_id is not set
+UPDATE guestbook SET line = 'edited';                                      -- no user: no anyone rule for update
+ERROR:  letter: UPDATE denied on "public.guestbook" — letter.user_id is not set
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000009';
+UPDATE guestbook SET line = 'edited by ida';                               -- but any user may
+SELECT line, approved FROM guestbook;
+     line      | approved 
+---------------+----------
+ edited by ida | f
+(1 row)
+
+RESET letter.user_id;
+SELECT letter.revoke_global('insert', 'public.users', 'any_user');
+ revoke_global 
+---------------
+ t
+(1 row)
+
+DROP TABLE guestbook;
+NOTICE:  letter: dropped table public.guestbook: removed 2 grant(s), 0 assignment(s), 0 role(s)
 -- Clean up
 DROP TABLE team_members CASCADE;
 NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 assignment(s), 0 role(s)

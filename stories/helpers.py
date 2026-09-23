@@ -100,8 +100,7 @@ def expected_view(app, admin, table, pk="id"):
     out = []
     for row in admin.execute(f"SELECT * FROM {table} ORDER BY {pk}"):
         r = dict(zip(cols, row))
-        # from a driver the key needs a cast: the parameter is anyelement (FINDINGS.md #8)
-        vc = app.execute("SELECT letter.visible_columns(%s, %s::text)",
+        vc = app.execute("SELECT letter.visible_columns(%s, %s)",
                          (f"public.{table}", str(r[pk]))).fetchone()[0]
         if vc is None:
             continue

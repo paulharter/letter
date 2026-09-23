@@ -47,6 +47,8 @@ SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['name', 
 (1 row)
 
 SELECT letter.grant_global('delete', 'public.projects', 'admin');
+WARNING:  letter: "admin" has no select grant on public.projects — it can see no row, so it can change none
+HINT:  A write reaches only the rows the writer can see: grant select on the columns the role must see first.
  grant_global 
 --------------
  t

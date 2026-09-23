@@ -7,7 +7,8 @@
 
 CREATE TABLE letter.memberships (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    role VARCHAR(64) NOT NULL,
+    -- anyone and any_user are held by everyone (plan/22): never a membership row
+    role VARCHAR(64) NOT NULL CHECK (role NOT IN ('anyone', 'any_user')),
     user_id VARCHAR(256) NOT NULL CHECK (user_id <> ''),
     scope_table regclass,               -- NULL = the global scope
     scope_id VARCHAR(256)
@@ -33,7 +34,7 @@ CREATE TABLE letter.membership_rules (
     table_name regclass NOT NULL,
     scope_table regclass,
     user_column VARCHAR(64) NOT NULL,
-    role VARCHAR(64),
+    role VARCHAR(64) CHECK (role NOT IN ('anyone', 'any_user')),   -- a rule cannot confer what everyone holds (plan/22)
     role_column VARCHAR(64),
     if TEXT,
     CONSTRAINT unique_assign UNIQUE (table_name, scope_table, user_column, role, role_column),
@@ -314,7 +315,7 @@ END $$;
 -- The columns of one row that the current user may read, or NULL if the
 -- row is not visible to them: the in-band way to tell a hidden column from
 -- a NULL one (plan/17 D3).
-CREATE FUNCTION letter.visible_columns(rel regclass, pk anyelement) RETURNS text[]
+CREATE FUNCTION letter.visible_columns(rel regclass, pk text) RETURNS text[]
 AS 'MODULE_PATHNAME', 'letter_visible_columns'
 LANGUAGE C STABLE STRICT;
 
@@ -412,6 +413,16 @@ LANGUAGE sql VOLATILE AS $$
     FROM letter.grants g
     WHERE g.scope <> 0 AND EXISTS (SELECT 1 FROM pg_class WHERE oid = g.on_table)
       AND NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = g.scope)
+    UNION ALL
+    -- a write grant whose role sees no row of the table can change none (plan/21 finding 6)
+    SELECT DISTINCT 'warning', 'grant ' || g.role || '/' || g.privilege || ' on ' || letter._qualname(g.on_table),
+           'the role has no select grant on the table: it can see no row, so it can change none'
+    FROM letter.grants g
+    WHERE g.privilege IN ('update', 'delete', 'fill')
+      AND EXISTS (SELECT 1 FROM pg_class WHERE oid = g.on_table)
+      AND NOT EXISTS (SELECT 1 FROM letter.grants s
+                      WHERE s.on_table = g.on_table AND s.privilege = 'select'
+                        AND s.role IN (g.role, 'anyone', 'any_user'))
     UNION ALL
     -- enforcement triggers
     SELECT 'error', 'table ' || letter._qualname(t.on_table), 'has grants but no ' || tg.name || ' trigger'

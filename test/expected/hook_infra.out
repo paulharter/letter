@@ -128,6 +128,7 @@ SELECT letter.grant_scoped('select', 'public.notes', 'editor', ARRAY['body'], 'p
 (1 row)
 
 SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['name'], 'public.projects');
+WARNING:  letter: "editor" has no select grant on public.projects — it can see no row, so it can change none
  grant_scoped 
 --------------
  t

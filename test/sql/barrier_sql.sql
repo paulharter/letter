@@ -135,6 +135,8 @@ BEGIN
         WITH vw AS (
             SELECT (SELECT jsonb_object_agg(e.key,
                                CASE WHEN jsonb_typeof(e.value) = 'null' THEN e.value
+                                    WHEN jsonb_typeof(e.value) = 'boolean'    -- _read() prints booleans as t/f
+                                         THEN to_jsonb(CASE WHEN (e.value #>> '{}') = 'true' THEN 't' ELSE 'f' END)
                                     ELSE to_jsonb(e.value #>> '{}') END)
                     FROM jsonb_each(to_jsonb(x)) e
                     WHERE e.key NOT LIKE '%%pg.dropped%%') AS j
@@ -438,7 +440,7 @@ CREATE FUNCTION vc_parity(v regclass, tbl regclass, OUT mismatches bigint, OUT h
 LANGUAGE plpgsql AS $$
 BEGIN
     EXECUTE format($q$
-        WITH base AS (SELECT x.id, to_jsonb(x) AS j, letter.visible_columns(%L, x.id) AS vc FROM %s x),
+        WITH base AS (SELECT x.id, to_jsonb(x) AS j, letter.visible_columns(%L, x.id::text) AS vc FROM %s x),
         expect AS (
             SELECT id, (SELECT jsonb_object_agg(e.key, CASE WHEN e.key = ANY (vc) THEN e.value ELSE 'null'::jsonb END)
                         FROM jsonb_each(j) e) AS j
@@ -517,9 +519,60 @@ ALTER TABLE notes RENAME COLUMN kind TO category;
 \set VERBOSITY default
 ALTER TABLE notes DROP COLUMN kind;
 SELECT role, column_name, "if" FROM letter.grants WHERE on_table = 'public.notes'::regclass ORDER BY 1, 2, 3;
-DROP FUNCTION vc_parity(regclass, regclass);
 DROP FUNCTION is_public(notes);
 DROP TABLE notes;
+
+-- ============================================================
+-- Fixture 11: the built-in roles (plan/22). anyone reads titles of
+-- published pages — with no user set at all; any_user reads bodies too
+-- once a user is set, membership or not; editors of the project read
+-- everything, drafts included. A table with an anyone grant serves the
+-- anonymous session; a table without one (tasks) still errors.
+-- ============================================================
+CREATE TABLE pages (
+    id int PRIMARY KEY,
+    project_id uuid REFERENCES projects(id),
+    title TEXT,
+    body TEXT,
+    draft boolean NOT NULL DEFAULT false
+);
+CREATE INDEX ON pages (project_id);
+INSERT INTO pages VALUES
+    (1, 'a0000000-0000-0000-0000-000000000001', 'Alpha page',  'alpha body', false),
+    (2, 'a0000000-0000-0000-0000-000000000001', 'Alpha draft', 'draft body', true),
+    (3, 'a0000000-0000-0000-0000-000000000002', 'Beta page',   'beta body',  false);
+SELECT letter.grant_global('select', 'public.pages', 'anyone',   ARRAY['title'],         if := 'NOT draft');
+SELECT letter.grant_global('select', 'public.pages', 'any_user', ARRAY['title', 'body'], if := 'NOT draft');
+SELECT letter.grant_scoped('select', 'public.pages', 'editor',   ARRAY['*'], 'public.projects');
+
+SELECT letter.read_policy('public.pages') AS sql \gset
+SELECT show_sql(:'sql') AS sql_shown \gset
+\echo :sql_shown
+CREATE VIEW v_pages WITH (security_barrier) AS :sql;
+
+SET letter.user_id = 'alice';     -- editor@Alpha: 1 and 2 in full; 3 as any user
+SELECT id, title, body, draft FROM v_pages ORDER BY id;
+SET letter.user_id = 'nobody';    -- a user with no membership at all: any_user
+SELECT id, title, body, draft FROM v_pages ORDER BY id;
+RESET letter.user_id;             -- no user: the anonymous view
+SELECT id, title, body, draft FROM v_pages ORDER BY id;
+\set VERBOSITY terse
+SELECT count(*) FROM v_tasks;     -- no anyone grant on tasks: still an error
+\set VERBOSITY default
+-- The triggers' view (visible_columns) and the walker (_read) agree with the
+-- barrier for all three sessions — anonymous included.
+SET letter.user_id = 'alice';
+SELECT * FROM vc_parity('v_pages', 'public.pages');
+SELECT * FROM parity('v_pages', 'public.pages');
+SET letter.user_id = 'nobody';
+SELECT * FROM vc_parity('v_pages', 'public.pages');
+SELECT * FROM parity('v_pages', 'public.pages');
+RESET letter.user_id;
+SELECT * FROM vc_parity('v_pages', 'public.pages');
+SELECT * FROM parity('v_pages', 'public.pages');
+\set VERBOSITY terse
+SELECT letter.visible_columns('public.tasks', 'b0000000-0000-0000-0000-000000000001');   -- still an error
+\set VERBOSITY default
 
 -- ============================================================
 -- Entry criterion (plan/16 §7): nothing user-specific in the text.
@@ -543,9 +596,10 @@ RESET letter.user_id;
 SELECT letter.read_policy('public.ungranted') IS NULL AS no_barrier;
 
 -- Cleanup
-DROP VIEW v_tasks, v_comments, v_reactions, v_orgs, v_projects, v_memberships, v_odd;
+DROP VIEW v_tasks, v_comments, v_reactions, v_orgs, v_projects, v_memberships, v_odd, v_pages;
 DROP FUNCTION parity(regclass, text);
+DROP FUNCTION vc_parity(regclass, regclass);
 DROP FUNCTION show_sql(text);
-DROP TABLE ungranted, odd_leaf, "Odd Hop", "Odd Scope", pair_leaf, pair_scope,
+DROP TABLE pages, ungranted, odd_leaf, "Odd Hop", "Odd Scope", pair_leaf, pair_scope,
     memberships, reactions, comments, tasks, projects, orgs CASCADE;
 DROP EXTENSION letter CASCADE;

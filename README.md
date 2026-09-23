@@ -35,6 +35,12 @@ otherwise run without it. The library warns when loaded any other way, and
   (`editor` of project 42) or in the global scope (`scope_table IS NULL`). The global
   scope is just another scope: a role held in fifty projects never adds up to a global
   one, and a global membership never satisfies a scoped grant.
+- **Two roles need no membership.** `any_user` is every session with a user set;
+  `anyone` is every session at all, user set or not. Both are global only. Sign-up is
+  `grant_global('insert', 'public.users', 'any_user', if := 'id = letter.user_id()::uuid')`
+  — a user inserts the row that brings them into existence, and no other. An `anyone`
+  select grant makes a table readable by an anonymous session: the one case in which
+  an unset user is not an error, and only on that table.
 - **Grants are a set of permissive rules.** They cannot contradict each other and their
   order does not matter; a rule can only add. Granting the same rule twice is one rule;
   two rules for one role that differ in their path both stand. Narrowing means revoking.
@@ -60,7 +66,8 @@ otherwise run without it. The library warns when loaded any other way, and
   kinds.
 - **The current user** is the session setting `letter.user_id`, which the
   application sets per request. While it is unset, any read or write of a protected
-  table is an error. `letter.user_id()` reads it back (NULL when unset), for SQL
+  table is an error — except on a table with an `anyone` grant, which serves the
+  anonymous view. `letter.user_id()` reads it back (NULL when unset), for SQL
   such as `WHERE owner_id = letter.user_id()::uuid`. Letter
   assumes end users never hold a raw SQL connection: the application layer that sets
   it is the enforcement perimeter.
@@ -82,7 +89,7 @@ letter.assign  (source_table regclass, user_column text,
 letter.unassign(source_table regclass, user_column text,
                 role text DEFAULT NULL, role_column text DEFAULT NULL, scope regclass DEFAULT NULL)
 
-letter.visible_columns(rel regclass, pk anyelement)        -- text[]: what this user may read of that row
+letter.visible_columns(rel regclass, pk text)              -- text[]: what this user may read of that row
 letter.forget_user(user_id text)                            -- remove every membership the user holds; bigint
 letter.user_id()                                       -- the current user id as text, NULL when unset
 letter.enforcing()                                     -- is this session protected? the application's start-up probe
@@ -120,8 +127,9 @@ SET letter.user_id = '…';
 
 A hidden column reads as NULL. When an application needs to tell a hidden column from
 a NULL one — a lock icon, no edit box — `letter.visible_columns('public.projects',
-id)` returns the columns of that row the current user may read, or NULL if the row is
-not visible at all.
+id::text)` returns the columns of that row the current user may read, or NULL if the
+row is not visible at all. The key is passed as text, whatever its type: a driver
+passes the string it holds.
 
 Hand-written queries against `letter.grants` or `letter.memberships` must compare table
 columns with a `regclass`, e.g. `WHERE on_table = 'public.tasks'::regclass` (a bare
@@ -166,6 +174,8 @@ it is planned.
 Without `letter.bypass`, only what a grant allows is allowed — across the whole
 database. A table with no grants can be neither read nor written by an application
 session (an error, not an empty result: a missing grant is a configuration mistake).
+A user who holds no membership that any grant on the table names is a different case,
+and the ordinary one: they read an empty result, and their writes are refused.
 Exempt: `pg_catalog`, `information_schema`, the session's own temporary tables, and
 letter's own schema, which you keep out of the application's reach with ordinary SQL
 privileges (`REVOKE ALL ON ALL TABLES IN SCHEMA letter FROM app`). Scope and hop tables
@@ -177,8 +187,11 @@ are ordinary tables in this respect: directly readable only with a grant, and re
 The table a statement writes to is protected the same way. Rows the user cannot see
 are not there for `UPDATE` or `DELETE` either — they are skipped, silently, so neither
 a row count nor an error reveals them. Rows the user can see but may not change are
-refused loudly by the enforcement triggers. Hidden columns read as NULL wherever a
-write reads them: in the `WHERE`, in `SET` expressions, in `RETURNING`, in
+refused loudly by the enforcement triggers. So a write grant presupposes a select
+grant that shows the rows to be written: a role with `delete` but no `select` on a
+table deletes nothing, silently. `grant_*` warns when a write grant has no select
+grant beside it, and `check_health()` reports it. Hidden columns read as NULL wherever
+a write reads them: in the `WHERE`, in `SET` expressions, in `RETURNING`, in
 `ON CONFLICT`. `INSERT … RETURNING` is redacted too.
 
 ## Deployment model
@@ -208,8 +221,9 @@ ALTER ROLE migrator SET letter.bypass = on;      -- a superuser, for now
 bypassed implicitly — the same `ALTER ROLE` opts them in. `letter.assign()` and
 `letter.unassign()` require bypass. `TRUNCATE` on a protected table requires bypass.
 
-Most memberships never need an administrator: they follow from the application's
-own writes. A user who inserts a project with `owner_id = letter.user_id()::uuid`
+Memberships never need an administrator unless you want them to: they follow from
+the application's own writes. A user signs up as themselves (`any_user`); one who
+inserts a project with `owner_id = letter.user_id()::uuid`
 (an insert grant's `if`) becomes its owner through a rule
 (`assign('projects', 'owner_id', role := 'owner', scope := 'projects')`); an owner
 who inserts a `team_members` row confers that role. Privileged, RBAC-style
