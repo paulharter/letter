@@ -8,6 +8,7 @@ cmake-build-debug/
 *.dylib
 *.so
 *.bc
+*.pyc
 
 # pg_regress
 results/
