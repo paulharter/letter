@@ -4,6 +4,9 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_extension.h"
+#include "access/genam.h"
+#include "utils/fmgroids.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "commands/event_trigger.h"
@@ -48,6 +51,7 @@ PG_MODULE_MAGIC;
 static char *letter_current_user_id = "";
 static bool letter_bypass = false;
 static bool letter_enforce_reads = true;
+static bool letter_preloaded = false;	/* the hook is in every session of this database */
 
 /* ----------------------------------------------------------------
  * Internal guard (plan/17-planner-hook-implementation.md H1).
@@ -158,6 +162,7 @@ PG_FUNCTION_INFO_V1(letter_problems);
 PG_FUNCTION_INFO_V1(letter_visible_columns);
 PG_FUNCTION_INFO_V1(letter_barrier_write_sql);
 PG_FUNCTION_INFO_V1(letter_require_user);
+PG_FUNCTION_INFO_V1(letter_enforcing);
 
 void _PG_init(void);
 static void split_table_name(const char *qualified, char **schema_out, char **table_out);
@@ -213,6 +218,8 @@ typedef enum IfForm
 	IF_TRANSITION				/* names old and new: evaluated once */
 } IfForm;
 static IfForm validate_if_expr(Oid relid, const char *privilege, const char *if_text);
+static void require_superuser(const char *fn);
+static char *deparse_if_as(Oid relid, const char *if_expr, const char *out_alias, bool qualify);
 static bool try_in_subxact(void (*fn) (void *), void *arg, char **errmsg_out);
 static void letter_replan_assign_hook(bool newval, void *extra);
 static void protected_set_xact_callback(XactEvent event, void *arg);
@@ -285,9 +292,10 @@ _PG_init(void)
 	 * that have loaded the library (plan/17 D12). Loaded any way other than
 	 * preloading, a session that never calls a letter function has no
 	 * hook at all. */
-	if (!process_shared_preload_libraries_in_progress &&
-		(session_preload_libraries_string == NULL ||
-		 strstr(session_preload_libraries_string, "letter") == NULL))
+	letter_preloaded = process_shared_preload_libraries_in_progress ||
+		(session_preload_libraries_string != NULL &&
+		 strstr(session_preload_libraries_string, "letter") != NULL);
+	if (!letter_preloaded)
 		ereport(WARNING,
 				(errmsg("letter: library loaded on demand, not preloaded"),
 				 errdetail("Read enforcement is a planner hook; sessions that never call a letter function will not have it."),
@@ -305,21 +313,78 @@ letter_replan_assign_hook(bool newval, void *extra)
 }
 
 /* ----------------------------------------------------------------
- * Guarded SPI: letter's own queries, invisible to the planner hook.
+ * Guarded SPI: letter's own queries, invisible to the planner hook and
+ * run with letter's authority (plan/21 S1, 2026-09-23). Enforcement
+ * happens in the application's session, but what it reads — the grants,
+ * the memberships, the hop tables — is letter's, not the application's:
+ * the application role holds no privilege on schema letter (README
+ * "Default deny") and may hold none on a hop table. So, for the duration
+ * of one of letter's own queries, the session runs as the extension's
+ * owner, the way a SECURITY DEFINER function does. Configuration calls
+ * (grant, revoke, assign) are not guarded: they run as their caller.
  * ---------------------------------------------------------------- */
+static Oid	letter_owner = InvalidOid;
+
+static Oid
+letter_owner_oid(void)
+{
+	Relation	rel;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	if (OidIsValid(letter_owner))
+		return letter_owner;
+	rel = table_open(ExtensionRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_extension_extname, BTEqualStrategyNumber, F_NAMEEQ,
+				CStringGetDatum("letter"));
+	scan = systable_beginscan(rel, ExtensionNameIndexId, true, NULL, 1, &key);
+	tup = systable_getnext(scan);
+	if (HeapTupleIsValid(tup))
+		letter_owner = ((Form_pg_extension) GETSTRUCT(tup))->extowner;
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return letter_owner;
+}
+
+typedef struct LetterGuard
+{
+	Oid			save_uid;
+	int			save_ctx;
+} LetterGuard;
+
+static void
+guard_enter(LetterGuard *g)
+{
+	Oid			owner = letter_owner_oid();
+
+	letter_guard_depth++;
+	GetUserIdAndSecContext(&g->save_uid, &g->save_ctx);
+	if (OidIsValid(owner))
+		SetUserIdAndSecContext(owner, g->save_ctx | SECURITY_LOCAL_USERID_CHANGE);
+}
+
+static void
+guard_exit(LetterGuard *g)
+{
+	SetUserIdAndSecContext(g->save_uid, g->save_ctx);
+	letter_guard_depth--;
+}
+
 static int
 guarded_spi_execute(const char *sql, bool read_only, long tcount)
 {
 	int			ret;
+	LetterGuard g;
 
-	letter_guard_depth++;
+	guard_enter(&g);
 	PG_TRY();
 	{
 		ret = SPI_execute(sql, read_only, tcount);
 	}
 	PG_FINALLY();
 	{
-		letter_guard_depth--;
+		guard_exit(&g);
 	}
 	PG_END_TRY();
 	return ret;
@@ -331,8 +396,9 @@ guarded_spi_execute_with_args(const char *sql, int nargs, Oid *argtypes,
 							  bool read_only, long tcount)
 {
 	int			ret;
+	LetterGuard g;
 
-	letter_guard_depth++;
+	guard_enter(&g);
 	PG_TRY();
 	{
 		ret = SPI_execute_with_args(sql, nargs, argtypes, values, nulls,
@@ -340,7 +406,7 @@ guarded_spi_execute_with_args(const char *sql, int nargs, Oid *argtypes,
 	}
 	PG_FINALLY();
 	{
-		letter_guard_depth--;
+		guard_exit(&g);
 	}
 	PG_END_TRY();
 	return ret;
@@ -370,6 +436,7 @@ letter_grant(PG_FUNCTION_ARGS)
 	const char *on_table_name;
 	const char *scope_name;
 
+	require_superuser("letter.grant_global/grant_scoped");
 	deconstruct_array(columns, TEXTOID, -1, false, TYPALIGN_INT,
 					  &col_datums, &col_nulls, &col_count);
 
@@ -458,6 +525,7 @@ letter_revoke(PG_FUNCTION_ARGS)
 	bool		wildcard = false;
 	int			ret;
 
+	require_superuser("letter.revoke_global/revoke_scoped");
 	/* Not STRICT: a NULL scope means unscoped. Everything else is required. */
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(3))
 		ereport(ERROR,
@@ -1134,6 +1202,20 @@ rel_quoted_name(Oid relid)
 					quote_identifier(relname));
 }
 
+/* Configuration — grants and membership rules — is done by a superuser
+ * (plan/21 D9): the calls write letter's tables and create functions in
+ * its schema, and a half-privileged migrator would fail with a bare
+ * "permission denied" somewhere inside. */
+static void
+require_superuser(const char *fn)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("letter: %s requires a superuser", fn),
+				 errhint("Grants and membership rules are configured by a superuser; the application role never calls these.")));
+}
+
 /* assign()/unassign() are admin operations (plan/17 D13). */
 static void
 require_bypass(const char *fn)
@@ -1237,12 +1319,14 @@ letter_assign(PG_FUNCTION_ARGS)
 	char	   *role;
 	char	   *role_column;
 	char	   *if_fn;
+	char	   *if_sql = NULL;		/* if_fn, schema-qualified, over the source name */
 	char	   *assignment_id;
 	char	   *safe_id;
 	char	   *pk_column;
 	char	   *scope_fk_column;
 	StringInfoData buf;
 
+	require_superuser("letter.assign");
 	require_bypass("letter.assign");
 
 	source_table = rel_quoted_name(source_oid);
@@ -1265,9 +1349,14 @@ letter_assign(PG_FUNCTION_ARGS)
 	if ((role == NULL) == (role_column == NULL))
 		elog(ERROR, "letter: must provide exactly one of role or role_column");
 
-	/* The if is an expression over the source row (plan/20 §3). */
+	/* The if is an expression over the source row (plan/20 §3). The rule
+	 * functions run SECURITY DEFINER with search_path pinned to pg_catalog,
+	 * so the text they embed is the schema-qualified form. */
 	if (if_fn != NULL)
+	{
 		(void) validate_if_expr(source_oid, "assign", if_fn);
+		if_sql = deparse_if_as(source_oid, if_fn, source_name, true);
+	}
 
 	SPI_connect();
 
@@ -1311,7 +1400,13 @@ letter_assign(PG_FUNCTION_ARGS)
 
 	/* ---- Step 3: Find the FK column pointing to scope table (if scoped) ---- */
 	scope_fk_column = NULL;
-	if (scope_table != NULL)
+	if (scope_table != NULL && scope_oid == source_oid)
+	{
+		/* The table is its own scope (plan/21 D8): the scope id is the
+		 * row's own key — a project's owner is scoped to that project. */
+		scope_fk_column = pk_column;
+	}
+	else if (scope_table != NULL)
 	{
 		resetStringInfo(&buf);
 		appendStringInfo(&buf,
@@ -1356,8 +1451,8 @@ letter_assign(PG_FUNCTION_ARGS)
 			role_expr = psprintf("NEW.%s", role_column);
 
 		/* Evaluated over NEW as the source table's row, like a grant's if. */
-		condition = if_fn ? psprintf("SELECT (\n%s\n) FROM (SELECT (NEW).*) AS %s",
-									 if_fn, quote_identifier(source_name)) : "TRUE";
+		condition = if_fn ? psprintf("SELECT %s FROM (SELECT (NEW).*) AS %s",
+									 if_sql, quote_identifier(source_name)) : "TRUE";
 
 		if (scope_table != NULL)
 		{
@@ -1372,7 +1467,7 @@ letter_assign(PG_FUNCTION_ARGS)
 		resetStringInfo(&buf);
 		appendStringInfo(&buf,
 			"CREATE OR REPLACE FUNCTION letter._rule_%s_upsert() RETURNS trigger "
-			"LANGUAGE plpgsql AS $fn$ "
+			"LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$ "
 			"DECLARE "
 			"  ra_id uuid; "
 			"  r_id uuid; "
@@ -1431,7 +1526,7 @@ letter_assign(PG_FUNCTION_ARGS)
 	resetStringInfo(&buf);
 	appendStringInfo(&buf,
 		"CREATE OR REPLACE FUNCTION letter._rule_%s_delete() RETURNS trigger "
-		"LANGUAGE plpgsql AS $fn$ "
+		"LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$ "
 		"BEGIN "
 		"  DELETE FROM letter.membership_sources "
 		"    WHERE assignment_id = '%s' "
@@ -1447,8 +1542,10 @@ letter_assign(PG_FUNCTION_ARGS)
 	spi_exec(buf.data);
 	depend_on_assign(psprintf("_rule_%s_delete", safe_id), fcinfo->flinfo->fn_oid);
 
-	/* ---- Step 6: Create scope delete trigger function (if scoped) ---- */
-	if (scope_table != NULL)
+	/* ---- Step 6: Create scope delete trigger function (if scoped) ----
+	 * Not when the table is its own scope: deleting the row fires the
+	 * source delete trigger, which removes its memberships. */
+	if (scope_table != NULL && scope_oid != source_oid)
 	{
 		char   *scope_pk;
 
@@ -1470,7 +1567,7 @@ letter_assign(PG_FUNCTION_ARGS)
 		resetStringInfo(&buf);
 		appendStringInfo(&buf,
 			"CREATE OR REPLACE FUNCTION letter._rule_%s_scope_delete() RETURNS trigger "
-			"LANGUAGE plpgsql AS $fn$ "
+			"LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$ "
 			"BEGIN "
 			"  DELETE FROM letter.membership_sources "
 			"    WHERE assignment_id = '%s' "
@@ -1517,7 +1614,7 @@ letter_assign(PG_FUNCTION_ARGS)
 	spi_exec(buf.data);
 
 	/* Scope DELETE trigger */
-	if (scope_table != NULL)
+	if (scope_table != NULL && scope_oid != source_oid)
 	{
 		resetStringInfo(&buf);
 		appendStringInfo(&buf,
@@ -1565,8 +1662,8 @@ letter_assign(PG_FUNCTION_ARGS)
 			user_column,				/* user_id */
 			scope_vals,					/* scope values */
 			source_table,				/* FROM source */
-			if_fn ? psprintf("WHERE (SELECT (\n%s\n) FROM (SELECT s.*) AS %s)",
-							 if_fn, quote_identifier(source_name)) : "",	/* condition */
+			if_fn ? psprintf("WHERE (SELECT %s FROM (SELECT s.*) AS %s)",
+							 if_sql, quote_identifier(source_name)) : "",	/* condition */
 			scope_cols,					/* role_assignments extra columns */
 			assignment_id,				/* assignment_id */
 			source_oid,					/* source_table */
@@ -1575,8 +1672,8 @@ letter_assign(PG_FUNCTION_ARGS)
 			scope_vals,					/* scope values */
 			source_table,				/* FROM source */
 			user_column,				/* JOIN on user_id */
-			if_fn ? psprintf("WHERE (SELECT (\n%s\n) FROM (SELECT s.*) AS %s)",
-							 if_fn, quote_identifier(source_name)) : ""	/* condition */
+			if_fn ? psprintf("WHERE (SELECT %s FROM (SELECT s.*) AS %s)",
+							 if_sql, quote_identifier(source_name)) : ""	/* condition */
 		);
 
 		spi_exec(buf.data);
@@ -1613,6 +1710,7 @@ letter_unassign(PG_FUNCTION_ARGS)
 	char	   *assignment_id;
 	StringInfoData buf;
 
+	require_superuser("letter.unassign");
 	require_bypass("letter.unassign");
 
 	(void) rel_quoted_name(source_oid);		/* the table must exist */
@@ -2592,6 +2690,8 @@ letter_relcache_callback(Datum arg, Oid relid)
 	{
 		protected_set_valid = false;
 		letter_cache.valid = false;
+		if (!OidIsValid(relid))
+			letter_owner = InvalidOid;
 	}
 	else if (relid == letter_roles_epoch_oid)
 		letter_cache.valid = false;
@@ -3103,8 +3203,11 @@ walk_scope_path(Oid relid, Oid scope_oid, const char *via_str,
 
 	/* Hop fetches run under the internal guard: a hop table may itself be
 	 * protected, and the walker must follow the true chain. */
+	{
+	LetterGuard guard;
+
 	scope_walk_depth++;
-	letter_guard_depth++;
+	guard_enter(&guard);
 	PG_TRY();
 	{
 		for (i = 1; i < cp->nhops; i++)
@@ -3135,10 +3238,11 @@ walk_scope_path(Oid relid, Oid scope_oid, const char *via_str,
 	}
 	PG_FINALLY();
 	{
-		letter_guard_depth--;
+		guard_exit(&guard);
 		scope_walk_depth--;
 	}
 	PG_END_TRY();
+	}
 
 	if (key == NULL)
 		return SCOPE_PATH_NULL;
@@ -3207,7 +3311,7 @@ typedef struct BarrierGroup
  * is b.col and the whole row is b. No sublink: the planner sees a plain
  * expression, and a hop alias can never capture a name. */
 static char *
-deparse_if_over_b(Oid relid, const char *if_expr)
+deparse_if_as(Oid relid, const char *if_expr, const char *out_alias, bool qualify)
 {
 	char	   *sql = psprintf("SELECT (\n%s\n) FROM %s AS %s", if_expr, rel_quoted_name(relid),
 							   quote_identifier(get_rel_name(relid)));
@@ -3215,14 +3319,36 @@ deparse_if_over_b(Oid relid, const char *if_expr)
 	Query	   *q;
 	TargetEntry *tle;
 	List	   *context;
+	char	   *text;
 
 	if (list_length(raw) != 1)
 		elog(ERROR, "letter: if expression is not a single statement");
 	q = parse_analyze_fixedparams(linitial_node(RawStmt, raw), sql, NULL, 0, NULL);
 	tle = linitial_node(TargetEntry, q->targetList);
-	context = deparse_context_for("b", relid);
-	/* forceprefix: b.col always — a hop alias must never capture a name */
-	return psprintf("(%s)", deparse_expression((Node *) tle->expr, context, true, false));
+	context = deparse_context_for(out_alias, relid);
+	/* forceprefix: <alias>.col always — no other alias may capture a name */
+	if (qualify)
+	{
+		/* Names were resolved above in the caller's search_path; deparsing
+		 * with only pg_catalog visible writes every other schema out, so the
+		 * text means the same wherever it is later run (a SECURITY DEFINER
+		 * function with a pinned search_path). pg_dump's trick. */
+		int			nest = NewGUCNestLevel();
+
+		(void) set_config_option("search_path", "pg_catalog", PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+		text = deparse_expression((Node *) tle->expr, context, true, false);
+		AtEOXact_GUC(true, nest);
+	}
+	else
+		text = deparse_expression((Node *) tle->expr, context, true, false);
+	return psprintf("(%s)", text);
+}
+
+static char *
+deparse_if_over_b(Oid relid, const char *if_expr)
+{
+	return deparse_if_as(relid, if_expr, "b", false);
 }
 
 /* Does every role of the group cover the column (plan/17 D17)? Then the
@@ -3961,20 +4087,21 @@ if_prepare(void *arg)
 	Oid			rowtype = get_rel_type_id(p->relid);
 	Oid			argtypes[2] = {rowtype, rowtype};
 	char	   *sql;
+	LetterGuard guard;
 
 	if (p->form == IF_ROW)
 		sql = psprintf("SELECT (\n%s\n) FROM (SELECT ($1).*) AS %s", p->text, alias);
 	else
 		sql = psprintf("SELECT (\n%s\n) FROM (SELECT ($1).*) AS old, (SELECT ($2).*) AS new",
 					   p->text);
-	letter_guard_depth++;
+	guard_enter(&guard);
 	PG_TRY();
 	{
 		p->plan = SPI_prepare(sql, p->form == IF_ROW ? 1 : 2, argtypes);
 	}
 	PG_FINALLY();
 	{
-		letter_guard_depth--;
+		guard_exit(&guard);
 	}
 	PG_END_TRY();
 	if (p->plan == NULL)
@@ -4101,6 +4228,7 @@ if_holds(Oid relid, const char *privilege, const char *text,
 	int			ret;
 	bool		isnull;
 	Datum		d;
+	LetterGuard guard;
 
 	if (e->key.form == IF_ROW)
 		values[0] = row_as_composite(relid, tuple, tupdesc);
@@ -4112,14 +4240,14 @@ if_holds(Oid relid, const char *privilege, const char *text,
 		values[1] = row_as_composite(relid, newtuple, tupdesc);
 	}
 
-	letter_guard_depth++;
+	guard_enter(&guard);
 	PG_TRY();
 	{
 		ret = SPI_execute_plan(e->plan, values, NULL, true, 1);
 	}
 	PG_FINALLY();
 	{
-		letter_guard_depth--;
+		guard_exit(&guard);
 	}
 	PG_END_TRY();
 	if (ret != SPI_OK_SELECT || SPI_processed != 1)
@@ -4758,7 +4886,7 @@ validate_assignment_row(void *arg)
 				 errmsg("column \"%s\" of %s no longer exists", a->role_column, source_name)));
 	if (a->if_expr != NULL)
 		(void) validate_if_expr(a->table_name, "assign", a->if_expr);
-	if (OidIsValid(a->scope_table))
+	if (OidIsValid(a->scope_table) && a->scope_table != a->table_name)	/* self-scoped: the PK (D8) */
 	{
 		char	   *s_schema, *s_table, *t_schema, *t_table;
 		int			nfks = 0;
@@ -4799,7 +4927,7 @@ remove_assignment(const char *assignment_id, Oid source_oid, Oid scope_oid)
 			spi_exec(buf.data);
 		}
 	}
-	if (OidIsValid(scope_oid) && get_rel_name(scope_oid) != NULL)
+	if (OidIsValid(scope_oid) && scope_oid != source_oid && get_rel_name(scope_oid) != NULL)	/* self-scoped: none (D8) */
 	{
 		resetStringInfo(&buf);
 		appendStringInfo(&buf, "DROP TRIGGER IF EXISTS letter_rule_%s_scope_delete ON %s",
@@ -4813,7 +4941,7 @@ remove_assignment(const char *assignment_id, Oid source_oid, Oid scope_oid)
 	resetStringInfo(&buf);
 	appendStringInfo(&buf, "DROP FUNCTION IF EXISTS letter._rule_%s_delete()", safe_id);
 	spi_exec(buf.data);
-	if (OidIsValid(scope_oid))
+	if (OidIsValid(scope_oid) && scope_oid != source_oid)
 	{
 		resetStringInfo(&buf);
 		appendStringInfo(&buf, "DROP FUNCTION IF EXISTS letter._rule_%s_scope_delete()", safe_id);
@@ -5310,6 +5438,22 @@ letter_enforce_truncate(PG_FUNCTION_ARGS)
  * barrier, so an unidentified session cannot read a protected table
  * (D2, amended 2026-09-23: reads and writes fail the same way).
  * ---------------------------------------------------------------- */
+/* ----------------------------------------------------------------
+ * letter.enforcing() → boolean: is this session protected? True when the
+ * library was preloaded — so every session of the database has the
+ * planner hook, not just the ones that happened to call letter — and
+ * reads are enforced and not bypassed. A start-up probe for the
+ * application (plan/21 finding 4): call it on a fresh pooled connection
+ * and refuse to serve if it says false. A session that loaded the
+ * library on demand has the hook from then on, but its neighbours in the
+ * pool do not, so it answers false.
+ * ---------------------------------------------------------------- */
+Datum
+letter_enforcing(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(letter_preloaded && letter_enforce_reads && !letter_bypass);
+}
+
 Datum
 letter_require_user(PG_FUNCTION_ARGS)
 {

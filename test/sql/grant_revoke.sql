@@ -3,6 +3,21 @@
 CREATE EXTENSION letter;
 SET letter.enforce_reads = off;   -- this test is not about the read hook
 
+-- Configuration is a superuser's (plan/21 D9): any other role is refused,
+-- bypass or not.
+CREATE ROLE letter_test_nobody;
+GRANT USAGE ON SCHEMA letter TO letter_test_nobody;   -- what an application role has
+SET ROLE letter_test_nobody;
+\set VERBOSITY terse
+SELECT letter.grant_global('select', 'pg_class', 'r', ARRAY['*']);
+SELECT letter.revoke_global('select', 'pg_class', 'r');
+SELECT letter.assign('pg_class', 'relname', role := 'r');
+SELECT letter.unassign('pg_class', 'relname', role := 'r');
+\set VERBOSITY default
+RESET ROLE;
+REVOKE USAGE ON SCHEMA letter FROM letter_test_nobody;
+DROP ROLE letter_test_nobody;
+
 -- Tables are regclass (plan/18 D1): letter.grant_global() refuses one that does
 -- not exist (plan/17 D10) and handles names that need quoting.
 CREATE TABLE orgs (id uuid PRIMARY KEY DEFAULT gen_random_uuid());

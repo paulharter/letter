@@ -332,6 +332,13 @@ LANGUAGE C VOLATILE;
 -- The current end user, as the application set it — or NULL when unset. For
 -- application SQL and for check expressions ("only the author may edit"):
 --   owner_id = letter.user_id()::uuid
+-- Is this session protected? True when letter was preloaded (every session
+-- of the database has the planner hook), reads are enforced, and bypass is
+-- off. The application's start-up probe: call it on a fresh connection.
+CREATE FUNCTION letter.enforcing() RETURNS boolean
+AS 'MODULE_PATHNAME', 'letter_enforcing'
+LANGUAGE C STABLE PARALLEL SAFE;
+
 CREATE FUNCTION letter.user_id() RETURNS text
 LANGUAGE sql STABLE PARALLEL SAFE AS $$
     SELECT NULLIF(pg_catalog.current_setting('letter.user_id', true), '')

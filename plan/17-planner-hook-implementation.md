@@ -597,8 +597,9 @@ Options:
 - Housekeeping, all safe to remove: `letter_spike.dylib` in the PG lib dir (inert unless
   `LOAD`ed), scratch databases `letter_bench`, `letter_walker_bench`, `letter_spike`.
   Keep `letter_bench` if H5.9's plan-shape comparison will reuse it.
-- Tracked build artefacts (`letter.o`, `results/*.out`) keep showing as modified —
-  consider gitignoring.
+- ~~Tracked build artefacts (`letter.o`, `results/*.out`) keep showing as modified —
+  consider gitignoring.~~ Done 2026-09-23: `.gitignore` covers build output, every
+  pg_regress artefact (`results/`, `regression.diffs`, `regression.out`) and `spike/`.
 
 ---
 

@@ -85,6 +85,7 @@ letter.unassign(source_table regclass, user_column text,
 letter.visible_columns(rel regclass, pk anyelement)        -- text[]: what this user may read of that row
 letter.forget_user(user_id text)                            -- remove every membership the user holds; bigint
 letter.user_id()                                       -- the current user id as text, NULL when unset
+letter.enforcing()                                     -- is this session protected? the application's start-up probe
 letter.list_grants(role text DEFAULT NULL)
 letter.user_permissions(user_id text)
 letter.read_policy(rel regclass)                            -- the read-enforcement subquery
@@ -126,6 +127,40 @@ Hand-written queries against `letter.grants` or `letter.memberships` must compar
 columns with a `regclass`, e.g. `WHERE on_table = 'public.tasks'::regclass` (a bare
 string literal is taken as an OID).
 
+## Using letter from an application
+
+The current user is a session setting, and a session outlives a request. Letter cannot
+tell where one request ends and the next begins, so the application must:
+
+```python
+# per request, inside the request's transaction — the setting dies with it
+with conn.transaction():
+    conn.execute("SELECT set_config('letter.user_id', %s, true)", (user_id,))   # SET LOCAL
+    ...
+
+# or, on an autocommit connection: set on entry, reset on the way out, whatever happened
+conn.execute("SELECT set_config('letter.user_id', %s, false)", (user_id,))
+try:
+    ...
+finally:
+    conn.execute("RESET letter.user_id")
+```
+
+and, as a second line of defence, reset connections when they return to the pool
+(`psycopg_pool`'s `reset=` hook, or `DISCARD ALL`). A handler that sets the user and
+never resets it leaves that user on the connection for the next borrower, and letter
+has no way to notice. Under pgbouncer in transaction mode, only the `SET LOCAL` form
+is safe: a session-level `SET` follows the server connection to the next client.
+
+At start-up, call `letter.enforcing()` on a fresh connection and refuse to serve if
+it returns false: it is true only when letter is preloaded for every session of the
+database, reads are enforced and bypass is off. (A session that loads the library on
+demand is protected from then on, but its neighbours in the pool are not, so it answers
+false.) A request that never sets the user gets an error on its first protected read
+or write, never somebody else's data. Prepared statements, including the ones a driver prepares
+on its own, are safe across users: the user is read when the statement runs, not when
+it is planned.
+
 ## Default deny
 
 Without `letter.bypass`, only what a grant allows is allowed — across the whole
@@ -149,16 +184,37 @@ write reads them: in the `WHERE`, in `SET` expressions, in `RETURNING`, in
 ## Deployment model
 
 Enforcement is a property of the connecting database role. The application connects
-as a role without `letter.bypass`; administrators, migrations and `pg_dump` connect as
-roles that have it by default:
+as a role without `letter.bypass` and without any privilege on letter's tables — it
+needs `USAGE` on schema `letter` to call `letter.user_id()` and
+`letter.visible_columns()`, and nothing else. Letter's own reads and writes — the
+grants it consults, the memberships its rules maintain — run with letter's authority
+(the extension owner's), the way a `SECURITY DEFINER` function does, so the
+application can only ever reach a membership through a rule:
 
 ```sql
-ALTER ROLE migrator SET letter.bypass = on;
+GRANT USAGE ON SCHEMA letter TO app;
+REVOKE ALL ON ALL TABLES IN SCHEMA letter FROM app;
+```
+
+Configuration — `grant_*`, `revoke_*`, `assign`, `unassign` — is done by a superuser;
+any other role is refused. Administrators, migrations and `pg_dump` connect as roles
+that have bypass by default:
+
+```sql
+ALTER ROLE migrator SET letter.bypass = on;      -- a superuser, for now
 ```
 
 `letter.bypass` is superuser-settable only (`PGC_SUSET`). Superusers are **not**
 bypassed implicitly — the same `ALTER ROLE` opts them in. `letter.assign()` and
 `letter.unassign()` require bypass. `TRUNCATE` on a protected table requires bypass.
+
+Most memberships never need an administrator: they follow from the application's
+own writes. A user who inserts a project with `owner_id = letter.user_id()::uuid`
+(an insert grant's `if`) becomes its owner through a rule
+(`assign('projects', 'owner_id', role := 'owner', scope := 'projects')`); an owner
+who inserts a `team_members` row confers that role. Privileged, RBAC-style
+administration is done directly on `letter.memberships` by a superuser or a backend
+process with bypass, never through a letter-enforced route.
 
 ## Backup and restore
 

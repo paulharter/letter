@@ -1,8 +1,21 @@
+# IDE
 cmake-build-debug/
-
-*.dylib
 .claude/
 .idea/
 
-letter.o
-results/*.out
+# build
+*.o
+*.dylib
+*.so
+*.bc
+
+# pg_regress
+results/
+regression.diffs
+regression.out
+log/
+tmp_check/
+
+# throwaway spike modules (findings live in plan/17 §7)
+spike/
+stories/.venv/

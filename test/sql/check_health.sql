@@ -7,6 +7,13 @@
 -- present.
 
 CREATE EXTENSION letter;
+-- letter.enforcing(): this session loaded the library on demand (the
+-- regression suite does not preload it), so it is not the deployment the
+-- application should accept — false, whatever the switches say.
+SELECT letter.enforcing();
+SET letter.bypass = on;
+SELECT letter.enforcing();
+RESET letter.bypass;
 SET letter.enforce_reads = off;   -- this test is not about the read hook
 
 CREATE TABLE users (id uuid PRIMARY KEY);

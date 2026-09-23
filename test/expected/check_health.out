@@ -9,6 +9,23 @@ CREATE EXTENSION letter;
 WARNING:  letter: library loaded on demand, not preloaded
 DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
 HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+-- letter.enforcing(): this session loaded the library on demand (the
+-- regression suite does not preload it), so it is not the deployment the
+-- application should accept — false, whatever the switches say.
+SELECT letter.enforcing();
+ enforcing 
+-----------
+ f
+(1 row)
+
+SET letter.bypass = on;
+SELECT letter.enforcing();
+ enforcing 
+-----------
+ f
+(1 row)
+
+RESET letter.bypass;
 SET letter.enforce_reads = off;   -- this test is not about the read hook
 CREATE TABLE users (id uuid PRIMARY KEY);
 CREATE TABLE projects (id uuid PRIMARY KEY, name TEXT);

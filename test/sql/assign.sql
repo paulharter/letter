@@ -158,6 +158,43 @@ SELECT count(*) AS rules FROM letter.membership_rules WHERE table_name = 'public
 SELECT count(*) AS staff_memberships FROM letter.memberships WHERE role = 'staff';
 DROP TABLE staff CASCADE;
 
+-- ============================================================
+-- Test 7: a table that is its own scope (plan/21 D8): a project's owner
+-- is scoped to that project — the rule that lets a user bootstrap a
+-- scope by authoring the resource. The scope id is the row's own key.
+-- ============================================================
+CREATE TABLE owned_projects (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name text NOT NULL
+);
+INSERT INTO users (id, name) VALUES
+    ('a0000000-0000-0000-0000-000000000007', 'Gus'),
+    ('a0000000-0000-0000-0000-000000000008', 'Hal');
+INSERT INTO owned_projects (id, owner_id, name) VALUES
+    ('d0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000007', 'Gus''s');
+SET letter.bypass = on;
+SELECT letter.assign('public.owned_projects', 'owner_id', role := 'owner', scope := 'public.owned_projects');
+RESET letter.bypass;
+-- backfill: the existing project's owner
+SELECT role, user_id, scope_table, scope_id FROM letter.memberships WHERE role = 'owner';
+-- a new project makes its author its owner
+INSERT INTO owned_projects (id, owner_id, name) VALUES
+    ('d0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000008', 'Hal''s');
+SELECT role, user_id, scope_id FROM letter.memberships WHERE role = 'owner' ORDER BY scope_id;
+-- handing a project over moves the membership
+UPDATE owned_projects SET owner_id = 'a0000000-0000-0000-0000-000000000008' WHERE name = 'Gus''s';
+SELECT role, user_id, scope_id FROM letter.memberships WHERE role = 'owner' ORDER BY scope_id;
+-- deleting a project removes its membership (no scope-delete trigger is needed)
+SELECT count(*) AS scope_delete_triggers FROM pg_trigger WHERE tgname LIKE 'letter_rule_%_scope_delete';
+DELETE FROM owned_projects WHERE name = 'Hal''s';
+SELECT role, user_id, scope_id FROM letter.memberships WHERE role = 'owner' ORDER BY scope_id;
+SET letter.bypass = on;
+SELECT letter.unassign('public.owned_projects', 'owner_id', role := 'owner', scope := 'public.owned_projects');
+RESET letter.bypass;
+SELECT count(*) AS owner_memberships FROM letter.memberships WHERE role = 'owner';
+DROP TABLE owned_projects CASCADE;
+
 DROP TABLE admins CASCADE;
 DROP TABLE team_members CASCADE;
 DROP TABLE projects CASCADE;
