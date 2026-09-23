@@ -26,34 +26,31 @@ CREATE TABLE team_members (
 CREATE TABLE stale (id int PRIMARY KEY, x TEXT);
 CREATE TABLE unguarded (id int PRIMARY KEY, x TEXT);
 SET letter.bypass = on;
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
  assign 
 --------
  t
 (1 row)
 
 RESET letter.bypass;
-SELECT letter.grant('select', 'public.tasks', 'editor', ARRAY['title'],
-    'public.projects', NULL, NULL);
-WARNING:  letter.grant: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
+SELECT letter.grant_scoped('select', 'public.tasks', 'editor', ARRAY['title'], 'public.projects');
+WARNING:  letter: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.tasks (project_id);
- grant 
--------
+ grant_scoped 
+--------------
  t
 (1 row)
 
-SELECT letter.grant('update', 'public.tasks', 'editor', ARRAY['title'],
-    'public.projects', NULL, NULL);
- grant 
--------
+SELECT letter.grant_scoped('update', 'public.tasks', 'editor', ARRAY['title'], 'public.projects');
+ grant_scoped 
+--------------
  t
 (1 row)
 
 -- assignment ids are random: normalise them away
 CREATE VIEW health AS
     SELECT severity, object,
-           regexp_replace(message, '[0-9a-f]{8}(_[0-9a-f]{4}){3}_[0-9a-f]{12}', '<id>') AS message
+           regexp_replace(message, 'rule_[0-9a-f]{8}', 'rule_<id>') AS message
     FROM letter.check_health();
 -- ============================================================
 -- 1. A healthy installation: only the two environmental rows and
@@ -78,19 +75,19 @@ INSERT INTO letter.grants (privilege, on_table, role, column_name, scope)
 INSERT INTO letter.grants (privilege, on_table, role, column_name, scope)
     VALUES ('select', 'public.unguarded'::regclass, 'r', '*', 0);
 -- enforcement triggers left behind by a hand-deleted grant
-SELECT letter.grant('select', 'public.stale', 'r', ARRAY['x'], NULL);
- grant 
--------
+SELECT letter.grant_global('select', 'public.stale', 'r', ARRAY['x']);
+ grant_global 
+--------------
  t
 (1 row)
 
 DELETE FROM letter.grants WHERE on_table = 'public.stale'::regclass;
 -- a role row managed directly, and one scoped to a dead table
-INSERT INTO letter.roles (role, user_id) VALUES ('auditor', 'u1');
-INSERT INTO letter.roles (role, user_id, scope_table, scope_id) VALUES ('editor', 'u2', 99999999, '1');
+INSERT INTO letter.memberships (role, user_id) VALUES ('auditor', 'u1');
+INSERT INTO letter.memberships (role, user_id, scope_table, scope_id) VALUES ('editor', 'u2', 99999999, '1');
 -- an assignment whose trigger function was dropped by hand
-SELECT 'letter.source_delete_' || replace(id::text, '-', '_') || '()' AS fn
-    FROM letter.assignments \gset
+SELECT 'letter._rule_' || left(id::text, 8) || '_delete()' AS fn
+    FROM letter.membership_rules \gset
 SET client_min_messages = warning;
 DROP FUNCTION :fn CASCADE;
 RESET client_min_messages;
@@ -100,8 +97,8 @@ ALTER ROLE letter_test_admin SET letter.bypass = on;
 SELECT * FROM health ORDER BY 1, 2, 3;
  severity |              object               |                                                                                      message                                                                                       
 ----------+-----------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- error    | assignment on public.team_members | is missing function letter.source_delete_<id>
- error    | assignment on public.team_members | is missing trigger letter_delete_<id>
+ error    | assignment on public.team_members | is missing function letter._rule_<id>_delete
+ error    | assignment on public.team_members | is missing trigger letter_rule_<id>_delete
  error    | grant ghost/select                | refers to a table that no longer exists (OID 99999999)
  error    | role editor of u2                 | is scoped to a table that no longer exists (OID 99999999)
  error    | table public.unguarded            | has grants but no letter_enforce_delete trigger

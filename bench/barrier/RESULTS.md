@@ -102,3 +102,82 @@ Not yet tested: 3+ hop chains, per-hop gating predicates on the joins, partition
 leaf tables, the result-relation (write-path) case, and whether the hook-built tree
 (as opposed to a view) plans identically — it should, since a `security_barrier` view
 is expanded into exactly this subquery RTE.
+
+## 2026-09-23 — the hook itself (plan/17 H5.9, plan/19 W3)
+
+The same data under letter proper: `letter_setup.sql` loads `lx.roles` into
+`letter.memberships` and makes the modelled grants for real (editor → body, viewer →
+author, scoped via `{task_id}`; admin `*` unscoped; editor on tasks/projects for the
+join; editor update on body for the write path). `letter_run.sql` runs the plain
+queries against `lx.comments` with `letter.enforce_reads` on — the planner hook does the
+rest. Warm cache, second run, PostgreSQL 17.9. Raw plans: `letter_run.out`,
+`letter_run_if.out`.
+
+| Case | hand-written form E | the hook | plan |
+|---|---|---|---|
+| Q1 alice, `count(*), count(body), count(author)` | 0.63 ms | **0.35 ms** | scope-driven: memberships → tasks(project_id) → comments(task_id); admin branch `never executed` |
+| Q2 alice, `WHERE id = 1650` | 0.03 ms (B/C) | **0.08 ms** | PK index scan below the barrier, semijoin on memberships |
+| Q3 alice, `WHERE body LIKE …` | 0.59 ms | **0.23 ms** | filter stays above the barrier (on the CASE) |
+| Q4 alice, comments ⋈ tasks ⋈ projects, all three protected | — | **0.31 ms** | every table scope-driven |
+| Q5 bigshot, 200k rows, three counts | 69 ms | **64 ms** | hash join tasks × 2000 scopes, hashed SubPlans for the columns |
+| Q5b bigshot, `count(*)` only | 31 ms | **47 ms** | see gap 1 |
+| Q6 nobody | 0.02 ms | **0.04 ms** | everything `never executed` |
+| Q7 root, unscoped admin, `count(*), count(body)` | 131 ms (`v_or_union`) | **205 ms** | see gap 2 |
+| W3 `UPDATE … SET body = body WHERE id = 1650` (in scope) | — | **0.17 ms** | `Index Scan using comments_pkey`, security qual as a filter — no scan |
+| W3b the same, row out of scope | — | **0.02 ms** | PK scan, 0 rows, silent |
+| Q1 with `if := 'author <> ''author 0'''` on the editor rule | — | 0.91 ms | see gap 3 |
+| Q5 with the same `if` | — | 122 ms | see gap 3 |
+
+Planning time: 2–3 ms per statement for this two-group table (the hook builds,
+parses and analyses the barrier text on every plan; the view was pre-parsed at
+0.1–0.3 ms). Prepared statements amortise it.
+
+**Verdict.** The hook's plans are the form E plans: driven from the user's scope set,
+PK lookups preserved (read and write), non-leakproof quals above the barrier, no scan
+of the wrong side anywhere. Three constant-factor gaps, none structural:
+
+1. **Unreferenced columns are not free under `UNION ALL`** (contradicts finding 5 above,
+   which was measured on a single-branch view). With two groups the barrier is an
+   `Append` of set-op branches, which PostgreSQL does not prune: each branch's `Result`
+   node computes every CASE column (hashed SubPlan probes) even for `count(*)`, and the
+   `Result` / `Subquery Scan` / `Append` nodes each add per-row overhead. 47 ms vs 31 ms
+   at 200k rows; nothing at alice's scale. A one-group table has no `Append` and
+   matches the view exactly (Q1).
+2. **The admin branch joins the scoped groups' chains it does not need.** In branch *i*
+   the generator emits the joins of every group some column tests, and the CASEs
+   still say `admin OR project_id IN (…)`. For root that is a hash left join of 1M
+   comments to 100k tasks (94 ms of the 205) to evaluate a test the branch's own WHERE
+   already made true. Fix (generator only): in branch *i*, group *i*'s test is TRUE —
+   columns covered by group *i* are plain `b.col`, and other groups' joins are added
+   only for columns group *i* does not cover. For an unscoped `*` grant that is exactly
+   `v_or_union`'s admin branch: `SELECT … FROM comments b WHERE <gate>`.
+3. **`if` costs a correlated SubPlan per row, evaluated up to twice.** The derived-table
+   form `(SELECT (<if>) FROM (SELECT b.*) AS comments)` is not pulled up: it runs as
+   `Filter: (SubPlan N)` on the scan (row test) and again inside the column CASE. At
+   200k rows: 64 → 122 ms; at 698 rows: 0.35 → 0.91 ms. Fix (generator only): analyse
+   the expression against the table and deparse it with the row aliased `b`
+   (`b.author <> 'author 0'`, whole-row as `b.*`) so it is an ordinary expression, and
+   evaluate it once by folding it into the branch WHERE when the group is the branch's
+   own (as in gap 2).
+
+### After D17 (same day): fixes 2 and 3 applied
+
+The generator now (a) deparses a rule's `if` as a plain expression over `b`
+(`b.author <> 'author 0'`, whole row `b.*`), (b) treats branch *i*'s own test as TRUE
+inside branch *i* — covered columns plain, other chains joined only where a column of
+that branch still tests them — and (c) renders each distinct (scope, via) chain once,
+shared by the groups that differ only in `if` or roles. Same data, same queries, warm:
+
+| Case | before D17 | after D17 | form E |
+|---|---|---|---|
+| Q1 alice | 0.35 ms | 0.32 ms | 0.63 ms |
+| Q5 bigshot | 64 ms | 66 ms | 69 ms |
+| Q5b bigshot `count(*)` | 47 ms | 48 ms | 31 ms (gap 1, stays) |
+| Q7 root, unscoped admin | 205 ms | **137 ms** | 131 ms |
+| Q1 with `if` | 0.91 ms | **0.28 ms** | — |
+| Q5 with `if` | 122 ms | **58 ms** | — |
+| W3 UPDATE by PK | 0.17 ms | 0.20 ms | — |
+
+The `if` is now `Filter: (author <> 'author 0')` on the comments index scan — no
+SubPlan — and the admin branch is `SELECT b.* FROM comments b WHERE <gate>`, no join.
+Gap 1 remains PostgreSQL's: an `Append` of set-op branches is not pruned.

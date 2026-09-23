@@ -28,47 +28,46 @@ INSERT INTO projects (id, name) VALUES
     ('b0000000-0000-0000-0000-000000000001', 'Project Alpha'),
     ('b0000000-0000-0000-0000-000000000002', 'Project Beta');
 -- Set up grants
-SELECT letter.grant('select', 'public.projects', 'viewer', ARRAY['*'], NULL, NULL, NULL);
- grant 
--------
+SELECT letter.grant_global('select', 'public.projects', 'viewer', ARRAY['*']);
+ grant_global 
+--------------
  t
 (1 row)
 
-SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['*'], NULL, NULL, NULL);
- grant 
--------
+SELECT letter.grant_global('select', 'public.projects', 'editor', ARRAY['*']);
+ grant_global 
+--------------
  t
 (1 row)
 
-SELECT letter.grant('update', 'public.projects', 'editor', ARRAY['name', 'status'], 'public.projects', NULL, NULL);
- grant 
--------
+SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['name', 'status'], 'public.projects');
+ grant_scoped 
+--------------
  t
 (1 row)
 
-SELECT letter.grant('delete', 'public.projects', 'admin', ARRAY['*'], NULL, NULL, NULL);
- grant 
--------
+SELECT letter.grant_global('delete', 'public.projects', 'admin');
+ grant_global 
+--------------
  t
 (1 row)
 
-SELECT letter.grant('insert', 'public.projects', 'admin', ARRAY['*'], NULL, NULL, NULL);
- grant 
--------
+SELECT letter.grant_global('insert', 'public.projects', 'admin');
+ grant_global 
+--------------
  t
 (1 row)
 
-SELECT letter.grant('select', 'public.team_members', 'editor', ARRAY['*'], 'public.projects', NULL, NULL);
-WARNING:  letter.grant: scope path column "project_id" on public.team_members has no index — reads scoped through it will scan the whole table
+SELECT letter.grant_scoped('select', 'public.team_members', 'editor', ARRAY['*'], 'public.projects');
+WARNING:  letter: scope path column "project_id" on public.team_members has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.team_members (project_id);
- grant 
--------
+ grant_scoped 
+--------------
  t
 (1 row)
 
 -- Set up assignments
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
  assign 
 --------
  t
@@ -83,27 +82,27 @@ INSERT INTO team_members (user_id, project_id, role) VALUES
 -- Test 1: list_grants() - all grants grouped by role
 -- ============================================================
 SELECT * FROM letter.list_grants() ORDER BY role, on_table, privilege, column_name;
-  role  | privilege |   on_table   | column_name |  scope   | using_path | check_fn 
---------+-----------+--------------+-------------+----------+------------+----------
- admin  | delete    | projects     | *           |          |            | 
- admin  | insert    | projects     | *           |          |            | 
- editor | select    | projects     | *           |          |            | 
- editor | update    | projects     | name        | projects |            | 
- editor | update    | projects     | status      | projects |            | 
- editor | select    | team_members | *           | projects |            | 
- viewer | select    | projects     | *           |          |            | 
+  role  | privilege |   on_table   | column_name |  scope   | via | if 
+--------+-----------+--------------+-------------+----------+-----+----
+ admin  | delete    | projects     | *           |          |     | 
+ admin  | insert    | projects     | *           |          |     | 
+ editor | select    | projects     | *           |          |     | 
+ editor | update    | projects     | name        | projects |     | 
+ editor | update    | projects     | status      | projects |     | 
+ editor | select    | team_members | *           | projects |     | 
+ viewer | select    | projects     | *           |          |     | 
 (7 rows)
 
 -- ============================================================
 -- Test 2: list_grants(role) - grants for a specific role
 -- ============================================================
 SELECT * FROM letter.list_grants('editor') ORDER BY on_table, privilege, column_name;
-  role  | privilege |   on_table   | column_name |  scope   | using_path | check_fn 
---------+-----------+--------------+-------------+----------+------------+----------
- editor | select    | projects     | *           |          |            | 
- editor | update    | projects     | name        | projects |            | 
- editor | update    | projects     | status      | projects |            | 
- editor | select    | team_members | *           | projects |            | 
+  role  | privilege |   on_table   | column_name |  scope   | via | if 
+--------+-----------+--------------+-------------+----------+-----+----
+ editor | select    | projects     | *           |          |     | 
+ editor | update    | projects     | name        | projects |     | 
+ editor | update    | projects     | status      | projects |     | 
+ editor | select    | team_members | *           | projects |     | 
 (4 rows)
 
 -- ============================================================
@@ -111,11 +110,11 @@ SELECT * FROM letter.list_grants('editor') ORDER BY on_table, privilege, column_
 -- ============================================================
 SELECT * FROM letter.user_permissions('a0000000-0000-0000-0000-000000000001')
     ORDER BY on_table, privilege, column_name, scope_table, scope_id;
-  role  | privilege |   on_table   | column_name |  scope   | scope_table |               scope_id               | using_path | check_fn 
---------+-----------+--------------+-------------+----------+-------------+--------------------------------------+------------+----------
- editor | update    | projects     | name        | projects | projects    | b0000000-0000-0000-0000-000000000001 |            | 
- editor | update    | projects     | status      | projects | projects    | b0000000-0000-0000-0000-000000000001 |            | 
- editor | select    | team_members | *           | projects | projects    | b0000000-0000-0000-0000-000000000001 |            | 
+  role  | privilege |   on_table   | column_name |  scope   | scope_table |               scope_id               | via | if 
+--------+-----------+--------------+-------------+----------+-------------+--------------------------------------+-----+----
+ editor | update    | projects     | name        | projects | projects    | b0000000-0000-0000-0000-000000000001 |     | 
+ editor | update    | projects     | status      | projects | projects    | b0000000-0000-0000-0000-000000000001 |     | 
+ editor | select    | team_members | *           | projects | projects    | b0000000-0000-0000-0000-000000000001 |     | 
 (3 rows)
 
 -- ============================================================
@@ -123,8 +122,8 @@ SELECT * FROM letter.user_permissions('a0000000-0000-0000-0000-000000000001')
 -- ============================================================
 SELECT * FROM letter.user_permissions('a0000000-0000-0000-0000-000000000002')
     ORDER BY on_table, privilege, column_name, scope_table, scope_id;
- role | privilege | on_table | column_name | scope | scope_table | scope_id | using_path | check_fn 
-------+-----------+----------+-------------+-------+-------------+----------+------------+----------
+ role | privilege | on_table | column_name | scope | scope_table | scope_id | via | if 
+------+-----------+----------+-------------+-------+-------------+----------+-----+----
 (0 rows)
 
 -- ============================================================
@@ -136,6 +135,24 @@ SELECT count(*) AS no_perms FROM letter.user_permissions('a0000000-0000-0000-000
         0
 (1 row)
 
+-- ============================================================
+-- Test 6: letter.user_id() — the user id, NULL when unset
+-- ============================================================
+RESET letter.user_id;
+SELECT letter.user_id() IS NULL AS unset;
+ unset 
+-------
+ t
+(1 row)
+
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT letter.user_id(), letter.user_id()::uuid = 'a0000000-0000-0000-0000-000000000001' AS castable;
+               user_id                | castable 
+--------------------------------------+----------
+ a0000000-0000-0000-0000-000000000001 | t
+(1 row)
+
+RESET letter.user_id;
 -- Clean up
 DROP TABLE team_members CASCADE;
 NOTICE:  letter: dropped table public.team_members: removed 1 grant(s), 1 assignment(s), 0 role(s)

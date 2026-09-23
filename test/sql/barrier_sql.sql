@@ -1,10 +1,10 @@
 -- Test: the barrier generator (plan/17-planner-hook-implementation.md §2, H2)
 --
--- letter.barrier_sql(regclass) returns the redacting subquery the planner
+-- letter.read_policy(regclass) returns the redacting subquery the planner
 -- hook will substitute for a protected table. Each fixture below is
 --   * golden text — the SQL is printed, and
 --   * executable  — the SQL is installed as a security_barrier view and its
---     rows/redaction compared with letter.read() on the same data. The hook
+--     rows/redaction compared with letter._read() on the same data. The hook
 --     and read() must agree (plan/15 D5); parity() counts rows found by one
 --     and not the other, values compared as text.
 --
@@ -103,7 +103,7 @@ INSERT INTO "Odd Scope" VALUES (1), (2);
 INSERT INTO "Odd Hop" VALUES (10, 1), (20, 2);
 INSERT INTO odd_leaf VALUES (100, 10, 'odd-1', 'kw-1'), (200, 20, 'odd-2', 'kw-2');
 
-INSERT INTO letter.roles (role, user_id, scope_table, scope_id) VALUES
+INSERT INTO letter.memberships (role, user_id, scope_table, scope_id) VALUES
     ('editor',   'alice', 'public.projects',  'a0000000-0000-0000-0000-000000000001'),
     ('viewer',   'alice', 'public.projects',  'a0000000-0000-0000-0000-000000000002'),
     ('viewer',   'bob',   'public.projects',  'a0000000-0000-0000-0000-000000000001'),
@@ -139,7 +139,7 @@ BEGIN
                     FROM jsonb_each(to_jsonb(x)) e
                     WHERE e.key NOT LIKE '%%pg.dropped%%') AS j
             FROM %s x),
-        rd AS (SELECT r - '_redacted' AS j FROM letter.read(%L) r)
+        rd AS (SELECT r - '_redacted' AS j FROM letter._read(%L) r)
         SELECT (SELECT count(*) FROM (SELECT j FROM vw EXCEPT SELECT j FROM rd) a),
                (SELECT count(*) FROM (SELECT j FROM rd EXCEPT SELECT j FROM vw) b)
     $q$, v, tbl) INTO only_in_view, only_in_read;
@@ -148,18 +148,17 @@ END $$;
 -- ============================================================
 -- Fixture 1: direct FK (no hops). No grant covers estimate.
 -- ============================================================
-SELECT letter.grant('select', 'public.tasks', 'editor', ARRAY['title'],
-    'public.projects', NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.tasks', 'editor', ARRAY['title'], 'public.projects');
 
-SELECT letter.barrier_sql('public.tasks') AS sql \gset
+SELECT letter.read_policy('public.tasks') AS sql \gset
 SELECT show_sql(:'sql') AS sql_shown \gset
 \echo :sql_shown
 CREATE VIEW v_tasks WITH (security_barrier) AS :sql;
 
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT title, estimate FROM v_tasks ORDER BY title;
 SELECT * FROM parity('v_tasks', 'public.tasks');
-SET letter.current_user_id = 'bob';
+SET letter.user_id = 'bob';
 SELECT title, estimate FROM v_tasks ORDER BY title;
 SELECT * FROM parity('v_tasks', 'public.tasks');
 
@@ -175,38 +174,35 @@ WHERE a.attrelid = 'v_tasks'::regclass ORDER BY a.attnum;
 -- columns on one chain; a dropped column; a NULL mid-chain (the
 -- orphan comment is visible to nobody).
 -- ============================================================
-SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
-    'public.projects', ARRAY['task_id'], NULL);
-SELECT letter.grant('select', 'public.comments', 'viewer', ARRAY['author'],
-    'public.projects', ARRAY['task_id'], NULL);
+SELECT letter.grant_scoped('select', 'public.comments', 'editor', ARRAY['body'], 'public.projects', ARRAY['task_id']);
+SELECT letter.grant_scoped('select', 'public.comments', 'viewer', ARRAY['author'], 'public.projects', ARRAY['task_id']);
 
-SELECT letter.barrier_sql('public.comments') AS sql \gset
+SELECT letter.read_policy('public.comments') AS sql \gset
 SELECT show_sql(:'sql') AS sql_shown \gset
 \echo :sql_shown
 CREATE VIEW v_comments WITH (security_barrier) AS :sql;
 
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT author, body FROM v_comments ORDER BY id;
 SELECT * FROM parity('v_comments', 'public.comments');
-SET letter.current_user_id = 'bob';
+SET letter.user_id = 'bob';
 SELECT author, body FROM v_comments ORDER BY id;
 SELECT * FROM parity('v_comments', 'public.comments');
 
 -- ============================================================
 -- Fixture 3: two hops, final hop inferred; a '*' grant.
 -- ============================================================
-SELECT letter.grant('select', 'public.reactions', 'viewer', ARRAY['*'],
-    'public.projects', ARRAY['comment_id', 'task_id'], NULL);
+SELECT letter.grant_scoped('select', 'public.reactions', 'viewer', ARRAY['*'], 'public.projects', ARRAY['comment_id', 'task_id']);
 
-SELECT letter.barrier_sql('public.reactions') AS sql \gset
+SELECT letter.read_policy('public.reactions') AS sql \gset
 SELECT show_sql(:'sql') AS sql_shown \gset
 \echo :sql_shown
 CREATE VIEW v_reactions WITH (security_barrier) AS :sql;
 
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT emoji FROM v_reactions ORDER BY id;
 SELECT * FROM parity('v_reactions', 'public.reactions');
-SET letter.current_user_id = 'bob';
+SET letter.user_id = 'bob';
 SELECT emoji FROM v_reactions ORDER BY id;
 SELECT * FROM parity('v_reactions', 'public.reactions');
 
@@ -214,37 +210,36 @@ SELECT * FROM parity('v_reactions', 'public.reactions');
 -- Fixture 4: the same chain with the final hop explicit.
 -- ============================================================
 DROP VIEW v_reactions;
-SELECT letter.revoke('select', 'public.reactions', 'viewer', ARRAY['*'], 'public.projects');
-SELECT letter.grant('select', 'public.reactions', 'viewer', ARRAY['emoji'],
-    'public.projects', ARRAY['comment_id', 'task_id', 'project_id'], NULL);
+SELECT letter.revoke_scoped('select', 'public.reactions', 'viewer', ARRAY['*'], 'public.projects');
+SELECT letter.grant_scoped('select', 'public.reactions', 'viewer', ARRAY['emoji'], 'public.projects', ARRAY['comment_id', 'task_id', 'project_id']);
 
-SELECT letter.barrier_sql('public.reactions') AS sql \gset
+SELECT letter.read_policy('public.reactions') AS sql \gset
 SELECT show_sql(:'sql') AS sql_shown \gset
 \echo :sql_shown
 CREATE VIEW v_reactions WITH (security_barrier) AS :sql;
 
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT emoji FROM v_reactions ORDER BY id;
 SELECT * FROM parity('v_reactions', 'public.reactions');
 
 -- ============================================================
 -- Fixture 5: an unscoped grant alone — one gated branch, no joins.
 -- ============================================================
-SELECT letter.grant('select', 'public.orgs', 'auditor', ARRAY['name'], NULL, NULL, NULL);
+SELECT letter.grant_global('select', 'public.orgs', 'auditor', ARRAY['name']);
 
-SELECT letter.barrier_sql('public.orgs') AS sql \gset
+SELECT letter.read_policy('public.orgs') AS sql \gset
 SELECT show_sql(:'sql') AS sql_shown \gset
 \echo :sql_shown
 CREATE VIEW v_orgs WITH (security_barrier) AS :sql;
 
-SET letter.current_user_id = 'carol';
+SET letter.user_id = 'carol';
 SELECT id, name FROM v_orgs ORDER BY id;
 SELECT * FROM parity('v_orgs', 'public.orgs');
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT id, name FROM v_orgs ORDER BY id;
 SELECT * FROM parity('v_orgs', 'public.orgs');
 -- erin holds 'auditor' scoped to a project, not globally: nothing (17 D11)
-SET letter.current_user_id = 'erin';
+SET letter.user_id = 'erin';
 SELECT id, name FROM v_orgs ORDER BY id;
 SELECT * FROM parity('v_orgs', 'public.orgs');
 
@@ -252,27 +247,25 @@ SELECT * FROM parity('v_orgs', 'public.orgs');
 -- Fixture 6: unscoped + scoped on one table; the table is its own
 -- scope; a second chain to a bigint-keyed scope.
 -- ============================================================
-SELECT letter.grant('select', 'public.projects', 'auditor', ARRAY['name'], NULL, NULL, NULL);
-SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['*'],
-    'public.projects', NULL, NULL);
-SELECT letter.grant('select', 'public.projects', 'member', ARRAY['status'],
-    'public.orgs', NULL, NULL);
+SELECT letter.grant_global('select', 'public.projects', 'auditor', ARRAY['name']);
+SELECT letter.grant_scoped('select', 'public.projects', 'editor', ARRAY['*'], 'public.projects');
+SELECT letter.grant_scoped('select', 'public.projects', 'member', ARRAY['status'], 'public.orgs');
 
-SELECT letter.barrier_sql('public.projects') AS sql \gset
+SELECT letter.read_policy('public.projects') AS sql \gset
 SELECT show_sql(:'sql') AS sql_shown \gset
 \echo :sql_shown
 CREATE VIEW v_projects WITH (security_barrier) AS :sql;
 
-SET letter.current_user_id = 'carol';
+SET letter.user_id = 'carol';
 SELECT name, status, org_id FROM v_projects ORDER BY name;
 SELECT * FROM parity('v_projects', 'public.projects');
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT name, status, org_id FROM v_projects ORDER BY name;
 SELECT * FROM parity('v_projects', 'public.projects');
-SET letter.current_user_id = 'dave';
+SET letter.user_id = 'dave';
 SELECT name, status, org_id FROM v_projects ORDER BY name;
 SELECT * FROM parity('v_projects', 'public.projects');
-SET letter.current_user_id = 'erin';
+SET letter.user_id = 'erin';
 SELECT name, status, org_id FROM v_projects ORDER BY name;
 SELECT * FROM parity('v_projects', 'public.projects');
 
@@ -284,32 +277,63 @@ SELECT * FROM parity('v_projects', 'public.projects');
 -- carol sees every row, the orphan included.
 -- ============================================================
 DROP VIEW v_comments;
-SELECT letter.grant('select', 'public.comments', 'assignee', ARRAY['body'],
-    'public.tasks', NULL, NULL);
-SELECT letter.grant('select', 'public.comments', 'auditor', ARRAY['author'], NULL, NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.comments', 'assignee', ARRAY['body'], 'public.tasks');
+SELECT letter.grant_global('select', 'public.comments', 'auditor', ARRAY['author']);
 
-SELECT letter.barrier_sql('public.comments') AS sql \gset
+SELECT letter.read_policy('public.comments') AS sql \gset
 SELECT show_sql(:'sql') AS sql_shown \gset
 \echo :sql_shown
 CREATE VIEW v_comments WITH (security_barrier) AS :sql;
 
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT author, body FROM v_comments ORDER BY id;
 SELECT * FROM parity('v_comments', 'public.comments');
-SET letter.current_user_id = 'bob';
+SET letter.user_id = 'bob';
 SELECT author, body FROM v_comments ORDER BY id;
 SELECT * FROM parity('v_comments', 'public.comments');
-SET letter.current_user_id = 'carol';
+SET letter.user_id = 'carol';
 SELECT author, body FROM v_comments ORDER BY id;
 SELECT * FROM parity('v_comments', 'public.comments');
 
+-- ============================================================
+-- Fixture 7b: two rules for one role differing only in their path
+-- (plan/17 D15): messages between projects, readable by a member of
+-- EITHER project. Both rules stand; the barrier unions them.
+-- ============================================================
+CREATE TABLE messages (
+    id uuid PRIMARY KEY,
+    from_project uuid REFERENCES projects(id),
+    to_project uuid REFERENCES projects(id),
+    body TEXT
+);
+CREATE INDEX ON messages (from_project);
+CREATE INDEX ON messages (to_project);
+INSERT INTO messages VALUES
+    ('e0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000003', 'Alpha→Gamma'),
+    ('e0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000002', 'Gamma→Beta'),
+    ('e0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000003', 'Gamma→Gamma');
+SELECT letter.grant_scoped('select', 'public.messages', 'editor', ARRAY['body'], 'public.projects', ARRAY['from_project']);
+SELECT letter.grant_scoped('select', 'public.messages', 'editor', ARRAY['body'], 'public.projects', ARRAY['to_project']);
+SELECT letter.grant_scoped('select', 'public.messages', 'editor', ARRAY['body'], 'public.projects', ARRAY['to_project']);   -- same rule: no-op
+SELECT count(*) AS rules FROM letter.grants WHERE on_table = 'public.messages'::regclass;
+
+SELECT letter.read_policy('public.messages') AS sql \gset
+SELECT show_sql(:'sql') AS sql_shown \gset
+\echo :sql_shown
+CREATE VIEW v_messages WITH (security_barrier) AS :sql;
+SET letter.user_id = 'alice';     -- editor@Alpha: the Alpha→Gamma message only
+SELECT body FROM v_messages ORDER BY body;
+SELECT * FROM parity('v_messages', 'public.messages');
+DROP VIEW v_messages;
+DROP TABLE messages;
+
 -- The write path's correlated form (plan/19 W1): the row qual and the
 -- per-column tests over alias b, hops as scalar sublinks. Executable: the
--- qual must select exactly the rows letter.read() shows.
-SELECT letter.barrier_write_sql('public.comments') AS wsql \gset
+-- qual must select exactly the rows letter._read() shows.
+SELECT letter.write_policy('public.comments') AS wsql \gset
 SELECT show_sql(:'wsql') AS wsql_shown \gset
 \echo :wsql_shown
-SELECT letter.barrier_write_sql('public.reactions') AS wsql \gset
+SELECT letter.write_policy('public.reactions') AS wsql \gset
 SELECT show_sql(:'wsql') AS wsql_shown \gset
 \echo :wsql_shown
 
@@ -317,47 +341,43 @@ CREATE FUNCTION write_qual_parity(tbl regclass, OUT by_qual bigint, OUT by_read 
 LANGUAGE plpgsql AS $$
 DECLARE q text;
 BEGIN
-    q := split_part(letter.barrier_write_sql(tbl), E'\n', 1);   -- the WHERE line
+    q := split_part(letter.write_policy(tbl), E'\n', 1);   -- the WHERE line
     EXECUTE format('SELECT count(*) FROM %s b %s', tbl, q) INTO by_qual;
-    EXECUTE format('SELECT count(*) FROM letter.read(%L)', letter._qualname(tbl)) INTO by_read;
+    EXECUTE format('SELECT count(*) FROM letter._read(%L)', letter._qualname(tbl)) INTO by_read;
 END $$;
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT * FROM write_qual_parity('public.comments');
 SELECT * FROM write_qual_parity('public.reactions');
-SET letter.current_user_id = 'bob';
+SET letter.user_id = 'bob';
 SELECT * FROM write_qual_parity('public.comments');
 SELECT * FROM write_qual_parity('public.reactions');
-SET letter.current_user_id = 'carol';
+SET letter.user_id = 'carol';
 SELECT * FROM write_qual_parity('public.comments');
-SET letter.current_user_id = 'erin';
+SET letter.user_id = 'erin';
 SELECT * FROM write_qual_parity('public.comments');
 DROP FUNCTION write_qual_parity(regclass);
 
 -- ============================================================
 -- Fixture 8: composite primary keys (D4). Allowed on a leaf — every
--- PK column is visible. (letter.read() shows only the first PK column,
+-- PK column is visible. (letter._read() shows only the first PK column,
 -- so parity is not asserted here.)
 -- ============================================================
-SELECT letter.grant('select', 'public.memberships', 'editor', ARRAY['note'],
-    'public.projects', NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.memberships', 'editor', ARRAY['note'], 'public.projects');
 
-SELECT letter.barrier_sql('public.memberships') AS sql \gset
+SELECT letter.read_policy('public.memberships') AS sql \gset
 SELECT show_sql(:'sql') AS sql_shown \gset
 \echo :sql_shown
 CREATE VIEW v_memberships WITH (security_barrier) AS :sql;
 
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT user_name, note FROM v_memberships ORDER BY user_name;
 
 -- Rejected at grant time on a scope table, on a table along the path,
 -- and on a table that is its own scope — for any privilege.
 \set VERBOSITY terse
-SELECT letter.grant('select', 'public.pair_leaf', 'viewer', ARRAY['body'],
-    'public.pair_scope', NULL, NULL);
-SELECT letter.grant('update', 'public.pair_leaf', 'viewer', ARRAY['body'],
-    'public.orgs', ARRAY['a'], NULL);
-SELECT letter.grant('select', 'public.pair_scope', 'viewer', ARRAY['name'],
-    'public.pair_scope', NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.pair_leaf', 'viewer', ARRAY['body'], 'public.pair_scope');
+SELECT letter.grant_scoped('update', 'public.pair_leaf', 'viewer', ARRAY['body'], 'public.orgs', ARRAY['a']);
+SELECT letter.grant_scoped('select', 'public.pair_scope', 'viewer', ARRAY['name'], 'public.pair_scope');
 \set VERBOSITY default
 SELECT count(*) FROM letter.grants WHERE on_table::text LIKE '%pair%';
 
@@ -365,38 +385,162 @@ SELECT count(*) FROM letter.grants WHERE on_table::text LIKE '%pair%';
 -- Fixture 9: identifiers that need quoting (mixed case, spaces, a
 -- keyword) and a role name containing a quote.
 -- ============================================================
-SELECT letter.grant('select', 'public.odd_leaf', 'o''brien', ARRAY['Body Text'],
-    'public."Odd Scope"', ARRAY['Hop Id'], NULL);
+SELECT letter.grant_scoped('select', 'public.odd_leaf', 'o''brien', ARRAY['Body Text'], 'public."Odd Scope"', ARRAY['Hop Id']);
 
-SELECT letter.barrier_sql('public.odd_leaf') AS sql \gset
+SELECT letter.read_policy('public.odd_leaf') AS sql \gset
 SELECT show_sql(:'sql') AS sql_shown \gset
 \echo :sql_shown
 CREATE VIEW v_odd WITH (security_barrier) AS :sql;
 
-SET letter.current_user_id = 'bob';
+SET letter.user_id = 'bob';
 SELECT id, "Body Text", "select" FROM v_odd ORDER BY id;
 SELECT * FROM parity('v_odd', 'public.odd_leaf');
+
+-- ============================================================
+-- Fixture 10: `if` — a boolean expression over the row (plan/20 §3).
+-- Three rules on notes: editors read the body of non-private notes;
+-- editors read everything of their own notes (same role, scope and
+-- path, a different if: two rules, two groups — 17 D15); auditors read
+-- the kind of public notes, the row named as the table. Parity is
+-- against visible_columns() (letter._read() does not evaluate if).
+-- ============================================================
+CREATE TABLE notes (
+    id int PRIMARY KEY,
+    project_id uuid REFERENCES projects(id),
+    author TEXT,
+    body TEXT,
+    kind TEXT
+);
+CREATE INDEX ON notes (project_id);
+INSERT INTO notes VALUES
+    (1, 'a0000000-0000-0000-0000-000000000001', 'alice', 'mine, private',   'private'),
+    (2, 'a0000000-0000-0000-0000-000000000001', 'bob',   'theirs, public',  'public'),
+    (3, 'a0000000-0000-0000-0000-000000000001', 'bob',   'theirs, private', 'private'),
+    (4, 'a0000000-0000-0000-0000-000000000002', 'alice', 'beta, mine',      'public'),
+    (5, 'a0000000-0000-0000-0000-000000000001', 'bob',   'kind unknown',    NULL);
+CREATE FUNCTION is_public(n notes) RETURNS boolean LANGUAGE sql IMMUTABLE
+    AS $$ SELECT n.kind = 'public' $$;
+
+SELECT letter.grant_scoped('select', 'public.notes', 'editor', ARRAY['body'], 'public.projects',
+                           if := 'kind <> ''private''');
+SELECT letter.grant_scoped('select', 'public.notes', 'editor', ARRAY['*'], 'public.projects',
+                           if := 'author = letter.user_id()');
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['kind'],
+                           if := 'is_public(notes)');
+SELECT role, column_name, "if" FROM letter.grants WHERE on_table = 'public.notes'::regclass ORDER BY 1, 2, 3;
+
+SELECT letter.read_policy('public.notes') AS sql \gset
+SELECT show_sql(:'sql') AS sql_shown \gset
+\echo :sql_shown
+CREATE VIEW v_notes WITH (security_barrier) AS :sql;
+
+CREATE FUNCTION vc_parity(v regclass, tbl regclass, OUT mismatches bigint, OUT hidden_rows bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE format($q$
+        WITH base AS (SELECT x.id, to_jsonb(x) AS j, letter.visible_columns(%L, x.id) AS vc FROM %s x),
+        expect AS (
+            SELECT id, (SELECT jsonb_object_agg(e.key, CASE WHEN e.key = ANY (vc) THEN e.value ELSE 'null'::jsonb END)
+                        FROM jsonb_each(j) e) AS j
+            FROM base WHERE vc IS NOT NULL),
+        vw AS (SELECT x.id, to_jsonb(x) AS j FROM %s x)
+        SELECT (SELECT count(*) FROM (SELECT * FROM expect EXCEPT SELECT * FROM vw) a)
+             + (SELECT count(*) FROM (SELECT * FROM vw EXCEPT SELECT * FROM expect) b),
+               (SELECT count(*) FROM base WHERE vc IS NULL)
+    $q$, tbl, tbl, v) INTO mismatches, hidden_rows;
+END $$;
+
+SET letter.user_id = 'alice';     -- editor@Alpha: 1 (hers, all columns), 2 (body); 3 private, 4 not editor, 5 kind NULL
+SELECT id, author, body, kind FROM v_notes ORDER BY id;
+SELECT * FROM vc_parity('v_notes', 'public.notes');
+SET letter.user_id = 'bob';       -- viewer@Alpha: no rule
+SELECT id, author, body, kind FROM v_notes ORDER BY id;
+SELECT * FROM vc_parity('v_notes', 'public.notes');
+SET letter.user_id = 'carol';     -- auditor: the kind of public notes
+SELECT id, author, body, kind FROM v_notes ORDER BY id;
+SELECT * FROM vc_parity('v_notes', 'public.notes');
+
+-- The write path's correlated form carries the same if; the qual selects
+-- exactly the rows the barrier shows.
+SELECT letter.write_policy('public.notes') AS wsql \gset
+SELECT show_sql(:'wsql') AS wsql_shown \gset
+\echo :wsql_shown
+CREATE FUNCTION if_qual_rows(tbl regclass) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+    EXECUTE format('SELECT count(*) FROM %s b %s', tbl,
+                   split_part(letter.write_policy(tbl), E'\n', 1)) INTO n;
+    RETURN n;
+END $$;
+SET letter.user_id = 'alice';
+SELECT if_qual_rows('public.notes') AS by_qual, (SELECT count(*) FROM v_notes) AS by_view;
+SET letter.user_id = 'carol';
+SELECT if_qual_rows('public.notes') AS by_qual, (SELECT count(*) FROM v_notes) AS by_view;
+DROP FUNCTION if_qual_rows(regclass);
+
+-- Refused shapes: validated at grant time by analysis in the row's
+-- context — not boolean, a subquery, an aggregate, a user function that
+-- is not IMMUTABLE, old/new on a select rule, a column of another table
+-- on the path, and text that is not one expression.
+CREATE FUNCTION flaky() RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT true $$;
+\set VERBOSITY terse
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'kind');
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'EXISTS (SELECT 1)');
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'count(*) > 0');
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'flaky()');
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'old.kind = new.kind');
+SELECT letter.grant_scoped('select', 'public.notes', 'auditor', ARRAY['body'], 'public.projects', if := 'name = ''Alpha''');
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'true) OR (true');
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'true; DROP TABLE notes');
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'true FROM projects');
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'no_such_column');
+\set VERBOSITY default
+-- A trailing comment is harmless: the generator puts the expression on its own lines.
+SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['body'], if := 'kind = ''public'' -- public only');
+SELECT count(*) AS rules FROM letter.grants WHERE on_table = 'public.notes'::regclass;
+SELECT letter.read_policy('public.notes') AS sql \gset
+CREATE VIEW v_notes_comment WITH (security_barrier) AS :sql;
+SET letter.user_id = 'carol';
+SELECT id, body, kind FROM v_notes_comment ORDER BY id;
+DROP VIEW v_notes_comment;
+SELECT letter.revoke_global('select', 'public.notes', 'auditor', ARRAY['body']);
+DROP FUNCTION flaky();
+
+-- Lifecycle: an if is revalidated like a path. Renaming a column it names
+-- is refused; dropping the column removes the rule with a NOTICE (the rule
+-- through is_public() stays — letter cannot see inside a function body,
+-- so it is revoked first).
+SELECT letter.revoke_global('select', 'public.notes', 'auditor', ARRAY['kind']);
+DROP VIEW v_notes;
+\set VERBOSITY terse
+ALTER TABLE notes RENAME COLUMN kind TO category;
+\set VERBOSITY default
+ALTER TABLE notes DROP COLUMN kind;
+SELECT role, column_name, "if" FROM letter.grants WHERE on_table = 'public.notes'::regclass ORDER BY 1, 2, 3;
+DROP FUNCTION vc_parity(regclass, regclass);
+DROP FUNCTION is_public(notes);
+DROP TABLE notes;
 
 -- ============================================================
 -- Entry criterion (plan/16 §7): nothing user-specific in the text.
 -- Generated as a sentinel user who holds a role, the SQL contains
 -- neither the user id nor any of that user's scope ids.
 -- ============================================================
-INSERT INTO letter.roles (role, user_id, scope_table, scope_id) VALUES
+INSERT INTO letter.memberships (role, user_id, scope_table, scope_id) VALUES
     ('editor', 'SENTINEL-USER', 'public.projects', 'a0000000-0000-0000-0000-000000000002');
-SET letter.current_user_id = 'SENTINEL-USER';
+SET letter.user_id = 'SENTINEL-USER';
 
 SELECT t.tbl,
-       position('SENTINEL' in letter.barrier_sql(t.tbl)) AS user_id_at,
-       (SELECT count(*) FROM letter.roles r
+       position('SENTINEL' in letter.read_policy(t.tbl)) AS user_id_at,
+       (SELECT count(*) FROM letter.memberships r
          WHERE length(r.scope_id) > 8
-           AND position(r.scope_id in letter.barrier_sql(t.tbl)) > 0) AS scope_ids_found
+           AND position(r.scope_id in letter.read_policy(t.tbl)) > 0) AS scope_ids_found
 FROM (VALUES ('public.comments'::regclass), ('public.projects'), ('public.reactions')) t(tbl);
 
-RESET letter.current_user_id;
+RESET letter.user_id;
 
 -- A table with no select grants has no barrier.
-SELECT letter.barrier_sql('public.ungranted') IS NULL AS no_barrier;
+SELECT letter.read_policy('public.ungranted') IS NULL AS no_barrier;
 
 -- Cleanup
 DROP VIEW v_tasks, v_comments, v_reactions, v_orgs, v_projects, v_memberships, v_odd;

@@ -5,7 +5,7 @@
 
 -- Core tables
 
-CREATE TABLE letter.roles (
+CREATE TABLE letter.memberships (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     role VARCHAR(64) NOT NULL,
     user_id VARCHAR(256) NOT NULL CHECK (user_id <> ''),
@@ -19,30 +19,34 @@ CREATE TABLE letter.grants (
     role VARCHAR(64) NOT NULL,
     column_name VARCHAR(64) NOT NULL,
     scope regclass NOT NULL,            -- 0 = unscoped
-    using_path TEXT[],
-    check_fn TEXT,
-    CONSTRAINT grants_pkey PRIMARY KEY (privilege, on_table, role, scope, column_name)
+    via TEXT[],
+    if TEXT,
+    -- A grant's identity is the whole rule (plan/17 D15): grants are a set of
+    -- permissive rules — the same rule twice is one rule, a rule that differs
+    -- in its path or check is another rule, and rules only ever add.
+    CONSTRAINT grants_rule UNIQUE NULLS NOT DISTINCT
+        (privilege, on_table, role, scope, column_name, via, if)
 );
 
-CREATE TABLE letter.assignments (
+CREATE TABLE letter.membership_rules (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     table_name regclass NOT NULL,
     scope_table regclass,
     user_column VARCHAR(64) NOT NULL,
-    role_name VARCHAR(64),
+    role VARCHAR(64),
     role_column VARCHAR(64),
-    if_fn TEXT,
-    CONSTRAINT unique_assign UNIQUE (table_name, scope_table, user_column, role_name, role_column),
-    CONSTRAINT role_name_or_column CHECK (
-        (role_name IS NOT NULL AND role_column IS NULL) OR
-        (role_name IS NULL AND role_column IS NOT NULL)
+    if TEXT,
+    CONSTRAINT unique_assign UNIQUE (table_name, scope_table, user_column, role, role_column),
+    CONSTRAINT role_or_column CHECK (
+        (role IS NOT NULL AND role_column IS NULL) OR
+        (role IS NULL AND role_column IS NOT NULL)
     )
 );
 
-CREATE TABLE letter.role_assignments (
+CREATE TABLE letter.membership_sources (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    assignment_id uuid NOT NULL REFERENCES letter.assignments(id) ON DELETE CASCADE,
-    role_id uuid NOT NULL REFERENCES letter.roles(id),
+    assignment_id uuid NOT NULL REFERENCES letter.membership_rules(id) ON DELETE CASCADE,
+    role_id uuid NOT NULL REFERENCES letter.memberships(id),
     source_table regclass NOT NULL,
     source_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
@@ -51,22 +55,22 @@ CREATE TABLE letter.role_assignments (
 );
 
 -- All four tables are configuration as far as pg_dump is concerned (plan/18
--- D6): roles and role_assignments are normally derived by the assignment
+-- D6): memberships and membership_sources are normally derived by the assignment
 -- triggers, but roles the application manages directly would otherwise be
 -- lost. Restore with session_replication_role = replica and letter.bypass
 -- (README): triggers and event triggers off, everything reloaded verbatim.
 SELECT pg_catalog.pg_extension_config_dump('letter.grants', '');
-SELECT pg_catalog.pg_extension_config_dump('letter.assignments', '');
-SELECT pg_catalog.pg_extension_config_dump('letter.roles', '');
-SELECT pg_catalog.pg_extension_config_dump('letter.role_assignments', '');
+SELECT pg_catalog.pg_extension_config_dump('letter.membership_rules', '');
+SELECT pg_catalog.pg_extension_config_dump('letter.memberships', '');
+SELECT pg_catalog.pg_extension_config_dump('letter.membership_sources', '');
 
 -- Indexes for enforcement query performance
-CREATE INDEX roles_user_id_idx ON letter.roles (user_id);
-CREATE INDEX roles_role_idx ON letter.roles (role);
+CREATE INDEX roles_user_id_idx ON letter.memberships (user_id);
+CREATE INDEX roles_role_idx ON letter.memberships (role);
 CREATE INDEX grants_on_table_role_idx ON letter.grants (on_table, role);
 
 -- Cleanup trigger: when a role_assignment is deleted, remove the associated role
-CREATE FUNCTION letter.role_cleanup() RETURNS trigger
+CREATE FUNCTION letter._membership_cleanup() RETURNS trigger
 AS 'MODULE_PATHNAME', 'letter_role_cleanup'
 LANGUAGE C;
 
@@ -74,80 +78,82 @@ LANGUAGE C;
 -- (plan/17 H4): the roles trigger invalidates it, and every backend's
 -- session cache follows, without invalidating the rewritten plans, which
 -- depend on letter.grants but not on role rows.
-CREATE TABLE letter.roles_epoch ();
+CREATE TABLE letter._membership_signal ();
 
 -- Session-cache invalidation: any write to roles or grants invalidates this
 -- backend's cache at once and, through the relcache, every other backend's
 -- at commit; a grants write also invalidates every rewritten plan.
-CREATE FUNCTION letter.cache_inval() RETURNS trigger
+CREATE FUNCTION letter._cache_inval() RETURNS trigger
 AS 'MODULE_PATHNAME', 'letter_cache_inval'
 LANGUAGE C;
 
-CREATE TRIGGER roles_cache_inval
-    AFTER INSERT OR UPDATE OR DELETE ON letter.roles
+CREATE TRIGGER _memberships_cache_inval
+    AFTER INSERT OR UPDATE OR DELETE ON letter.memberships
     FOR EACH STATEMENT
-    EXECUTE FUNCTION letter.cache_inval();
+    EXECUTE FUNCTION letter._cache_inval();
 
-CREATE TRIGGER grants_cache_inval
+CREATE TRIGGER _grants_cache_inval
     AFTER INSERT OR UPDATE OR DELETE ON letter.grants
     FOR EACH STATEMENT
-    EXECUTE FUNCTION letter.cache_inval();
+    EXECUTE FUNCTION letter._cache_inval();
 
 -- Enforcement trigger functions (generic, installed on protected tables by grant/revoke)
-CREATE FUNCTION letter.enforce_insert() RETURNS trigger
+CREATE FUNCTION letter._enforce_insert() RETURNS trigger
 AS 'MODULE_PATHNAME', 'letter_enforce_insert'
 LANGUAGE C;
 
-CREATE FUNCTION letter.enforce_update() RETURNS trigger
+CREATE FUNCTION letter._enforce_update() RETURNS trigger
 AS 'MODULE_PATHNAME', 'letter_enforce_update'
 LANGUAGE C;
 
-CREATE FUNCTION letter.enforce_delete() RETURNS trigger
+CREATE FUNCTION letter._enforce_delete() RETURNS trigger
 AS 'MODULE_PATHNAME', 'letter_enforce_delete'
 LANGUAGE C;
 
-CREATE FUNCTION letter.enforce_truncate() RETURNS trigger
+CREATE FUNCTION letter._enforce_truncate() RETURNS trigger
 AS 'MODULE_PATHNAME', 'letter_enforce_truncate'
 LANGUAGE C;
 
 -- Lifecycle (plan/18 §3): drop cascades, alter refuses.
-CREATE FUNCTION letter.on_sql_drop() RETURNS event_trigger
+CREATE FUNCTION letter._on_sql_drop() RETURNS event_trigger
 AS 'MODULE_PATHNAME', 'letter_on_sql_drop'
 LANGUAGE C;
 
-CREATE FUNCTION letter.on_ddl_command_end() RETURNS event_trigger
+CREATE FUNCTION letter._on_ddl_command_end() RETURNS event_trigger
 AS 'MODULE_PATHNAME', 'letter_on_ddl_command_end'
 LANGUAGE C;
 
 CREATE EVENT TRIGGER letter_sql_drop ON sql_drop
-    EXECUTE FUNCTION letter.on_sql_drop();
+    EXECUTE FUNCTION letter._on_sql_drop();
 
 CREATE EVENT TRIGGER letter_ddl_command_end ON ddl_command_end
     WHEN TAG IN ('ALTER TABLE')
-    EXECUTE FUNCTION letter.on_ddl_command_end();
+    EXECUTE FUNCTION letter._on_ddl_command_end();
 
-CREATE TRIGGER role_assignment_cleanup
-    AFTER DELETE ON letter.role_assignments
+CREATE TRIGGER _membership_cleanup
+    AFTER DELETE ON letter.membership_sources
     FOR EACH ROW
-    EXECUTE FUNCTION letter.role_cleanup();
+    EXECUTE FUNCTION letter._membership_cleanup();
 
 -- Functions
 
 -- Tables are identified by OID (regclass): a grant follows its table through
 -- renames. scope NULL = unscoped (stored as 0).
-CREATE FUNCTION letter.grant(
+-- Plumbing: the C entry points. The API is grant_global / grant_scoped,
+-- revoke_global / revoke_scoped, assign / unassign below.
+CREATE FUNCTION letter._grant(
     privilege text,
     on_table regclass,
     role text,
     columns text[],
     scope regclass DEFAULT NULL,
-    using_path text[] DEFAULT NULL,
-    check_fn text DEFAULT NULL
+    via text[] DEFAULT NULL,
+    if text DEFAULT NULL
 ) RETURNS boolean
 AS 'MODULE_PATHNAME', 'letter_grant'
 LANGUAGE C VOLATILE;
 
-CREATE FUNCTION letter.revoke(
+CREATE FUNCTION letter._revoke(
     privilege text,
     on_table regclass,
     role text,
@@ -157,28 +163,134 @@ CREATE FUNCTION letter.revoke(
 AS 'MODULE_PATHNAME', 'letter_revoke'
 LANGUAGE C VOLATILE;
 
--- assign/unassign are admin operations: they require letter.bypass = on
--- (plan/17 D13).
-CREATE FUNCTION letter.assign(
+CREATE FUNCTION letter._assign(
     source_table regclass,
     user_column text,
     scope_table regclass DEFAULT NULL,
-    role_name text DEFAULT NULL,
+    role text DEFAULT NULL,
     role_column text DEFAULT NULL,
-    if_fn text DEFAULT NULL
+    if text DEFAULT NULL
 ) RETURNS boolean
 AS 'MODULE_PATHNAME', 'letter_assign'
 LANGUAGE C VOLATILE;
 
-CREATE FUNCTION letter.unassign(
+CREATE FUNCTION letter._unassign(
     source_table regclass,
     user_column text,
     scope_table regclass DEFAULT NULL,
-    role_name text DEFAULT NULL,
+    role text DEFAULT NULL,
     role_column text DEFAULT NULL
 ) RETURNS boolean
 AS 'MODULE_PATHNAME', 'letter_unassign'
 LANGUAGE C VOLATILE;
+
+-- insert and delete are row-level: their column list is always '*'. The
+-- others need one.
+CREATE FUNCTION letter._columns_or_default(privilege text, columns text[]) RETURNS text[]
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    IF columns IS NOT NULL THEN
+        RETURN columns;
+    END IF;
+    IF privilege IN ('insert', 'delete') THEN
+        RETURN ARRAY['*'];
+    END IF;
+    RAISE EXCEPTION 'letter: a % grant needs a column list (or ARRAY[''*''])', privilege
+        USING ERRCODE = 'null_value_not_allowed';
+END $$;
+
+-- Grants are a set of permissive rules: the same rule twice is one rule, a
+-- rule that differs in its path or its condition is another rule, and a rule
+-- only ever adds (plan/17 D15).
+
+-- What a role held in the global scope may do.
+CREATE FUNCTION letter.grant_global(
+    privilege text,
+    on_table regclass,
+    role text,
+    columns text[] DEFAULT NULL,
+    if text DEFAULT NULL
+) RETURNS boolean
+LANGUAGE sql VOLATILE AS $$
+    SELECT letter._grant(privilege, on_table, role,
+                         letter._columns_or_default(privilege, columns), NULL, NULL, "if")
+$$;
+
+-- What a role held in the scope a row belongs to may do. The row reaches its
+-- scope via a chain of foreign keys; the final hop is inferred when it is
+-- unambiguous.
+CREATE FUNCTION letter.grant_scoped(
+    privilege text,
+    on_table regclass,
+    role text,
+    columns text[],
+    scope regclass,
+    via text[] DEFAULT NULL,
+    if text DEFAULT NULL
+) RETURNS boolean
+LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    IF scope IS NULL THEN
+        RAISE EXCEPTION 'letter: grant_scoped needs a scope (use grant_global for the global scope)'
+            USING ERRCODE = 'null_value_not_allowed';
+    END IF;
+    RETURN letter._grant(privilege, on_table, role,
+                         letter._columns_or_default(privilege, columns), scope, via, "if");
+END $$;
+
+-- Revoke removes every rule under its key.
+CREATE FUNCTION letter.revoke_global(
+    privilege text,
+    on_table regclass,
+    role text,
+    columns text[] DEFAULT ARRAY['*']
+) RETURNS boolean
+LANGUAGE sql VOLATILE AS $$
+    SELECT letter._revoke(privilege, on_table, role, columns, NULL)
+$$;
+
+CREATE FUNCTION letter.revoke_scoped(
+    privilege text,
+    on_table regclass,
+    role text,
+    columns text[],
+    scope regclass
+) RETURNS boolean
+LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    IF scope IS NULL THEN
+        RAISE EXCEPTION 'letter: revoke_scoped needs a scope (use revoke_global for the global scope)'
+            USING ERRCODE = 'null_value_not_allowed';
+    END IF;
+    RETURN letter._revoke(privilege, on_table, role, columns, scope);
+END $$;
+
+-- Memberships come from one of your tables: each row confers on the user in
+-- user_column the role (a constant, or read from role_column), in the scope
+-- the row's foreign key points at — or in the global scope when there is no
+-- scope. Admin operations: require letter.bypass (plan/17 D13).
+CREATE FUNCTION letter.assign(
+    source_table regclass,
+    user_column text,
+    role text DEFAULT NULL,
+    role_column text DEFAULT NULL,
+    scope regclass DEFAULT NULL,
+    if text DEFAULT NULL
+) RETURNS boolean
+LANGUAGE sql VOLATILE AS $$
+    SELECT letter._assign(source_table, user_column, scope, role, role_column, "if")
+$$;
+
+CREATE FUNCTION letter.unassign(
+    source_table regclass,
+    user_column text,
+    role text DEFAULT NULL,
+    role_column text DEFAULT NULL,
+    scope regclass DEFAULT NULL
+) RETURNS boolean
+LANGUAGE sql VOLATILE AS $$
+    SELECT letter._unassign(source_table, user_column, scope, role, role_column)
+$$;
 
 -- letter.forget_user(user_id): remove every role the user holds — the ones
 -- assignments derived and the ones the application inserted directly — and
@@ -191,9 +303,9 @@ LANGUAGE plpgsql VOLATILE AS $$
 DECLARE
     n bigint;
 BEGIN
-    SELECT count(*) INTO n FROM letter.roles WHERE user_id = p_user_id;
-    DELETE FROM letter.role_assignments WHERE user_id = p_user_id;   -- cleanup trigger drops their roles
-    DELETE FROM letter.roles WHERE user_id = p_user_id;              -- the directly-managed rest
+    SELECT count(*) INTO n FROM letter.memberships WHERE user_id = p_user_id;
+    DELETE FROM letter.membership_sources WHERE user_id = p_user_id;   -- cleanup trigger drops their roles
+    DELETE FROM letter.memberships WHERE user_id = p_user_id;              -- the directly-managed rest
     RETURN n;
 END $$;
 
@@ -206,28 +318,43 @@ CREATE FUNCTION letter.visible_columns(rel regclass, pk anyelement) RETURNS text
 AS 'MODULE_PATHNAME', 'letter_visible_columns'
 LANGUAGE C STABLE STRICT;
 
--- DEPRECATED (plan/17 D3, 2026-09-22): plain SELECT is the enforced read.
--- letter.read() predates the planner hook, returns strings, and its raw
--- condition is evaluated against true values. Kept for parity tests; will
--- be removed.
-CREATE FUNCTION letter.read(
+-- Plumbing, test-only (plan/20 S2): the walker-based read, kept as the
+-- parity oracle for the generator (plan/15 D5). Not an API: plain SELECT is
+-- the enforced read. Returns strings; its raw condition is evaluated against
+-- true values.
+CREATE FUNCTION letter._read(
     table_name text,
     condition text DEFAULT NULL
 ) RETURNS SETOF jsonb
 AS 'MODULE_PATHNAME', 'letter_read'
 LANGUAGE C VOLATILE;
 
+-- The current end user, as the application set it — or NULL when unset. For
+-- application SQL and for check expressions ("only the author may edit"):
+--   owner_id = letter.user_id()::uuid
+CREATE FUNCTION letter.user_id() RETURNS text
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT NULLIF(pg_catalog.current_setting('letter.user_id', true), '')
+$$;
+
+-- The current end user, or an error when unset. Every generated barrier reads
+-- the user through this, so an unidentified session cannot read a protected
+-- table any more than it can write one.
+CREATE FUNCTION letter._user_id() RETURNS text
+AS 'MODULE_PATHNAME', 'letter_require_user'
+LANGUAGE C STABLE PARALLEL SAFE;
+
 -- Info/debug functions
 
 -- Debugging aid: the redacting subquery the planner hook substitutes for a
 -- protected table (NULL if the table has no select grants).
-CREATE FUNCTION letter.barrier_sql(rel regclass) RETURNS text
+CREATE FUNCTION letter.read_policy(rel regclass) RETURNS text
 AS 'MODULE_PATHNAME', 'letter_barrier_sql'
 LANGUAGE C STABLE STRICT;
 
 -- Debugging aid for the write path (plan/19): the row-visibility qual and
 -- the per-column tests applied to a protected result relation.
-CREATE FUNCTION letter.barrier_write_sql(rel regclass) RETURNS text
+CREATE FUNCTION letter.write_policy(rel regclass) RETURNS text
 AS 'MODULE_PATHNAME', 'letter_barrier_write_sql'
 LANGUAGE C STABLE STRICT;
 
@@ -252,9 +379,9 @@ LANGUAGE sql VOLATILE AS $$
             || string_to_array(replace(current_setting('session_preload_libraries'), ' ', ''), ',') AS libs
     ),
     assignment AS (
-        SELECT a.*, replace(a.id::text, '-', '_') AS safe_id,
+        SELECT a.*, left(a.id::text, 8) AS short_id,
                EXISTS (SELECT 1 FROM pg_class WHERE oid = a.table_name) AS source_exists
-        FROM letter.assignments a
+        FROM letter.membership_rules a
     )
     -- deployment
     SELECT 'warning', 'library',
@@ -308,27 +435,27 @@ LANGUAGE sql VOLATILE AS $$
     UNION ALL
     SELECT 'error', 'assignment on ' || letter._qualname(a.table_name), 'is missing function letter.' || f.name
     FROM assignment a
-    CROSS JOIN LATERAL (VALUES ('source_upsert_' || a.safe_id), ('source_delete_' || a.safe_id)) f(name)
+    CROSS JOIN LATERAL (VALUES ('_rule_' || a.short_id || '_upsert'), ('_rule_' || a.short_id || '_delete')) f(name)
     WHERE a.source_exists
       AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                       WHERE n.nspname = 'letter' AND p.proname = f.name)
     UNION ALL
     SELECT 'error', 'assignment on ' || letter._qualname(a.table_name), 'is missing trigger ' || tg.name
     FROM assignment a
-    CROSS JOIN LATERAL (VALUES ('letter_insert_' || a.safe_id), ('letter_update_' || a.safe_id),
-                               ('letter_delete_' || a.safe_id)) tg(name)
+    CROSS JOIN LATERAL (VALUES ('letter_rule_' || a.short_id || '_insert'), ('letter_rule_' || a.short_id || '_update'),
+                               ('letter_rule_' || a.short_id || '_delete')) tg(name)
     WHERE a.source_exists
       AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = a.table_name AND tgname = tg.name)
     UNION ALL
     -- roles
     SELECT 'error', 'role ' || r.role || ' of ' || r.user_id,
            'is scoped to a table that no longer exists (OID ' || r.scope_table::oid || ')'
-    FROM letter.roles r
+    FROM letter.memberships r
     WHERE r.scope_table IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = r.scope_table)
     UNION ALL
     SELECT 'info', 'roles', count(*) || ' role row(s) are managed directly, not by an assignment'
-    FROM letter.roles r
-    WHERE NOT EXISTS (SELECT 1 FROM letter.role_assignments ra WHERE ra.role_id = r.id)
+    FROM letter.memberships r
+    WHERE NOT EXISTS (SELECT 1 FROM letter.membership_sources ra WHERE ra.role_id = r.id)
     HAVING count(*) > 0
     UNION ALL
     -- validation and index coverage
@@ -342,11 +469,11 @@ RETURNS TABLE (
     on_table regclass,
     column_name VARCHAR(64),
     scope regclass,
-    using_path TEXT[],
-    check_fn TEXT
+    via TEXT[],
+    if TEXT
 ) AS $$
     SELECT g.role, g.privilege, g.on_table, g.column_name,
-           NULLIF(g.scope, 0), g.using_path, g.check_fn
+           NULLIF(g.scope, 0), g.via, g.if
     FROM letter.grants g
     WHERE (filter_role IS NULL OR g.role = filter_role);
 $$ LANGUAGE SQL STABLE;
@@ -360,12 +487,12 @@ RETURNS TABLE (
     scope regclass,
     scope_table regclass,
     scope_id VARCHAR(256),
-    using_path TEXT[],
-    check_fn TEXT
+    via TEXT[],
+    if TEXT
 ) AS $$
     SELECT r.role, g.privilege, g.on_table, g.column_name, NULLIF(g.scope, 0),
-           r.scope_table, r.scope_id, g.using_path, g.check_fn
-    FROM letter.roles r
+           r.scope_table, r.scope_id, g.via, g.if
+    FROM letter.memberships r
     JOIN letter.grants g ON g.role = r.role
         AND (
             -- Scoped grant: scope matches the role's scope_table

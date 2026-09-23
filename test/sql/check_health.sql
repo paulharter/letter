@@ -26,19 +26,16 @@ CREATE TABLE stale (id int PRIMARY KEY, x TEXT);
 CREATE TABLE unguarded (id int PRIMARY KEY, x TEXT);
 
 SET letter.bypass = on;
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
 RESET letter.bypass;
 
-SELECT letter.grant('select', 'public.tasks', 'editor', ARRAY['title'],
-    'public.projects', NULL, NULL);
-SELECT letter.grant('update', 'public.tasks', 'editor', ARRAY['title'],
-    'public.projects', NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.tasks', 'editor', ARRAY['title'], 'public.projects');
+SELECT letter.grant_scoped('update', 'public.tasks', 'editor', ARRAY['title'], 'public.projects');
 
 -- assignment ids are random: normalise them away
 CREATE VIEW health AS
     SELECT severity, object,
-           regexp_replace(message, '[0-9a-f]{8}(_[0-9a-f]{4}){3}_[0-9a-f]{12}', '<id>') AS message
+           regexp_replace(message, 'rule_[0-9a-f]{8}', 'rule_<id>') AS message
     FROM letter.check_health();
 
 -- ============================================================
@@ -58,14 +55,14 @@ INSERT INTO letter.grants (privilege, on_table, role, column_name, scope)
 INSERT INTO letter.grants (privilege, on_table, role, column_name, scope)
     VALUES ('select', 'public.unguarded'::regclass, 'r', '*', 0);
 -- enforcement triggers left behind by a hand-deleted grant
-SELECT letter.grant('select', 'public.stale', 'r', ARRAY['x'], NULL);
+SELECT letter.grant_global('select', 'public.stale', 'r', ARRAY['x']);
 DELETE FROM letter.grants WHERE on_table = 'public.stale'::regclass;
 -- a role row managed directly, and one scoped to a dead table
-INSERT INTO letter.roles (role, user_id) VALUES ('auditor', 'u1');
-INSERT INTO letter.roles (role, user_id, scope_table, scope_id) VALUES ('editor', 'u2', 99999999, '1');
+INSERT INTO letter.memberships (role, user_id) VALUES ('auditor', 'u1');
+INSERT INTO letter.memberships (role, user_id, scope_table, scope_id) VALUES ('editor', 'u2', 99999999, '1');
 -- an assignment whose trigger function was dropped by hand
-SELECT 'letter.source_delete_' || replace(id::text, '-', '_') || '()' AS fn
-    FROM letter.assignments \gset
+SELECT 'letter._rule_' || left(id::text, 8) || '_delete()' AS fn
+    FROM letter.membership_rules \gset
 SET client_min_messages = warning;
 DROP FUNCTION :fn CASCADE;
 RESET client_min_messages;

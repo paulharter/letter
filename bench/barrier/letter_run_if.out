@@ -1,0 +1,503 @@
+psql:bench/barrier/letter_run_if.sql:3: WARNING:  letter: library loaded on demand, not preloaded
+DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
+HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
+LOAD
+SET
+SET
+SET
+ revoke_scoped 
+---------------
+ t
+(1 row)
+
+ grant_scoped 
+--------------
+ t
+(1 row)
+
+SET
+SET
+==== Q1-if alice
+                                                                                   QUERY PLAN                                                                                   
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=41162.07..41162.08 rows=1 width=24) (actual time=0.520..0.523 rows=1 loops=1)
+   ->  Append  (cost=12.93..33659.44 rows=1000351 width=22) (actual time=0.088..0.504 rows=698 loops=1)
+         ->  Subquery Scan on "*SELECT* 1"  (cost=12.93..28346.93 rows=1000000 width=22) (actual time=0.018..0.018 rows=0 loops=1)
+               ->  Result  (cost=12.93..18346.93 rows=1000000 width=38) (actual time=0.017..0.018 rows=0 loops=1)
+                     One-Time Filter: (InitPlan 2).col1
+                     InitPlan 2
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.017..0.017 rows=1 loops=1)
+                             InitPlan 1
+                               ->  Bitmap Heap Scan on memberships r_2  (cost=8.90..12.92 rows=1 width=0) (actual time=0.016..0.017 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.015..0.015 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.008..0.008 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.006..0.006 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     ->  Seq Scan on comments b  (cost=0.00..18334.00 rows=1000000 width=22) (never executed)
+         ->  Subquery Scan on "*SELECT* 2"  (cost=74.10..115.13 rows=201 width=43) (actual time=0.070..0.223 rows=498 loops=1)
+               ->  Result  (cost=74.10..113.12 rows=201 width=59) (actual time=0.070..0.203 rows=498 loops=1)
+                     One-Time Filter: (NOT (InitPlan 7).col1)
+                     InitPlan 4
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.007..0.007 rows=1 loops=1)
+                             InitPlan 3
+                               ->  Bitmap Heap Scan on memberships r_3  (cost=8.90..12.92 rows=1 width=0) (actual time=0.006..0.007 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.006..0.006 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.002..0.002 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.003..0.003 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     InitPlan 7
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.025..0.026 rows=1 loops=1)
+                             InitPlan 6
+                               ->  Bitmap Heap Scan on memberships r_5  (cost=8.90..12.92 rows=1 width=0) (actual time=0.025..0.025 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.025..0.025 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.002..0.002 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.022..0.022 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     ->  Nested Loop  (cost=24.08..62.10 rows=201 width=30) (actual time=0.028..0.128 rows=498 loops=1)
+                           ->  Nested Loop  (cost=23.65..40.51 rows=20 width=16) (actual time=0.022..0.041 rows=50 loops=1)
+                                 ->  Unique  (cost=23.36..23.37 rows=2 width=4) (actual time=0.017..0.019 rows=5 loops=1)
+                                       ->  Sort  (cost=23.36..23.36 rows=2 width=4) (actual time=0.017..0.018 rows=5 loops=1)
+                                             Sort Key: ((r.scope_id)::bigint)
+                                             Sort Method: quicksort  Memory: 25kB
+                                             ->  Bitmap Heap Scan on memberships r  (cost=4.33..23.35 rows=2 width=4) (actual time=0.007..0.009 rows=5 loops=1)
+                                                   Recheck Cond: ((user_id)::text = letter._user_id())
+                                                   Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                                                   Rows Removed by Filter: 6
+                                                   Heap Blocks: exact=2
+                                                   ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.003..0.003 rows=11 loops=1)
+                                                         Index Cond: ((user_id)::text = letter._user_id())
+                                 ->  Index Scan using tasks_project_id_idx on tasks g1h1  (cost=0.30..8.47 rows=10 width=16) (actual time=0.003..0.004 rows=10 loops=5)
+                                       Index Cond: (project_id = (r.scope_id)::bigint)
+                           ->  Index Scan using comments_task_id_idx on comments b_1  (cost=0.42..0.98 rows=10 width=30) (actual time=0.001..0.001 rows=10 loops=50)
+                                 Index Cond: (task_id = g1h1.id)
+                     SubPlan 5
+                       ->  Index Scan using roles_user_id_idx on memberships r_4  (cost=0.29..24.16 rows=3 width=8) (actual time=0.004..0.005 rows=3 loops=1)
+                             Index Cond: ((user_id)::text = letter._user_id())
+                             Filter: (((role)::text = 'editor'::text) AND ((scope_table)::oid = '42442'::oid))
+                             Rows Removed by Filter: 8
+         ->  Subquery Scan on "*SELECT* 3"  (cost=98.24..195.63 rows=150 width=43) (actual time=0.172..0.240 rows=200 loops=1)
+               ->  Result  (cost=98.24..194.13 rows=150 width=59) (actual time=0.171..0.234 rows=200 loops=1)
+                     One-Time Filter: (NOT (InitPlan 12).col1)
+                     InitPlan 9
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.013..0.013 rows=1 loops=1)
+                             InitPlan 8
+                               ->  Bitmap Heap Scan on memberships r_6  (cost=8.90..12.92 rows=1 width=0) (actual time=0.013..0.013 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.006..0.006 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.003..0.003 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.003..0.003 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     InitPlan 12
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.006..0.007 rows=1 loops=1)
+                             InitPlan 11
+                               ->  Bitmap Heap Scan on memberships r_8  (cost=8.90..12.92 rows=1 width=0) (actual time=0.006..0.006 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.006..0.006 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.002..0.002 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.004..0.004 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     ->  Nested Loop  (cost=48.23..143.75 rows=150 width=30) (actual time=0.143..0.196 rows=200 loops=1)
+                           ->  Nested Loop  (cost=47.81..121.50 rows=15 width=16) (actual time=0.138..0.141 rows=20 loops=1)
+                                 ->  HashAggregate  (cost=23.35..23.38 rows=3 width=4) (actual time=0.066..0.067 rows=3 loops=1)
+                                       Group Key: (r_1.scope_id)::bigint
+                                       Batches: 1  Memory Usage: 24kB
+                                       ->  Bitmap Heap Scan on memberships r_1  (cost=4.33..23.35 rows=3 width=4) (actual time=0.019..0.062 rows=3 loops=1)
+                                             Recheck Cond: ((user_id)::text = letter._user_id())
+                                             Filter: (((role)::text = 'editor'::text) AND ((scope_table)::oid = '42442'::oid))
+                                             Rows Removed by Filter: 8
+                                             Heap Blocks: exact=2
+                                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.002..0.002 rows=11 loops=1)
+                                                   Index Cond: ((user_id)::text = letter._user_id())
+                                 ->  Index Scan using tasks_project_id_idx on tasks g1h1_1  (cost=24.46..32.66 rows=5 width=16) (actual time=0.022..0.023 rows=7 loops=3)
+                                       Index Cond: (project_id = (r_1.scope_id)::bigint)
+                                       Filter: ((ANY (project_id = (hashed SubPlan 13).col1)) IS NOT TRUE)
+                                       Rows Removed by Filter: 3
+                                       SubPlan 13
+                                         ->  Index Scan using roles_user_id_idx on memberships r_9  (cost=0.29..24.15 rows=2 width=8) (actual time=0.013..0.014 rows=5 loops=1)
+                                               Index Cond: ((user_id)::text = letter._user_id())
+                                               Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                                               Rows Removed by Filter: 6
+                           ->  Index Scan using comments_task_id_idx on comments b_2  (cost=0.42..1.38 rows=10 width=30) (actual time=0.001..0.002 rows=10 loops=20)
+                                 Index Cond: (task_id = g1h1_1.id)
+                                 Filter: (author <> 'author 0'::text)
+                     SubPlan 10
+                       ->  Index Scan using roles_user_id_idx on memberships r_7  (cost=0.29..24.15 rows=2 width=8) (actual time=0.004..0.004 rows=5 loops=1)
+                             Index Cond: ((user_id)::text = letter._user_id())
+                             Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                             Rows Removed by Filter: 6
+ Planning Time: 2.958 ms
+ Execution Time: 0.592 ms
+(120 rows)
+
+                                                                                   QUERY PLAN                                                                                   
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=41162.07..41162.08 rows=1 width=24) (actual time=0.234..0.236 rows=1 loops=1)
+   ->  Append  (cost=12.93..33659.44 rows=1000351 width=22) (actual time=0.027..0.221 rows=698 loops=1)
+         ->  Subquery Scan on "*SELECT* 1"  (cost=12.93..28346.93 rows=1000000 width=22) (actual time=0.006..0.006 rows=0 loops=1)
+               ->  Result  (cost=12.93..18346.93 rows=1000000 width=38) (actual time=0.006..0.006 rows=0 loops=1)
+                     One-Time Filter: (InitPlan 2).col1
+                     InitPlan 2
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.006..0.006 rows=1 loops=1)
+                             InitPlan 1
+                               ->  Bitmap Heap Scan on memberships r_2  (cost=8.90..12.92 rows=1 width=0) (actual time=0.006..0.006 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.005..0.005 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.003..0.003 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.002..0.002 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     ->  Seq Scan on comments b  (cost=0.00..18334.00 rows=1000000 width=22) (never executed)
+         ->  Subquery Scan on "*SELECT* 2"  (cost=74.10..115.13 rows=201 width=43) (actual time=0.020..0.129 rows=498 loops=1)
+               ->  Result  (cost=74.10..113.12 rows=201 width=59) (actual time=0.020..0.114 rows=498 loops=1)
+                     One-Time Filter: (NOT (InitPlan 7).col1)
+                     InitPlan 4
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.003..0.004 rows=1 loops=1)
+                             InitPlan 3
+                               ->  Bitmap Heap Scan on memberships r_3  (cost=8.90..12.92 rows=1 width=0) (actual time=0.003..0.004 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.003..0.003 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.001..0.001 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.002..0.002 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     InitPlan 7
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.003..0.003 rows=1 loops=1)
+                             InitPlan 6
+                               ->  Bitmap Heap Scan on memberships r_5  (cost=8.90..12.92 rows=1 width=0) (actual time=0.003..0.003 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.003..0.003 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.001..0.001 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.001..0.001 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     ->  Nested Loop  (cost=24.08..62.10 rows=201 width=30) (actual time=0.009..0.075 rows=498 loops=1)
+                           ->  Nested Loop  (cost=23.65..40.51 rows=20 width=16) (actual time=0.008..0.017 rows=50 loops=1)
+                                 ->  Unique  (cost=23.36..23.37 rows=2 width=4) (actual time=0.006..0.007 rows=5 loops=1)
+                                       ->  Sort  (cost=23.36..23.36 rows=2 width=4) (actual time=0.006..0.006 rows=5 loops=1)
+                                             Sort Key: ((r.scope_id)::bigint)
+                                             Sort Method: quicksort  Memory: 25kB
+                                             ->  Bitmap Heap Scan on memberships r  (cost=4.33..23.35 rows=2 width=4) (actual time=0.004..0.005 rows=5 loops=1)
+                                                   Recheck Cond: ((user_id)::text = letter._user_id())
+                                                   Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                                                   Rows Removed by Filter: 6
+                                                   Heap Blocks: exact=2
+                                                   ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.001..0.001 rows=11 loops=1)
+                                                         Index Cond: ((user_id)::text = letter._user_id())
+                                 ->  Index Scan using tasks_project_id_idx on tasks g1h1  (cost=0.30..8.47 rows=10 width=16) (actual time=0.001..0.001 rows=10 loops=5)
+                                       Index Cond: (project_id = (r.scope_id)::bigint)
+                           ->  Index Scan using comments_task_id_idx on comments b_1  (cost=0.42..0.98 rows=10 width=30) (actual time=0.000..0.001 rows=10 loops=50)
+                                 Index Cond: (task_id = g1h1.id)
+                     SubPlan 5
+                       ->  Index Scan using roles_user_id_idx on memberships r_4  (cost=0.29..24.16 rows=3 width=8) (actual time=0.002..0.002 rows=3 loops=1)
+                             Index Cond: ((user_id)::text = letter._user_id())
+                             Filter: (((role)::text = 'editor'::text) AND ((scope_table)::oid = '42442'::oid))
+                             Rows Removed by Filter: 8
+         ->  Subquery Scan on "*SELECT* 3"  (cost=98.24..195.63 rows=150 width=43) (actual time=0.022..0.066 rows=200 loops=1)
+               ->  Result  (cost=98.24..194.13 rows=150 width=59) (actual time=0.022..0.060 rows=200 loops=1)
+                     One-Time Filter: (NOT (InitPlan 12).col1)
+                     InitPlan 9
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.003..0.003 rows=1 loops=1)
+                             InitPlan 8
+                               ->  Bitmap Heap Scan on memberships r_6  (cost=8.90..12.92 rows=1 width=0) (actual time=0.003..0.003 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.003..0.003 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.001..0.001 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.001..0.001 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     InitPlan 12
+                       ->  Result  (cost=12.92..12.93 rows=1 width=1) (actual time=0.004..0.004 rows=1 loops=1)
+                             InitPlan 11
+                               ->  Bitmap Heap Scan on memberships r_8  (cost=8.90..12.92 rows=1 width=0) (actual time=0.003..0.004 rows=0 loops=1)
+                                     Recheck Cond: (((role)::text = 'admin'::text) AND ((user_id)::text = letter._user_id()))
+                                     Filter: (scope_table IS NULL)
+                                     ->  BitmapAnd  (cost=8.90..8.90 rows=1 width=0) (actual time=0.003..0.003 rows=0 loops=1)
+                                           ->  Bitmap Index Scan on roles_role_idx  (cost=0.00..4.32 rows=3 width=0) (actual time=0.001..0.001 rows=1 loops=1)
+                                                 Index Cond: ((role)::text = 'admin'::text)
+                                           ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.001..0.001 rows=11 loops=1)
+                                                 Index Cond: ((user_id)::text = letter._user_id())
+                     ->  Nested Loop  (cost=48.23..143.75 rows=150 width=30) (actual time=0.012..0.039 rows=200 loops=1)
+                           ->  Nested Loop  (cost=47.81..121.50 rows=15 width=16) (actual time=0.011..0.013 rows=20 loops=1)
+                                 ->  HashAggregate  (cost=23.35..23.38 rows=3 width=4) (actual time=0.004..0.004 rows=3 loops=1)
+                                       Group Key: (r_1.scope_id)::bigint
+                                       Batches: 1  Memory Usage: 24kB
+                                       ->  Bitmap Heap Scan on memberships r_1  (cost=4.33..23.35 rows=3 width=4) (actual time=0.002..0.003 rows=3 loops=1)
+                                             Recheck Cond: ((user_id)::text = letter._user_id())
+                                             Filter: (((role)::text = 'editor'::text) AND ((scope_table)::oid = '42442'::oid))
+                                             Rows Removed by Filter: 8
+                                             Heap Blocks: exact=2
+                                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..4.33 rows=5 width=0) (actual time=0.001..0.001 rows=11 loops=1)
+                                                   Index Cond: ((user_id)::text = letter._user_id())
+                                 ->  Index Scan using tasks_project_id_idx on tasks g1h1_1  (cost=24.46..32.66 rows=5 width=16) (actual time=0.002..0.003 rows=7 loops=3)
+                                       Index Cond: (project_id = (r_1.scope_id)::bigint)
+                                       Filter: ((ANY (project_id = (hashed SubPlan 13).col1)) IS NOT TRUE)
+                                       Rows Removed by Filter: 3
+                                       SubPlan 13
+                                         ->  Index Scan using roles_user_id_idx on memberships r_9  (cost=0.29..24.15 rows=2 width=8) (actual time=0.002..0.002 rows=5 loops=1)
+                                               Index Cond: ((user_id)::text = letter._user_id())
+                                               Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                                               Rows Removed by Filter: 6
+                           ->  Index Scan using comments_task_id_idx on comments b_2  (cost=0.42..1.38 rows=10 width=30) (actual time=0.000..0.001 rows=10 loops=20)
+                                 Index Cond: (task_id = g1h1_1.id)
+                                 Filter: (author <> 'author 0'::text)
+                     SubPlan 10
+                       ->  Index Scan using roles_user_id_idx on memberships r_7  (cost=0.29..24.15 rows=2 width=8) (actual time=0.002..0.002 rows=5 loops=1)
+                             Index Cond: ((user_id)::text = letter._user_id())
+                             Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                             Rows Removed by Filter: 6
+ Planning Time: 0.457 ms
+ Execution Time: 0.281 ms
+(120 rows)
+
+SET
+==== Q5-if bigshot
+                                                                                   QUERY PLAN                                                                                    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=72537.43..72537.44 rows=1 width=24) (actual time=61.293..61.300 rows=1 loops=1)
+   ->  Append  (cost=14.63..63923.41 rows=1148536 width=25) (actual time=1.011..57.401 rows=200000 loops=1)
+         ->  Subquery Scan on "*SELECT* 1"  (cost=14.63..28348.63 rows=1000000 width=22) (actual time=0.006..0.007 rows=0 loops=1)
+               ->  Result  (cost=14.63..18348.63 rows=1000000 width=38) (actual time=0.006..0.007 rows=0 loops=1)
+                     One-Time Filter: (InitPlan 2).col1
+                     InitPlan 2
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (actual time=0.006..0.006 rows=1 loops=1)
+                             InitPlan 1
+                               ->  Index Scan using roles_role_idx on memberships r_2  (cost=0.29..14.62 rows=1 width=0) (actual time=0.005..0.005 rows=0 loops=1)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                                     Rows Removed by Filter: 1
+                     ->  Seq Scan on comments b  (cost=0.00..18334.00 rows=1000000 width=22) (never executed)
+         ->  Subquery Scan on "*SELECT* 2"  (cost=2125.16..16274.57 rows=97593 width=43) (actual time=0.150..0.152 rows=0 loops=1)
+               ->  Result  (cost=2125.16..15298.64 rows=97593 width=59) (actual time=0.150..0.152 rows=0 loops=1)
+                     One-Time Filter: (NOT (InitPlan 7).col1)
+                     InitPlan 4
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (never executed)
+                             InitPlan 3
+                               ->  Index Scan using roles_role_idx on memberships r_3  (cost=0.29..14.62 rows=1 width=0) (never executed)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                     InitPlan 7
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (actual time=0.002..0.002 rows=1 loops=1)
+                             InitPlan 6
+                               ->  Index Scan using roles_role_idx on memberships r_5  (cost=0.29..14.62 rows=1 width=0) (actual time=0.002..0.002 rows=0 loops=1)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                                     Rows Removed by Filter: 1
+                     ->  Nested Loop  (cost=1056.04..13741.56 rows=97593 width=30) (actual time=0.147..0.148 rows=0 loops=1)
+                           ->  Hash Join  (cost=1055.62..3209.64 rows=9759 width=16) (actual time=0.147..0.148 rows=0 loops=1)
+                                 Hash Cond: (g1h1.project_id = (r.scope_id)::bigint)
+                                 ->  Seq Scan on tasks g1h1  (cost=0.00..1736.00 rows=100000 width=16) (actual time=0.003..0.003 rows=1 loops=1)
+                                 ->  Hash  (cost=1043.98..1043.98 rows=931 width=4) (actual time=0.143..0.143 rows=0 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 8kB
+                                       ->  HashAggregate  (cost=1034.67..1043.98 rows=931 width=4) (actual time=0.143..0.143 rows=0 loops=1)
+                                             Group Key: (r.scope_id)::bigint
+                                             Batches: 1  Memory Usage: 73kB
+                                             ->  Bitmap Heap Scan on memberships r  (cost=39.46..1032.24 rows=973 width=4) (actual time=0.138..0.138 rows=0 loops=1)
+                                                   Recheck Cond: ((user_id)::text = letter._user_id())
+                                                   Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                                                   Rows Removed by Filter: 2000
+                                                   Heap Blocks: exact=19
+                                                   ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (actual time=0.026..0.026 rows=2000 loops=1)
+                                                         Index Cond: ((user_id)::text = letter._user_id())
+                           ->  Index Scan using comments_task_id_idx on comments b_1  (cost=0.42..0.98 rows=10 width=30) (never executed)
+                                 Index Cond: (task_id = g1h1.id)
+                     SubPlan 5
+                       ->  Bitmap Heap Scan on memberships r_4  (cost=39.47..1037.33 rows=1016 width=8) (never executed)
+                             Recheck Cond: ((user_id)::text = letter._user_id())
+                             Filter: (((role)::text = 'editor'::text) AND ((scope_table)::oid = '42442'::oid))
+                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (never executed)
+                                   Index Cond: ((user_id)::text = letter._user_id())
+         ->  Subquery Scan on "*SELECT* 3"  (cost=3165.35..13557.53 rows=50943 width=43) (actual time=0.855..51.695 rows=200000 loops=1)
+               ->  Result  (cost=3165.35..13048.10 rows=50943 width=59) (actual time=0.855..45.500 rows=200000 loops=1)
+                     One-Time Filter: (NOT (InitPlan 12).col1)
+                     InitPlan 9
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (actual time=0.002..0.003 rows=1 loops=1)
+                             InitPlan 8
+                               ->  Index Scan using roles_role_idx on memberships r_6  (cost=0.29..14.62 rows=1 width=0) (actual time=0.002..0.002 rows=0 loops=1)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                                     Rows Removed by Filter: 1
+                     InitPlan 12
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (actual time=0.002..0.003 rows=1 loops=1)
+                             InitPlan 11
+                               ->  Index Scan using roles_role_idx on memberships r_8  (cost=0.29..14.62 rows=1 width=0) (actual time=0.002..0.002 rows=0 loops=1)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                                     Rows Removed by Filter: 1
+                     ->  Nested Loop  (cost=2096.57..11851.96 rows=50943 width=30) (actual time=0.717..38.043 rows=200000 loops=1)
+                           ->  Hash Join  (cost=2096.14..4294.04 rows=5095 width=16) (actual time=0.714..8.310 rows=20000 loops=1)
+                                 Hash Cond: (g1h1_1.project_id = (r_1.scope_id)::bigint)
+                                 ->  Seq Scan on tasks g1h1_1  (cost=1039.53..3025.53 rows=50000 width=16) (actual time=0.124..3.817 rows=100000 loops=1)
+                                       Filter: ((ANY (project_id = (hashed SubPlan 13).col1)) IS NOT TRUE)
+                                       SubPlan 13
+                                         ->  Bitmap Heap Scan on memberships r_9  (cost=39.46..1037.10 rows=973 width=8) (actual time=0.122..0.122 rows=0 loops=1)
+                                               Recheck Cond: ((user_id)::text = letter._user_id())
+                                               Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                                               Rows Removed by Filter: 2000
+                                               Heap Blocks: exact=19
+                                               ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (actual time=0.024..0.024 rows=2000 loops=1)
+                                                     Index Cond: ((user_id)::text = letter._user_id())
+                                 ->  Hash  (cost=1044.49..1044.49 rows=970 width=4) (actual time=0.589..0.589 rows=2000 loops=1)
+                                       Buckets: 2048 (originally 1024)  Batches: 1 (originally 1)  Memory Usage: 89kB
+                                       ->  HashAggregate  (cost=1034.79..1044.49 rows=970 width=4) (actual time=0.377..0.469 rows=2000 loops=1)
+                                             Group Key: (r_1.scope_id)::bigint
+                                             Batches: 1  Memory Usage: 241kB
+                                             ->  Bitmap Heap Scan on memberships r_1  (cost=39.47..1032.25 rows=1016 width=4) (actual time=0.028..0.196 rows=2000 loops=1)
+                                                   Recheck Cond: ((user_id)::text = letter._user_id())
+                                                   Filter: (((role)::text = 'editor'::text) AND ((scope_table)::oid = '42442'::oid))
+                                                   Heap Blocks: exact=19
+                                                   ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (actual time=0.025..0.025 rows=2000 loops=1)
+                                                         Index Cond: ((user_id)::text = letter._user_id())
+                           ->  Index Scan using comments_task_id_idx on comments b_2  (cost=0.42..1.38 rows=10 width=30) (actual time=0.001..0.001 rows=10 loops=20000)
+                                 Index Cond: (task_id = g1h1_1.id)
+                                 Filter: (author <> 'author 0'::text)
+                     SubPlan 10
+                       ->  Bitmap Heap Scan on memberships r_7  (cost=39.46..1037.10 rows=973 width=8) (actual time=0.128..0.128 rows=0 loops=1)
+                             Recheck Cond: ((user_id)::text = letter._user_id())
+                             Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                             Rows Removed by Filter: 2000
+                             Heap Blocks: exact=19
+                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (actual time=0.025..0.025 rows=2000 loops=1)
+                                   Index Cond: ((user_id)::text = letter._user_id())
+ Planning Time: 0.401 ms
+ Execution Time: 61.349 ms
+(107 rows)
+
+                                                                                   QUERY PLAN                                                                                    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=72537.43..72537.44 rows=1 width=24) (actual time=57.601..57.605 rows=1 loops=1)
+   ->  Append  (cost=14.63..63923.41 rows=1148536 width=25) (actual time=0.772..53.646 rows=200000 loops=1)
+         ->  Subquery Scan on "*SELECT* 1"  (cost=14.63..28348.63 rows=1000000 width=22) (actual time=0.006..0.007 rows=0 loops=1)
+               ->  Result  (cost=14.63..18348.63 rows=1000000 width=38) (actual time=0.006..0.007 rows=0 loops=1)
+                     One-Time Filter: (InitPlan 2).col1
+                     InitPlan 2
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (actual time=0.005..0.006 rows=1 loops=1)
+                             InitPlan 1
+                               ->  Index Scan using roles_role_idx on memberships r_2  (cost=0.29..14.62 rows=1 width=0) (actual time=0.005..0.005 rows=0 loops=1)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                                     Rows Removed by Filter: 1
+                     ->  Seq Scan on comments b  (cost=0.00..18334.00 rows=1000000 width=22) (never executed)
+         ->  Subquery Scan on "*SELECT* 2"  (cost=2125.16..16274.57 rows=97593 width=43) (actual time=0.117..0.118 rows=0 loops=1)
+               ->  Result  (cost=2125.16..15298.64 rows=97593 width=59) (actual time=0.116..0.118 rows=0 loops=1)
+                     One-Time Filter: (NOT (InitPlan 7).col1)
+                     InitPlan 4
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (never executed)
+                             InitPlan 3
+                               ->  Index Scan using roles_role_idx on memberships r_3  (cost=0.29..14.62 rows=1 width=0) (never executed)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                     InitPlan 7
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (actual time=0.002..0.002 rows=1 loops=1)
+                             InitPlan 6
+                               ->  Index Scan using roles_role_idx on memberships r_5  (cost=0.29..14.62 rows=1 width=0) (actual time=0.002..0.002 rows=0 loops=1)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                                     Rows Removed by Filter: 1
+                     ->  Nested Loop  (cost=1056.04..13741.56 rows=97593 width=30) (actual time=0.115..0.115 rows=0 loops=1)
+                           ->  Hash Join  (cost=1055.62..3209.64 rows=9759 width=16) (actual time=0.115..0.115 rows=0 loops=1)
+                                 Hash Cond: (g1h1.project_id = (r.scope_id)::bigint)
+                                 ->  Seq Scan on tasks g1h1  (cost=0.00..1736.00 rows=100000 width=16) (actual time=0.001..0.001 rows=1 loops=1)
+                                 ->  Hash  (cost=1043.98..1043.98 rows=931 width=4) (actual time=0.113..0.113 rows=0 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 8kB
+                                       ->  HashAggregate  (cost=1034.67..1043.98 rows=931 width=4) (actual time=0.112..0.113 rows=0 loops=1)
+                                             Group Key: (r.scope_id)::bigint
+                                             Batches: 1  Memory Usage: 73kB
+                                             ->  Bitmap Heap Scan on memberships r  (cost=39.46..1032.24 rows=973 width=4) (actual time=0.108..0.108 rows=0 loops=1)
+                                                   Recheck Cond: ((user_id)::text = letter._user_id())
+                                                   Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                                                   Rows Removed by Filter: 2000
+                                                   Heap Blocks: exact=19
+                                                   ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (actual time=0.020..0.020 rows=2000 loops=1)
+                                                         Index Cond: ((user_id)::text = letter._user_id())
+                           ->  Index Scan using comments_task_id_idx on comments b_1  (cost=0.42..0.98 rows=10 width=30) (never executed)
+                                 Index Cond: (task_id = g1h1.id)
+                     SubPlan 5
+                       ->  Bitmap Heap Scan on memberships r_4  (cost=39.47..1037.33 rows=1016 width=8) (never executed)
+                             Recheck Cond: ((user_id)::text = letter._user_id())
+                             Filter: (((role)::text = 'editor'::text) AND ((scope_table)::oid = '42442'::oid))
+                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (never executed)
+                                   Index Cond: ((user_id)::text = letter._user_id())
+         ->  Subquery Scan on "*SELECT* 3"  (cost=3165.35..13557.53 rows=50943 width=43) (actual time=0.649..47.928 rows=200000 loops=1)
+               ->  Result  (cost=3165.35..13048.10 rows=50943 width=59) (actual time=0.649..41.681 rows=200000 loops=1)
+                     One-Time Filter: (NOT (InitPlan 12).col1)
+                     InitPlan 9
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (actual time=0.002..0.002 rows=1 loops=1)
+                             InitPlan 8
+                               ->  Index Scan using roles_role_idx on memberships r_6  (cost=0.29..14.62 rows=1 width=0) (actual time=0.002..0.002 rows=0 loops=1)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                                     Rows Removed by Filter: 1
+                     InitPlan 12
+                       ->  Result  (cost=14.62..14.63 rows=1 width=1) (actual time=0.002..0.002 rows=1 loops=1)
+                             InitPlan 11
+                               ->  Index Scan using roles_role_idx on memberships r_8  (cost=0.29..14.62 rows=1 width=0) (actual time=0.002..0.002 rows=0 loops=1)
+                                     Index Cond: ((role)::text = 'admin'::text)
+                                     Filter: ((scope_table IS NULL) AND ((user_id)::text = letter._user_id()))
+                                     Rows Removed by Filter: 1
+                     ->  Nested Loop  (cost=2096.57..11851.96 rows=50943 width=30) (actual time=0.551..34.292 rows=200000 loops=1)
+                           ->  Hash Join  (cost=2096.14..4294.04 rows=5095 width=16) (actual time=0.550..7.493 rows=20000 loops=1)
+                                 Hash Cond: (g1h1_1.project_id = (r_1.scope_id)::bigint)
+                                 ->  Seq Scan on tasks g1h1_1  (cost=1039.53..3025.53 rows=50000 width=16) (actual time=0.096..3.499 rows=100000 loops=1)
+                                       Filter: ((ANY (project_id = (hashed SubPlan 13).col1)) IS NOT TRUE)
+                                       SubPlan 13
+                                         ->  Bitmap Heap Scan on memberships r_9  (cost=39.46..1037.10 rows=973 width=8) (actual time=0.094..0.094 rows=0 loops=1)
+                                               Recheck Cond: ((user_id)::text = letter._user_id())
+                                               Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                                               Rows Removed by Filter: 2000
+                                               Heap Blocks: exact=19
+                                               ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (actual time=0.018..0.018 rows=2000 loops=1)
+                                                     Index Cond: ((user_id)::text = letter._user_id())
+                                 ->  Hash  (cost=1044.49..1044.49 rows=970 width=4) (actual time=0.453..0.453 rows=2000 loops=1)
+                                       Buckets: 2048 (originally 1024)  Batches: 1 (originally 1)  Memory Usage: 89kB
+                                       ->  HashAggregate  (cost=1034.79..1044.49 rows=970 width=4) (actual time=0.296..0.365 rows=2000 loops=1)
+                                             Group Key: (r_1.scope_id)::bigint
+                                             Batches: 1  Memory Usage: 241kB
+                                             ->  Bitmap Heap Scan on memberships r_1  (cost=39.47..1032.25 rows=1016 width=4) (actual time=0.020..0.160 rows=2000 loops=1)
+                                                   Recheck Cond: ((user_id)::text = letter._user_id())
+                                                   Filter: (((role)::text = 'editor'::text) AND ((scope_table)::oid = '42442'::oid))
+                                                   Heap Blocks: exact=19
+                                                   ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (actual time=0.017..0.017 rows=2000 loops=1)
+                                                         Index Cond: ((user_id)::text = letter._user_id())
+                           ->  Index Scan using comments_task_id_idx on comments b_2  (cost=0.42..1.38 rows=10 width=30) (actual time=0.000..0.001 rows=10 loops=20000)
+                                 Index Cond: (task_id = g1h1_1.id)
+                                 Filter: (author <> 'author 0'::text)
+                     SubPlan 10
+                       ->  Bitmap Heap Scan on memberships r_7  (cost=39.46..1037.10 rows=973 width=8) (actual time=0.092..0.092 rows=0 loops=1)
+                             Recheck Cond: ((user_id)::text = letter._user_id())
+                             Filter: (((role)::text = 'viewer'::text) AND ((scope_table)::oid = '42442'::oid))
+                             Rows Removed by Filter: 2000
+                             Heap Blocks: exact=19
+                             ->  Bitmap Index Scan on roles_user_id_idx  (cost=0.00..39.21 rows=1989 width=0) (actual time=0.017..0.018 rows=2000 loops=1)
+                                   Index Cond: ((user_id)::text = letter._user_id())
+ Planning Time: 0.377 ms
+ Execution Time: 57.642 ms
+(107 rows)
+
+SET
+ revoke_scoped 
+---------------
+ t
+(1 row)
+
+ grant_scoped 
+--------------
+ t
+(1 row)
+

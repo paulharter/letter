@@ -15,7 +15,7 @@
 --      revoke, and a grant rolled back by a transaction or savepoint, all
 --      take effect.
 --   6. letter's own SPI runs under the internal guard, invisible to the
---      hook — and letter.read() resets the plan cache as it leaves the
+--      hook — and letter._read() resets the plan cache as it leaves the
 --      guard, so a function first run inside read()'s condition is
 --      replanned afterwards (D9).
 --   7. The substituted subquery redacts: rows and columns follow the
@@ -57,7 +57,7 @@ INSERT INTO notes (id, project_id, body) VALUES
     ('b0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000002', 'n2');
 INSERT INTO widgets VALUES (1, 'w1');
 
-INSERT INTO letter.roles (role, user_id, scope_table, scope_id) VALUES
+INSERT INTO letter.memberships (role, user_id, scope_table, scope_id) VALUES
     ('editor', 'alice', 'public.projects', 'a0000000-0000-0000-0000-000000000001'),
     ('editor', 'bob',   'public.projects', 'a0000000-0000-0000-0000-000000000002');
 
@@ -85,7 +85,7 @@ DROP ROLE letter_test_nosuper;
 -- exempt namespaces are not.
 -- ============================================================
 SET letter.enforce_reads = on;
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 
 SELECT count(*) FROM notes;
 SELECT count(*) FROM widgets;
@@ -95,17 +95,15 @@ CREATE TEMP TABLE scratch (x int);
 INSERT INTO scratch VALUES (1);
 SELECT count(*) FROM scratch;
 SELECT count(*) FROM letter.grants;
-SELECT count(*) FROM letter.read('public.widgets');
+SELECT count(*) FROM letter._read('public.widgets');
 
 -- ============================================================
 -- Test 3: references to protected tables are substituted wherever
 -- they sit in the tree. projects gets only an update grant: closed
 -- to reads, open to the gate for updates (Test 9).
 -- ============================================================
-SELECT letter.grant('select', 'public.notes', 'editor', ARRAY['body'],
-    'public.projects', NULL, NULL);
-SELECT letter.grant('update', 'public.projects', 'editor', ARRAY['name'],
-    'public.projects', NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.notes', 'editor', ARRAY['body'], 'public.projects');
+SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['name'], 'public.projects');
 
 SET client_min_messages = debug1;
 -- top level
@@ -178,14 +176,13 @@ INSERT INTO notes (id, project_id, body) VALUES
 SET letter.bypass = off;
 
 SELECT count(*) FROM notes;
-SELECT letter.grant('select', 'public.notes', 'editor', ARRAY['body'],
-    'public.projects', NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.notes', 'editor', ARRAY['body'], 'public.projects');
 SELECT count(*) FROM notes;
 
 -- 5b: a grant rolled back with its transaction protects nothing:
 -- readable inside the transaction, closed again after ROLLBACK.
 BEGIN;
-SELECT letter.grant('select', 'public.widgets', 'editor', ARRAY['*'], NULL, NULL, NULL);
+SELECT letter.grant_global('select', 'public.widgets', 'editor', ARRAY['*']);
 SELECT count(*) FROM widgets;
 ROLLBACK;
 SELECT count(*) FROM widgets;
@@ -193,20 +190,20 @@ SELECT count(*) FROM widgets;
 -- 5c: likewise for a savepoint.
 BEGIN;
 SAVEPOINT s;
-SELECT letter.grant('select', 'public.widgets', 'editor', ARRAY['*'], NULL, NULL, NULL);
+SELECT letter.grant_global('select', 'public.widgets', 'editor', ARRAY['*']);
 SELECT count(*) FROM widgets;
 ROLLBACK TO s;
 SELECT count(*) FROM widgets;
 ROLLBACK;
 
 -- 5d: revoking the last select grant closes the table.
-SELECT letter.grant('select', 'public.widgets', 'editor', ARRAY['*'], NULL, NULL, NULL);
+SELECT letter.grant_global('select', 'public.widgets', 'editor', ARRAY['*']);
 SELECT count(*) FROM widgets;
-SELECT letter.revoke('select', 'public.widgets', 'editor', ARRAY['*'], NULL);
+SELECT letter.revoke_global('select', 'public.widgets', 'editor');
 SELECT count(*) FROM widgets;
 
 -- ============================================================
--- Test 6: the internal guard, and letter.read()'s plan-cache
+-- Test 6: the internal guard, and letter._read()'s plan-cache
 -- reset. count_notes() is first planned inside read()'s guarded
 -- scan — unrewritten, and invisible to the hook — so its plan must
 -- be discarded when read() leaves the guard (D9).
@@ -214,13 +211,13 @@ SELECT count(*) FROM widgets;
 DISCARD PLANS;
 SET client_min_messages = debug1;
 -- silent: read()'s scan and everything under it is letter's own
-SELECT count(*) FROM letter.read('public.notes', 'count_notes() > 0');
+SELECT count(*) FROM letter._read('public.notes', 'count_notes() > 0');
 -- substituted: the plan cached inside the guard was discarded
 SELECT count_notes();
 RESET client_min_messages;
 
 -- An error inside a guarded region must not leave the guard set.
-SELECT count(*) FROM letter.read('public.notes', '1/0 > 0');
+SELECT count(*) FROM letter._read('public.notes', '1/0 > 0');
 SET client_min_messages = debug1;
 SELECT count(*) FROM notes;
 RESET client_min_messages;
@@ -228,19 +225,20 @@ RESET client_min_messages;
 -- ============================================================
 -- Test 7: the substituted subquery redacts.
 -- ============================================================
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 SELECT body FROM notes ORDER BY body;
+-- the path column is visible with the grant (17 D16)
 SELECT n.body, n.project_id IS NULL AS project_id_hidden FROM notes n ORDER BY 1;
--- the leak is closed: a predicate on a hidden column finds nothing
-SELECT count(*) FROM notes WHERE project_id = 'a0000000-0000-0000-0000-000000000001';
-SET letter.current_user_id = 'bob';
+-- the leak is closed: a predicate that would match an invisible row finds nothing
+SELECT count(*) FROM notes WHERE project_id = 'a0000000-0000-0000-0000-000000000002';
+SET letter.user_id = 'bob';
 SELECT body FROM notes ORDER BY body;
-SET letter.current_user_id = 'nobody';
+SET letter.user_id = 'nobody';
 SELECT body FROM notes ORDER BY body;
-RESET letter.current_user_id;
--- unset user id: zero rows, no error (D2)
+RESET letter.user_id;
+-- unset user id: an error, on reads as on writes (D2, amended)
 SELECT count(*) FROM notes;
-SET letter.current_user_id = 'alice';
+SET letter.user_id = 'alice';
 
 -- ============================================================
 -- Test 8: shapes that cannot be redacted faithfully fail closed.
@@ -294,7 +292,7 @@ SET letter.bypass = off;
 \set VERBOSITY default
 
 -- Cleanup
-RESET letter.current_user_id;
+RESET letter.user_id;
 RESET letter.enforce_reads;
 DROP FUNCTION count_notes();
 DROP TABLE scratch;

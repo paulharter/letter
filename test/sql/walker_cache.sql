@@ -1,7 +1,7 @@
 -- Test: compiled scope paths and the statement-local memo
 -- (plan/16-scope-resolution-direction.md §6)
 --
--- The path-walker compiles each (table, scope, using_path) once per
+-- The path-walker compiles each (table, scope, via) once per
 -- backend, keeps saved plans for its hop fetches, and memoises
 -- resolved chains within a statement. None of that may change what
 -- is enforced. Semantics under test:
@@ -73,20 +73,17 @@ INSERT INTO comments (id, task_id, body) VALUES
 
 -- Alice is editor on Alpha only.
 SET letter.bypass = on;
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
 RESET letter.bypass;
 
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
 
 -- Two grants sharing one two-hop path (they share a compiled path and memo).
-SELECT letter.grant('insert', 'public.reactions', 'editor', ARRAY['*'],
-    'public.projects', ARRAY['comment_id', 'task_id'], NULL);
-SELECT letter.grant('select', 'public.reactions', 'editor', ARRAY['emoji'],
-    'public.projects', ARRAY['comment_id', 'task_id'], NULL);
+SELECT letter.grant_scoped('insert', 'public.reactions', 'editor', ARRAY['*'], 'public.projects', ARRAY['comment_id', 'task_id']);
+SELECT letter.grant_scoped('select', 'public.reactions', 'editor', ARRAY['emoji'], 'public.projects', ARRAY['comment_id', 'task_id']);
 
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
 \set VERBOSITY terse
 
 -- ============================================================
@@ -115,7 +112,7 @@ FROM generate_series(1, 200) g;
 SELECT count(*) FROM reactions;
 
 -- Read path shares the walker: all 200 visible.
-SELECT count(*) FROM letter.read('public.reactions') t(row_data);
+SELECT count(*) FROM letter._read('public.reactions') t(row_data);
 
 -- ============================================================
 -- Test 2: the memo does not outlive its statement. Inside one

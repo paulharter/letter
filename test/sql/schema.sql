@@ -19,9 +19,9 @@ SELECT e::regclass::text AS dumped
     FROM (SELECT unnest(extconfig) AS e FROM pg_extension WHERE extname = 'letter') x
     ORDER BY 1;
 
--- Verify roles table columns
+-- Verify memberships table columns
 SELECT column_name, data_type FROM information_schema.columns
-    WHERE table_schema = 'letter' AND table_name = 'roles'
+    WHERE table_schema = 'letter' AND table_name = 'memberships'
     ORDER BY ordinal_position;
 
 -- Verify grants table columns
@@ -29,43 +29,43 @@ SELECT column_name, data_type FROM information_schema.columns
     WHERE table_schema = 'letter' AND table_name = 'grants'
     ORDER BY ordinal_position;
 
--- Verify assignments table columns
+-- Verify membership_rules table columns
 SELECT column_name, data_type FROM information_schema.columns
-    WHERE table_schema = 'letter' AND table_name = 'assignments'
+    WHERE table_schema = 'letter' AND table_name = 'membership_rules'
     ORDER BY ordinal_position;
 
--- Verify role_assignments table columns
+-- Verify membership_sources table columns
 SELECT column_name, data_type FROM information_schema.columns
-    WHERE table_schema = 'letter' AND table_name = 'role_assignments'
+    WHERE table_schema = 'letter' AND table_name = 'membership_sources'
     ORDER BY ordinal_position;
 
--- Verify assignments CHECK constraint: must have role_name or role_column but not both
+-- Verify assignments CHECK constraint: must have role or role_column but not both
 \set VERBOSITY terse
-INSERT INTO letter.assignments (table_name, user_column, role_name, role_column)
+INSERT INTO letter.membership_rules (table_name, user_column, role, role_column)
     VALUES ('t', 'user_id', 'admin', 'role_col');
 
-INSERT INTO letter.assignments (table_name, user_column)
+INSERT INTO letter.membership_rules (table_name, user_column)
     VALUES ('t', 'user_id');
 \set VERBOSITY default
 
--- Verify FK cascade: deleting assignment cascades to role_assignments
-INSERT INTO letter.assignments (table_name, user_column, role_name)
+-- Verify FK cascade: deleting assignment cascades to membership_sources
+INSERT INTO letter.membership_rules (table_name, user_column, role)
     VALUES ('t', 'user_id', 'admin')
     RETURNING id \gset assign_
 
-INSERT INTO letter.roles (role, user_id) VALUES ('admin', 'user1') RETURNING id \gset role_
+INSERT INTO letter.memberships (role, user_id) VALUES ('admin', 'user1') RETURNING id \gset role_
 
-INSERT INTO letter.role_assignments (assignment_id, role_id, source_table, source_id, user_id)
+INSERT INTO letter.membership_sources (assignment_id, role_id, source_table, source_id, user_id)
     VALUES (:'assign_id', :'role_id', 't', '1', 'user1');
 
-SELECT count(*) AS before_delete FROM letter.role_assignments;
+SELECT count(*) AS before_delete FROM letter.membership_sources;
 
-DELETE FROM letter.assignments WHERE id = :'assign_id';
+DELETE FROM letter.membership_rules WHERE id = :'assign_id';
 
-SELECT count(*) AS after_delete FROM letter.role_assignments;
+SELECT count(*) AS after_delete FROM letter.membership_sources;
 
 -- Verify cleanup trigger also removed the role
-SELECT count(*) AS orphaned_roles FROM letter.roles WHERE id = :'role_id';
+SELECT count(*) AS orphaned_roles FROM letter.memberships WHERE id = :'role_id';
 
 DROP TABLE t;
 DROP EXTENSION letter CASCADE;

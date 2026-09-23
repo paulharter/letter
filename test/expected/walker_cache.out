@@ -1,7 +1,7 @@
 -- Test: compiled scope paths and the statement-local memo
 -- (plan/16-scope-resolution-direction.md §6)
 --
--- The path-walker compiles each (table, scope, using_path) once per
+-- The path-walker compiles each (table, scope, via) once per
 -- backend, keeps saved plans for its hop fetches, and memoises
 -- resolved chains within a statement. None of that may change what
 -- is enforced. Semantics under test:
@@ -64,8 +64,7 @@ INSERT INTO comments (id, task_id, body) VALUES
     ('e0000000-0000-0000-0000-000000000003', 'd0000000-0000-0000-0000-000000000002', 'beta comment');
 -- Alice is editor on Alpha only.
 SET letter.bypass = on;
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
  assign 
 --------
  t
@@ -75,27 +74,25 @@ RESET letter.bypass;
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
 -- Two grants sharing one two-hop path (they share a compiled path and memo).
-SELECT letter.grant('insert', 'public.reactions', 'editor', ARRAY['*'],
-    'public.projects', ARRAY['comment_id', 'task_id'], NULL);
- grant 
--------
+SELECT letter.grant_scoped('insert', 'public.reactions', 'editor', ARRAY['*'], 'public.projects', ARRAY['comment_id', 'task_id']);
+ grant_scoped 
+--------------
  t
 (1 row)
 
-SELECT letter.grant('select', 'public.reactions', 'editor', ARRAY['emoji'],
-    'public.projects', ARRAY['comment_id', 'task_id'], NULL);
-WARNING:  letter.grant: scope path column "comment_id" on public.reactions has no index — reads scoped through it will scan the whole table
+SELECT letter.grant_scoped('select', 'public.reactions', 'editor', ARRAY['emoji'], 'public.projects', ARRAY['comment_id', 'task_id']);
+WARNING:  letter: scope path column "comment_id" on public.reactions has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.reactions (comment_id);
-WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+WARNING:  letter: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.comments (task_id);
-WARNING:  letter.grant: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
+WARNING:  letter: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.tasks (project_id);
- grant 
--------
+ grant_scoped 
+--------------
  t
 (1 row)
 
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
 \set VERBOSITY terse
 -- ============================================================
 -- Test 1a: bulk insert, 200 rows over the two Alpha comments —
@@ -130,7 +127,7 @@ SELECT count(*) FROM reactions;
 (1 row)
 
 -- Read path shares the walker: all 200 visible.
-SELECT count(*) FROM letter.read('public.reactions') t(row_data);
+SELECT count(*) FROM letter._read('public.reactions') t(row_data);
  count 
 -------
    200
@@ -179,7 +176,7 @@ SELECT emoji FROM reactions WHERE emoji LIKE '%move%' OR emoji LIKE 'after-%' OR
 -- longer resolves. Enforcement continues unchanged.
 -- ============================================================
 ALTER TABLE reactions DROP CONSTRAINT reactions_comment_fk;
-ERROR:  letter: the insert grant to "editor" on public.reactions (column "*") would no longer be valid: letter.grant: using_path column "comment_id" is not a foreign key on public.reactions
+ERROR:  letter: the insert grant to "editor" on public.reactions (column "*") would no longer be valid: letter: via column "comment_id" is not a foreign key on public.reactions
 INSERT INTO reactions (comment_id, emoji)
     VALUES ('e0000000-0000-0000-0000-000000000001', 'fk-kept');
 INSERT INTO reactions (comment_id, emoji)

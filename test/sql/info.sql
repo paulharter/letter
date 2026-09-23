@@ -33,16 +33,15 @@ INSERT INTO projects (id, name) VALUES
     ('b0000000-0000-0000-0000-000000000002', 'Project Beta');
 
 -- Set up grants
-SELECT letter.grant('select', 'public.projects', 'viewer', ARRAY['*'], NULL, NULL, NULL);
-SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['*'], NULL, NULL, NULL);
-SELECT letter.grant('update', 'public.projects', 'editor', ARRAY['name', 'status'], 'public.projects', NULL, NULL);
-SELECT letter.grant('delete', 'public.projects', 'admin', ARRAY['*'], NULL, NULL, NULL);
-SELECT letter.grant('insert', 'public.projects', 'admin', ARRAY['*'], NULL, NULL, NULL);
-SELECT letter.grant('select', 'public.team_members', 'editor', ARRAY['*'], 'public.projects', NULL, NULL);
+SELECT letter.grant_global('select', 'public.projects', 'viewer', ARRAY['*']);
+SELECT letter.grant_global('select', 'public.projects', 'editor', ARRAY['*']);
+SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['name', 'status'], 'public.projects');
+SELECT letter.grant_global('delete', 'public.projects', 'admin');
+SELECT letter.grant_global('insert', 'public.projects', 'admin');
+SELECT letter.grant_scoped('select', 'public.team_members', 'editor', ARRAY['*'], 'public.projects');
 
 -- Set up assignments
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
 
 -- Create some roles via assignment
 INSERT INTO team_members (user_id, project_id, role) VALUES
@@ -81,6 +80,15 @@ SELECT * FROM letter.user_permissions('a0000000-0000-0000-0000-000000000002')
 -- ============================================================
 
 SELECT count(*) AS no_perms FROM letter.user_permissions('a0000000-0000-0000-0000-000000000099');
+
+-- ============================================================
+-- Test 6: letter.user_id() — the user id, NULL when unset
+-- ============================================================
+RESET letter.user_id;
+SELECT letter.user_id() IS NULL AS unset;
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT letter.user_id(), letter.user_id()::uuid = 'a0000000-0000-0000-0000-000000000001' AS castable;
+RESET letter.user_id;
 
 -- Clean up
 DROP TABLE team_members CASCADE;

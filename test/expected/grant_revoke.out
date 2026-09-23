@@ -4,7 +4,7 @@ WARNING:  letter: library loaded on demand, not preloaded
 DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
 HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
 SET letter.enforce_reads = off;   -- this test is not about the read hook
--- Tables are regclass (plan/18 D1): letter.grant() refuses one that does
+-- Tables are regclass (plan/18 D1): letter.grant_global() refuses one that does
 -- not exist (plan/17 D10) and handles names that need quoting.
 CREATE TABLE orgs (id uuid PRIMARY KEY DEFAULT gen_random_uuid());
 CREATE TABLE projects (
@@ -20,23 +20,23 @@ CREATE TABLE documents (
     title TEXT
 );
 -- grant a single column privilege
-SELECT letter.grant('select', 'public.projects', 'admin', ARRAY['name'], NULL, NULL, NULL);
- grant 
--------
+SELECT letter.grant_global('select', 'public.projects', 'admin', ARRAY['name']);
+ grant_global 
+--------------
  t
 (1 row)
 
-SELECT privilege, on_table, role, column_name, scope, using_path, check_fn
+SELECT privilege, on_table, role, column_name, scope, via, if
     FROM letter.grants ORDER BY column_name;
- privilege | on_table | role  | column_name | scope | using_path | check_fn 
------------+----------+-------+-------------+-------+------------+----------
- select    | projects | admin | name        | -     |            | 
+ privilege | on_table | role  | column_name | scope | via | if 
+-----------+----------+-------+-------------+-------+-----+----
+ select    | projects | admin | name        | -     |     | 
 (1 row)
 
 -- grant multiple columns in one call
-SELECT letter.grant('select', 'public.projects', 'admin', ARRAY['description', 'status'], NULL, NULL, NULL);
- grant 
--------
+SELECT letter.grant_global('select', 'public.projects', 'admin', ARRAY['description', 'status']);
+ grant_global 
+--------------
  t
 (1 row)
 
@@ -49,38 +49,59 @@ SELECT privilege, on_table, role, column_name, scope
  select    | projects | admin | status      | -
 (3 rows)
 
--- grant with using_path and check_fn
-SELECT letter.grant('update', 'public.projects', 'member', ARRAY['status'], 'public.orgs', ARRAY['org_id'], 'is_active()');
- grant 
--------
+-- grant with via and if
+SELECT letter.grant_scoped('update', 'public.projects', 'member', ARRAY['status'], 'public.orgs', ARRAY['org_id'], 'status <> ''archived''');
+ grant_scoped 
+--------------
  t
 (1 row)
 
-SELECT privilege, on_table, role, column_name, scope, using_path, check_fn
+SELECT privilege, on_table, role, column_name, scope, via, if
     FROM letter.grants WHERE role = 'member';
- privilege | on_table |  role  | column_name | scope | using_path |  check_fn   
------------+----------+--------+-------------+-------+------------+-------------
- update    | projects | member | status      | orgs  | {org_id}   | is_active()
+ privilege | on_table |  role  | column_name | scope |   via    |          if          
+-----------+----------+--------+-------------+-------+----------+----------------------
+ update    | projects | member | status      | orgs  | {org_id} | status <> 'archived'
 (1 row)
 
--- upsert: granting same privilege again updates using_path and check_fn
-SELECT letter.grant('update', 'public.projects', 'member', ARRAY['status'], 'public.orgs', ARRAY['alt_org_id'], 'new_check()');
- grant 
--------
+-- a grant's identity is the whole rule (plan/17 D15): the same rule again is
+-- one rule; a rule that differs in its path is another rule alongside it
+SELECT letter.grant_scoped('update', 'public.projects', 'member', ARRAY['status'], 'public.orgs', ARRAY['org_id'], 'status <> ''archived''');
+ grant_scoped 
+--------------
  t
 (1 row)
 
-SELECT privilege, on_table, role, column_name, scope, using_path, check_fn
-    FROM letter.grants WHERE role = 'member';
- privilege | on_table |  role  | column_name | scope |  using_path  |  check_fn   
------------+----------+--------+-------------+-------+--------------+-------------
- update    | projects | member | status      | orgs  | {alt_org_id} | new_check()
+SELECT letter.grant_scoped('update', 'public.projects', 'member', ARRAY['status'], 'public.orgs', ARRAY['alt_org_id'], 'status <> ''archived''');
+ grant_scoped 
+--------------
+ t
+(1 row)
+
+SELECT privilege, on_table, role, column_name, scope, via, if
+    FROM letter.grants WHERE role = 'member' ORDER BY via;
+ privilege | on_table |  role  | column_name | scope |     via      |          if          
+-----------+----------+--------+-------------+-------+--------------+----------------------
+ update    | projects | member | status      | orgs  | {alt_org_id} | status <> 'archived'
+ update    | projects | member | status      | orgs  | {org_id}     | status <> 'archived'
+(2 rows)
+
+-- revoke removes every rule under its key
+SELECT letter.revoke_scoped('update', 'public.projects', 'member', ARRAY['status'], 'public.orgs');
+ revoke_scoped 
+---------------
+ t
+(1 row)
+
+SELECT count(*) FROM letter.grants WHERE role = 'member';
+ count 
+-------
+     0
 (1 row)
 
 -- grant with wildcard '*' means all columns (sentinel value)
-SELECT letter.grant('select', 'public.documents', 'viewer', ARRAY['*'], NULL, NULL, NULL);
- grant 
--------
+SELECT letter.grant_global('select', 'public.documents', 'viewer', ARRAY['*']);
+ grant_global 
+--------------
  t
 (1 row)
 
@@ -95,13 +116,13 @@ SELECT privilege, on_table, role, column_name, scope
 SELECT count(*) FROM letter.grants;
  count 
 -------
-     5
+     4
 (1 row)
 
 -- revoke wildcard grant
-SELECT letter.revoke('select', 'public.documents', 'viewer', ARRAY['*'], NULL);
- revoke 
---------
+SELECT letter.revoke_global('select', 'public.documents', 'viewer');
+ revoke_global 
+---------------
  t
 (1 row)
 
@@ -112,9 +133,9 @@ SELECT count(*) FROM letter.grants WHERE on_table = 'public.documents'::regclass
 (1 row)
 
 -- revoke specific columns
-SELECT letter.revoke('select', 'public.projects', 'admin', ARRAY['name'], NULL);
- revoke 
---------
+SELECT letter.revoke_global('select', 'public.projects', 'admin', ARRAY['name']);
+ revoke_global 
+---------------
  t
 (1 row)
 
@@ -127,9 +148,9 @@ SELECT privilege, on_table, role, column_name, scope
 (2 rows)
 
 -- revoke with wildcard removes all columns for that grant
-SELECT letter.revoke('select', 'public.projects', 'admin', ARRAY['*'], NULL);
- revoke 
---------
+SELECT letter.revoke_global('select', 'public.projects', 'admin');
+ revoke_global 
+---------------
  t
 (1 row)
 
@@ -140,13 +161,13 @@ SELECT count(*) FROM letter.grants WHERE privilege = 'select' AND role = 'admin'
 (1 row)
 
 -- revoke non-existent grant is a no-op
-SELECT letter.revoke('delete', 'public.projects', 'nobody', ARRAY['*'], NULL);
- revoke 
---------
+SELECT letter.revoke_global('delete', 'public.projects', 'nobody');
+ revoke_global 
+---------------
  t
 (1 row)
 
--- using_path FK validation: create real tables and verify
+-- via FK validation: create real tables and verify
 CREATE TABLE scope_parent (id uuid PRIMARY KEY DEFAULT gen_random_uuid());
 CREATE TABLE scope_child (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -154,43 +175,39 @@ CREATE TABLE scope_child (
     plain_col TEXT
 );
 -- valid: parent_id is an FK
-SELECT letter.grant('select', 'public.scope_child', 'r', ARRAY['plain_col'],
-    'public.scope_parent', ARRAY['parent_id'], NULL);
-WARNING:  letter.grant: scope path column "parent_id" on public.scope_child has no index — reads scoped through it will scan the whole table
+SELECT letter.grant_scoped('select', 'public.scope_child', 'r', ARRAY['plain_col'], 'public.scope_parent', ARRAY['parent_id']);
+WARNING:  letter: scope path column "parent_id" on public.scope_child has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.scope_child (parent_id);
- grant 
--------
+ grant_scoped 
+--------------
  t
 (1 row)
 
 -- invalid: plain_col is not an FK
 \set VERBOSITY terse
-SELECT letter.grant('select', 'public.scope_child', 'r', ARRAY['plain_col'],
-    'public.scope_parent', ARRAY['plain_col'], NULL);
-ERROR:  letter.grant: using_path column "plain_col" is not a foreign key on public.scope_child
+SELECT letter.grant_scoped('select', 'public.scope_child', 'r', ARRAY['plain_col'], 'public.scope_parent', ARRAY['plain_col']);
+ERROR:  letter: via column "plain_col" is not a foreign key on public.scope_child
 -- invalid: no_such_column doesn't exist
-SELECT letter.grant('select', 'public.scope_child', 'r', ARRAY['plain_col'],
-    'public.scope_parent', ARRAY['no_such_column'], NULL);
-ERROR:  letter.grant: using_path column "no_such_column" is not a foreign key on public.scope_child
+SELECT letter.grant_scoped('select', 'public.scope_child', 'r', ARRAY['plain_col'], 'public.scope_parent', ARRAY['no_such_column']);
+ERROR:  letter: via column "no_such_column" is not a foreign key on public.scope_child
 -- a grant on a table that doesn't exist is refused (regclass resolution),
 -- scoped or not — and nothing is stored
-SELECT letter.grant('select', 'public.future_table', 'r', ARRAY['x'],
-    'public.scope_parent', ARRAY['anything'], NULL);
-ERROR:  relation "public.future_table" does not exist at character 31
-SELECT letter.grant('insert', 'public.future_table', 'r', ARRAY['*'], NULL, NULL, NULL);
-ERROR:  relation "public.future_table" does not exist at character 31
+SELECT letter.grant_scoped('select', 'public.future_table', 'r', ARRAY['x'], 'public.scope_parent', ARRAY['anything']);
+ERROR:  relation "public.future_table" does not exist at character 38
+SELECT letter.grant_global('insert', 'public.future_table', 'r');
+ERROR:  relation "public.future_table" does not exist at character 38
 \set VERBOSITY default
 SELECT count(*) FROM letter.grants;
  count 
 -------
-     2
+     1
 (1 row)
 
 -- a table whose name needs quoting: grant installs triggers, revoke removes them
 CREATE TABLE "Mixed Leaf" (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), "Some Col" TEXT);
-SELECT letter.grant('select', 'public."Mixed Leaf"', 'r', ARRAY['Some Col']);
- grant 
--------
+SELECT letter.grant_global('select', 'public."Mixed Leaf"', 'r', ARRAY['Some Col']);
+ grant_global 
+--------------
  t
 (1 row)
 
@@ -209,9 +226,9 @@ SELECT on_table, column_name FROM letter.grants WHERE on_table = '"Mixed Leaf"':
  "Mixed Leaf" | Some Col
 (1 row)
 
-SELECT letter.revoke('select', 'public."Mixed Leaf"', 'r', ARRAY['*']);
- revoke 
---------
+SELECT letter.revoke_global('select', 'public."Mixed Leaf"', 'r');
+ revoke_global 
+---------------
  t
 (1 row)
 
@@ -227,7 +244,6 @@ NOTICE:  letter: dropped table public.scope_child: removed 1 grant(s), 0 assignm
 DROP TABLE scope_parent;
 DROP TABLE documents;
 DROP TABLE projects;
-NOTICE:  letter: dropped table public.projects: removed 1 grant(s), 0 assignment(s), 0 role(s)
 DROP TABLE orgs;
 -- clean up
 DROP EXTENSION letter CASCADE;

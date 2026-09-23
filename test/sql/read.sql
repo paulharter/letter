@@ -1,7 +1,7 @@
--- Test: letter.read() enforced reads returning JSONB
+-- Test: letter._read() enforced reads returning JSONB
 --
 -- Semantics under test:
---   1. letter.current_user_id unset → ERROR. This is a hard precondition;
+--   1. letter.user_id unset → ERROR. This is a hard precondition;
 --      letter fails closed loudly so the application cannot silently read
 --      without identity.
 --   2. Once a user id is set, no other access failure raises an error —
@@ -69,16 +69,13 @@ INSERT INTO widgets (id, name) VALUES
     ('c0000000-0000-0000-0000-000000000001', 'Widget-1');
 
 -- Scoped assignments: role derived from team_members.role, scoped to projects.
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
 
 -- Unscoped assignment: auditors are global 'auditor' role.
-SELECT letter.assign('public.auditors', 'user_id', NULL,
-    role_name := 'auditor', role_column := NULL, if_fn := NULL);
+SELECT letter.assign('public.auditors', 'user_id', role := 'auditor');
 
 -- Unscoped assignment: reporters are global 'reporter' role.
-SELECT letter.assign('public.reporters', 'user_id', NULL,
-    role_name := 'reporter', role_column := NULL, if_fn := NULL);
+SELECT letter.assign('public.reporters', 'user_id', role := 'reporter');
 
 -- Alice: editor on Alpha, viewer on Beta. No role on Gamma.
 -- Bob:   viewer on Alpha only.
@@ -96,58 +93,58 @@ INSERT INTO reporters (user_id) VALUES ('a0000000-0000-0000-0000-000000000003');
 --   editor:  select all columns, scoped to projects
 --   viewer:  select name + status only, scoped to projects
 --   auditor: select name only, unscoped
-SELECT letter.grant('select', 'public.projects', 'editor',  ARRAY['*'],              'public.projects', NULL, NULL);
-SELECT letter.grant('select', 'public.projects', 'viewer',  ARRAY['name', 'status'], 'public.projects', NULL, NULL);
-SELECT letter.grant('select', 'public.projects', 'auditor', ARRAY['name'],           NULL,                NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.projects', 'editor', ARRAY['*'], 'public.projects');
+SELECT letter.grant_scoped('select', 'public.projects', 'viewer', ARRAY['name', 'status'], 'public.projects');
+SELECT letter.grant_global('select', 'public.projects', 'auditor', ARRAY['name']);
 
 -- reporter has select on users only — used to test "user has grants, but not
 -- on this table".
-SELECT letter.grant('select', 'public.users', 'reporter', ARRAY['*'], NULL, NULL, NULL);
+SELECT letter.grant_global('select', 'public.users', 'reporter', ARRAY['*']);
 
 SET letter.bypass = false;
 
 \set VERBOSITY terse
 
 -- ============================================================
--- Test 1: letter.current_user_id is unset → ERROR (fail closed loudly)
+-- Test 1: letter.user_id is unset → ERROR (fail closed loudly)
 -- ============================================================
-RESET letter.current_user_id;
-SELECT * FROM letter.read('public.projects');
+RESET letter.user_id;
+SELECT * FROM letter._read('public.projects');
 
 -- ============================================================
 -- Test 2: Table with no letter grants at all → an error (plan/17 D14:
 -- a missing grant is a configuration mistake, not an authorization outcome).
 -- ============================================================
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
-SELECT count(*) AS row_count FROM letter.read('public.widgets');
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT count(*) AS row_count FROM letter._read('public.widgets');
 
 -- ============================================================
 -- Test 3: User has select grants, but none on this table → zero rows
 -- Carol has 'reporter' with select on users only.
 -- ============================================================
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000003';
-SELECT count(*) AS row_count FROM letter.read('public.projects');
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000003';
+SELECT count(*) AS row_count FROM letter._read('public.projects');
 
 -- Sanity: Carol can still read users via her reporter grant.
-SELECT count(*) > 0 AS carol_sees_users FROM letter.read('public.users');
+SELECT count(*) > 0 AS carol_sees_users FROM letter._read('public.users');
 
 -- ============================================================
 -- Test 4: Unknown user id (no roles, no assignments) → zero rows
 -- ============================================================
-SET letter.current_user_id = 'a0000000-0000-0000-0000-0000000000ff';
-SELECT count(*) AS row_count FROM letter.read('public.projects');
+SET letter.user_id = 'a0000000-0000-0000-0000-0000000000ff';
+SELECT count(*) AS row_count FROM letter._read('public.projects');
 
 -- ============================================================
 -- Test 5: Alice as editor on Alpha → full row, empty _redacted
 -- ============================================================
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
 SELECT
     row_data->>'name'    AS name,
     row_data->>'status'  AS status,
     row_data->>'budget'  AS budget,
     row_data->>'notes'   AS notes,
     jsonb_array_length(row_data->'_redacted') AS redacted_len
-FROM letter.read('public.projects',
+FROM letter._read('public.projects',
     'id = ''b0000000-0000-0000-0000-000000000001''') t(row_data);
 
 -- ============================================================
@@ -164,14 +161,14 @@ SELECT
     'notes'  = ANY(SELECT jsonb_array_elements_text(row_data->'_redacted')) AS notes_redacted,
     'status' = ANY(SELECT jsonb_array_elements_text(row_data->'_redacted')) AS status_redacted,
     'name'   = ANY(SELECT jsonb_array_elements_text(row_data->'_redacted')) AS name_redacted
-FROM letter.read('public.projects',
+FROM letter._read('public.projects',
     'id = ''b0000000-0000-0000-0000-000000000002''') t(row_data);
 
 -- ============================================================
 -- Test 7: Alice on Gamma (no role on that project) → row excluded
 -- Previously returned a fully-redacted shell row; new semantics omit it.
 -- ============================================================
-SELECT count(*) AS row_count FROM letter.read('public.projects',
+SELECT count(*) AS row_count FROM letter._read('public.projects',
     'id = ''b0000000-0000-0000-0000-000000000003''');
 
 -- ============================================================
@@ -181,30 +178,30 @@ SELECT
     row_data->>'name'                         AS name,
     row_data->>'budget'                       AS budget,
     jsonb_array_length(row_data->'_redacted') AS redacted_count
-FROM letter.read('public.projects') t(row_data)
+FROM letter._read('public.projects') t(row_data)
 ORDER BY row_data->>'name';
 
 -- ============================================================
 -- Test 9: Bob reads all projects — only Alpha; Beta and Gamma excluded
 -- ============================================================
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000002';
 SELECT
     row_data->>'name'                         AS name,
     row_data->>'budget'                       AS budget,
     jsonb_array_length(row_data->'_redacted') AS redacted_count
-FROM letter.read('public.projects') t(row_data)
+FROM letter._read('public.projects') t(row_data)
 ORDER BY row_data->>'name';
 
 -- ============================================================
 -- Test 10: WHERE condition picks an out-of-scope row → zero rows, no error
 -- ============================================================
-SELECT count(*) AS row_count FROM letter.read('public.projects',
+SELECT count(*) AS row_count FROM letter._read('public.projects',
     'id = ''b0000000-0000-0000-0000-000000000003''');
 
 -- ============================================================
 -- Test 11: WHERE condition matches no rows at all → zero rows, no error
 -- ============================================================
-SELECT count(*) AS row_count FROM letter.read('public.projects',
+SELECT count(*) AS row_count FROM letter._read('public.projects',
     'id = ''00000000-0000-0000-0000-000000000000''');
 
 -- ============================================================
@@ -212,7 +209,7 @@ SELECT count(*) AS row_count FROM letter.read('public.projects',
 -- Beta's budget is genuinely NULL; viewer also lacks select on budget. Both
 -- are NULL in the row, but budget appears in _redacted while status does not.
 -- ============================================================
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
 SELECT
     row_data->>'name'   AS name,
     row_data->>'status' AS status,
@@ -220,7 +217,7 @@ SELECT
     'budget' = ANY(SELECT jsonb_array_elements_text(row_data->'_redacted')) AS budget_redacted,
     'status' = ANY(SELECT jsonb_array_elements_text(row_data->'_redacted')) AS status_redacted,
     'notes'  = ANY(SELECT jsonb_array_elements_text(row_data->'_redacted')) AS notes_redacted
-FROM letter.read('public.projects',
+FROM letter._read('public.projects',
     'id = ''b0000000-0000-0000-0000-000000000002''') t(row_data);
 
 -- ============================================================
@@ -228,22 +225,22 @@ FROM letter.read('public.projects',
 -- Dora (auditor, unscoped, select on name only) sees all 3 projects, each with
 -- only name visible and the rest redacted.
 -- ============================================================
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000004';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000004';
 SELECT
     row_data->>'name'                         AS name,
     row_data->>'status'                       AS status,
     row_data->>'budget'                       AS budget,
     row_data ? 'id'                           AS has_id,
     jsonb_array_length(row_data->'_redacted') AS redacted_count
-FROM letter.read('public.projects') t(row_data)
+FROM letter._read('public.projects') t(row_data)
 ORDER BY row_data->>'name';
 
 -- ============================================================
 -- Test 14: bypass returns everything untouched
 -- ============================================================
 SET letter.bypass = true;
-SELECT count(*) AS row_count FROM letter.read('public.projects');
-SELECT count(*) AS widgets_count FROM letter.read('public.widgets');
+SELECT count(*) AS row_count FROM letter._read('public.projects');
+SELECT count(*) AS widgets_count FROM letter._read('public.widgets');
 SET letter.bypass = false;
 
 \set VERBOSITY default

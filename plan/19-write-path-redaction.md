@@ -111,7 +111,7 @@ writes NULL; `RETURNING` redacted on UPDATE, DELETE and INSERT; `ON CONFLICT DO 
 … WHERE hidden …`; `UPDATE … FROM protected`; prepared statement across users; parity:
 `UPDATE t SET x = x` updates exactly the rows `SELECT` shows.
 
-### W3 — Plan shape *(check, not code)* — ✅ checked 2026-09-22 (on the test fixture; bench not run)
+### W3 — Plan shape *(check, not code)* — ✅ checked 2026-09-22 on the fixture; ✅ bench 2026-09-23: `UPDATE … WHERE id = …` on 1M rows is an `Index Scan using comments_pkey` with the security qual as a filter, 0.17 ms (`bench/barrier/RESULTS.md`)
 `EXPLAIN` of `UPDATE … WHERE pk = …` on the `bench/barrier` data: the security qual
 must not turn a PK lookup into a scan. If it does, stop (trigger 3).
 
@@ -154,6 +154,8 @@ must not turn a PK lookup into a scan. If it does, stop (trigger 3).
 ---
 
 ## 0. Status — resume here
+
+> **2026-09-23 — plan `20` (API rework) renamed the surface:** roles → `memberships`, assignments → `membership_rules` / `membership_sources`, `using_path` → `via`, `check_fn` → `if` (now enforced), `set` → `fill`, `letter.grant/revoke` → `grant_global/grant_scoped` and `revoke_*`, `assign/unassign` reshaped, `letter.read` → `letter._read` (test oracle only), `current_user_id` → `letter.user_id`, `barrier_sql` → `read_policy`/`write_policy`. Names in this document are as they were when it was written.
 
 **2026-09-22: COMPLETE.** W1–W4 done; 18 regression tests green (twice). The last
 read leak is closed: every location `15` §8 listed is redacted.

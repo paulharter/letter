@@ -24,14 +24,7 @@ CREATE TABLE team_members (
 -- "rows in team_members assign the role in the 'role' column, scoped to projects"
 -- ============================================================
 SET letter.bypass = on;
-SELECT letter.assign(
-    'public.team_members',  -- source table
-    'user_id',              -- user column
-    'public.projects',      -- scope table
-    role_name := NULL,
-    role_column := 'role',
-    if_fn := NULL
-);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
  assign 
 --------
  t
@@ -39,11 +32,11 @@ SELECT letter.assign(
 
 RESET letter.bypass;
 -- Verify the assignment rule was created
-SELECT table_name, scope_table, user_column, role_name, role_column
-    FROM letter.assignments;
-  table_name  | scope_table | user_column | role_name | role_column 
---------------+-------------+-------------+-----------+-------------
- team_members | projects    | user_id     |           | role
+SELECT table_name, scope_table, user_column, role, role_column
+    FROM letter.membership_rules;
+  table_name  | scope_table | user_column | role | role_column 
+--------------+-------------+-------------+------+-------------
+ team_members | projects    | user_id     |      | role
 (1 row)
 
 -- Insert test data
@@ -56,13 +49,13 @@ INSERT INTO projects (id, name) VALUES
 -- Adding a team member should create a role
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
-SELECT role, user_id, scope_table, scope_id FROM letter.roles ORDER BY role;
+SELECT role, user_id, scope_table, scope_id FROM letter.memberships ORDER BY role;
   role  |               user_id                | scope_table |               scope_id               
 --------+--------------------------------------+-------------+--------------------------------------
  editor | a0000000-0000-0000-0000-000000000001 | projects    | b0000000-0000-0000-0000-000000000001
 (1 row)
 
-SELECT count(*) AS role_assignment_count FROM letter.role_assignments;
+SELECT count(*) AS role_assignment_count FROM letter.membership_sources;
  role_assignment_count 
 -----------------------
                      1
@@ -71,7 +64,7 @@ SELECT count(*) AS role_assignment_count FROM letter.role_assignments;
 -- Adding another team member
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'viewer');
-SELECT role, user_id, scope_table, scope_id FROM letter.roles ORDER BY role, user_id;
+SELECT role, user_id, scope_table, scope_id FROM letter.memberships ORDER BY role, user_id;
   role  |               user_id                | scope_table |               scope_id               
 --------+--------------------------------------+-------------+--------------------------------------
  editor | a0000000-0000-0000-0000-000000000001 | projects    | b0000000-0000-0000-0000-000000000001
@@ -82,7 +75,7 @@ SELECT role, user_id, scope_table, scope_id FROM letter.roles ORDER BY role, use
 UPDATE team_members SET role = 'admin'
     WHERE user_id = 'a0000000-0000-0000-0000-000000000001'
     AND project_id = 'b0000000-0000-0000-0000-000000000001';
-SELECT role, user_id, scope_table, scope_id FROM letter.roles ORDER BY role, user_id;
+SELECT role, user_id, scope_table, scope_id FROM letter.memberships ORDER BY role, user_id;
   role  |               user_id                | scope_table |               scope_id               
 --------+--------------------------------------+-------------+--------------------------------------
  admin  | a0000000-0000-0000-0000-000000000001 | projects    | b0000000-0000-0000-0000-000000000001
@@ -95,13 +88,13 @@ SELECT role, user_id, scope_table, scope_id FROM letter.roles ORDER BY role, use
 DELETE FROM team_members
     WHERE user_id = 'a0000000-0000-0000-0000-000000000002'
     AND project_id = 'b0000000-0000-0000-0000-000000000001';
-SELECT role, user_id FROM letter.roles ORDER BY role;
+SELECT role, user_id FROM letter.memberships ORDER BY role;
  role  |               user_id                
 -------+--------------------------------------
  admin | a0000000-0000-0000-0000-000000000001
 (1 row)
 
-SELECT count(*) AS remaining FROM letter.role_assignments;
+SELECT count(*) AS remaining FROM letter.membership_sources;
  remaining 
 -----------
          1
@@ -113,7 +106,7 @@ SELECT count(*) AS remaining FROM letter.role_assignments;
 -- Give Alice a role on Beta too
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000002', 'viewer');
-SELECT count(*) AS roles_before FROM letter.roles;
+SELECT count(*) AS roles_before FROM letter.memberships;
  roles_before 
 --------------
             2
@@ -121,7 +114,7 @@ SELECT count(*) AS roles_before FROM letter.roles;
 
 -- Delete Project Alpha - should remove Alice's admin role on Alpha but keep her viewer on Beta
 DELETE FROM projects WHERE id = 'b0000000-0000-0000-0000-000000000001';
-SELECT role, user_id, scope_id FROM letter.roles ORDER BY role;
+SELECT role, user_id, scope_id FROM letter.memberships ORDER BY role;
   role  |               user_id                |               scope_id               
 --------+--------------------------------------+--------------------------------------
  viewer | a0000000-0000-0000-0000-000000000001 | b0000000-0000-0000-0000-000000000002
@@ -131,13 +124,13 @@ SELECT role, user_id, scope_id FROM letter.roles ORDER BY role;
 -- Test 4: Cleanup - deleting user cascades through and removes roles
 -- ============================================================
 DELETE FROM users WHERE id = 'a0000000-0000-0000-0000-000000000001';
-SELECT count(*) AS roles_after_user_delete FROM letter.roles;
+SELECT count(*) AS roles_after_user_delete FROM letter.memberships;
  roles_after_user_delete 
 -------------------------
                        0
 (1 row)
 
-SELECT count(*) AS assignments_after FROM letter.role_assignments;
+SELECT count(*) AS assignments_after FROM letter.membership_sources;
  assignments_after 
 -------------------
                  0
@@ -151,14 +144,7 @@ CREATE TABLE admins (
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE
 );
 SET letter.bypass = on;
-SELECT letter.assign(
-    'public.admins',
-    'user_id',
-    NULL,                   -- no scope
-    role_name := 'superadmin',
-    role_column := NULL,
-    if_fn := NULL
-);
+SELECT letter.assign('public.admins', 'user_id', role := 'superadmin');
  assign 
 --------
  t
@@ -167,7 +153,7 @@ SELECT letter.assign(
 RESET letter.bypass;
 INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000003', 'Charlie');
 INSERT INTO admins (user_id) VALUES ('a0000000-0000-0000-0000-000000000003');
-SELECT role, user_id, scope_table, scope_id FROM letter.roles;
+SELECT role, user_id, scope_table, scope_id FROM letter.memberships;
     role    |               user_id                | scope_table | scope_id 
 ------------+--------------------------------------+-------------+----------
  superadmin | a0000000-0000-0000-0000-000000000003 |             | 
@@ -175,12 +161,81 @@ SELECT role, user_id, scope_table, scope_id FROM letter.roles;
 
 -- Removing from admins removes the role
 DELETE FROM admins WHERE user_id = 'a0000000-0000-0000-0000-000000000003';
-SELECT count(*) AS roles_after_admin_delete FROM letter.roles;
+SELECT count(*) AS roles_after_admin_delete FROM letter.memberships;
  roles_after_admin_delete 
 --------------------------
                         0
 (1 row)
 
+-- ============================================================
+-- Test 6: assign with an if (plan/20 §3): the source row must satisfy
+-- it to confer the membership — on backfill, on insert, and as it
+-- changes. Validated like a grant's if.
+-- ============================================================
+CREATE TABLE staff (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    active boolean NOT NULL DEFAULT true,
+    title TEXT
+);
+INSERT INTO users (id, name) VALUES
+    ('a0000000-0000-0000-0000-000000000004', 'Dora'),
+    ('a0000000-0000-0000-0000-000000000005', 'Eve');
+INSERT INTO staff (user_id, active, title) VALUES
+    ('a0000000-0000-0000-0000-000000000004', true,  'on duty'),
+    ('a0000000-0000-0000-0000-000000000005', false, 'on leave');
+SET letter.bypass = on;
+SELECT letter.assign('public.staff', 'user_id', role := 'staff', if := 'active AND title <> ''fired''');
+ assign 
+--------
+ t
+(1 row)
+
+\set VERBOSITY terse
+SELECT letter.assign('public.staff', 'user_id', role := 'bad', if := 'title');
+ERROR:  letter: invalid if expression for assign on public.staff: the expression is text, not boolean
+SELECT letter.assign('public.staff', 'user_id', role := 'bad', if := 'EXISTS (SELECT 1)');
+ERROR:  letter: invalid if expression for assign on public.staff: subqueries are not allowed: an if expression sees only the row
+\set VERBOSITY default
+RESET letter.bypass;
+SELECT role, user_id FROM letter.memberships WHERE role = 'staff' ORDER BY user_id;
+ role  |               user_id                
+-------+--------------------------------------
+ staff | a0000000-0000-0000-0000-000000000004
+(1 row)
+
+UPDATE staff SET active = true WHERE title = 'on leave';                 -- Eve joins
+UPDATE staff SET title = 'fired' WHERE user_id = 'a0000000-0000-0000-0000-000000000004';   -- Dora leaves
+SELECT role, user_id FROM letter.memberships WHERE role = 'staff' ORDER BY user_id;
+ role  |               user_id                
+-------+--------------------------------------
+ staff | a0000000-0000-0000-0000-000000000005
+(1 row)
+
+INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000006', 'Fay');
+INSERT INTO staff (user_id, active) VALUES ('a0000000-0000-0000-0000-000000000006', false);   -- no membership
+SELECT count(*) AS staff_memberships FROM letter.memberships WHERE role = 'staff';
+ staff_memberships 
+-------------------
+                 1
+(1 row)
+
+-- Dropping a column the if names removes the rule (and its memberships).
+ALTER TABLE staff DROP COLUMN title;
+NOTICE:  letter: removed the assignment on public.staff: letter: invalid if expression for assign on public.staff: column "title" does not exist
+SELECT count(*) AS rules FROM letter.membership_rules WHERE table_name = 'public.staff'::regclass;
+ rules 
+-------
+     0
+(1 row)
+
+SELECT count(*) AS staff_memberships FROM letter.memberships WHERE role = 'staff';
+ staff_memberships 
+-------------------
+                 0
+(1 row)
+
+DROP TABLE staff CASCADE;
 DROP TABLE admins CASCADE;
 NOTICE:  letter: dropped table public.admins: removed 0 grant(s), 1 assignment(s), 0 role(s)
 DROP TABLE team_members CASCADE;

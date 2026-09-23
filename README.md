@@ -3,12 +3,11 @@
 Relationship-based access control (ReBAC) for PostgreSQL, as an extension. Permissions
 follow the relationships between rows — "editors of the project this task belongs to
 may read its title" — rather than static per-table grants. Writes are enforced by
-triggers; reads will be enforced transparently by a planner hook (in progress, see
-`plan/17`).
+triggers; reads transparently, by a planner hook.
 
 **Status:** pre-release. Write enforcement, transparent read enforcement (the planner
-hook, `letter.enforce_reads`, on by default), assignments, `letter.read()` and the
-lifecycle machinery are complete and tested on PostgreSQL 16 and 17.
+hook, `letter.enforce_reads`, on by default), membership rules, `if` conditions and
+the lifecycle machinery are complete and tested on PostgreSQL 16 and 17.
 
 ## Install
 
@@ -31,64 +30,91 @@ otherwise run without it. The library warns when loaded any other way, and
   (`'public.tasks'`, `'"Odd Schema"."Odd Table"'`), and letter stores the OID, so
   protection follows a table through `RENAME` and `SET SCHEMA`. Columns are identified
   by name.
-- **Roles** are rows in `letter.roles`: `(role, user_id, scope_table, scope_id)`. A role
-  is held either in the scope of one row of a *scope table* (`editor` of project 42) or
-  globally (`scope_table IS NULL`). The global scope is just another scope: a role held
-  in fifty projects never adds up to a global one, and a global role never satisfies a
-  scoped grant.
+- **Memberships** are rows in `letter.memberships`: `(role, user_id, scope_table,
+  scope_id)`. A user holds a role either in the scope of one row of a *scope table*
+  (`editor` of project 42) or in the global scope (`scope_table IS NULL`). The global
+  scope is just another scope: a role held in fifty projects never adds up to a global
+  one, and a global membership never satisfies a scoped grant.
+- **Grants are a set of permissive rules.** They cannot contradict each other and their
+  order does not matter; a rule can only add. Granting the same rule twice is one rule;
+  two rules for one role that differ in their path both stand. Narrowing means revoking.
 - **Grants** say what a role may do to which columns of which table, and — for scoped
   grants — how a row of that table reaches its scope: a chain of foreign keys, the
-  `using_path`. The final hop is inferred when it is unambiguous.
-- **Assignments** derive role rows from your own tables (a `team_members` table with a
-  `user_id`, a `project_id` and a `role` column) and keep them in step through triggers.
-- **Users** are opaque strings to letter. Roles derived by assignments follow their
-  source rows; roles the application inserts directly are the application's to remove
-  — `letter.forget_user(user_id)` removes every role a user holds, of both kinds.
-- **The current user** is the session setting `letter.current_user_id`, which the
-  application sets per request. Letter assumes end users never hold a raw SQL
-  connection: the application layer that sets it is the enforcement perimeter.
+  `via`. The final hop is inferred when it is unambiguous. A scoped select grant also
+  makes its own path column visible — the row is visible because of where it points —
+  so joins to the scope parent just work.
+- **`if`** narrows a rule to the rows that satisfy a boolean expression over the row's
+  own columns: `status <> 'archived'`, `author = letter.user_id()::uuid`. It is
+  validated when the rule is made and enforced wherever the rule is — in the read
+  policy and in the write triggers. On `update` and `fill` it is checked on the row
+  before and after the change, and both must pass; a rule that names `old` and `new`
+  (`old.status = 'draft' AND new.status = 'published'`) is checked once, on the
+  transition. The expression sees only the row: no subqueries, and any function it
+  calls must be `IMMUTABLE` (`pg_catalog` functions and `letter.user_id()` are allowed).
+- **Membership rules** (`letter.assign`) derive memberships from your own tables (a
+  `team_members` table with a `user_id`, a `project_id` and a `role` column) and keep
+  them in step through triggers. An `if` limits them to the source rows that satisfy it.
+- **Users** are opaque strings to letter. Memberships derived by rules follow their
+  source rows; memberships the application inserts directly are the application's to
+  remove — `letter.forget_user(user_id)` removes every membership a user holds, of both
+  kinds.
+- **The current user** is the session setting `letter.user_id`, which the
+  application sets per request. While it is unset, any read or write of a protected
+  table is an error. `letter.user_id()` reads it back (NULL when unset), for SQL
+  such as `WHERE owner_id = letter.user_id()::uuid`. Letter
+  assumes end users never hold a raw SQL connection: the application layer that sets
+  it is the enforcement perimeter.
 
 ## API
 
 ```sql
--- privileges: select | insert | update | delete | set   ('set' = update only while NULL)
-letter.grant (privilege text, on_table regclass, role text, columns text[],
-              scope regclass DEFAULT NULL,           -- NULL = unscoped
-              using_path text[] DEFAULT NULL, check_fn text DEFAULT NULL)
-letter.revoke(privilege text, on_table regclass, role text, columns text[],
-              scope regclass DEFAULT NULL)
+-- privileges: select | insert | update | delete | fill   ('fill' = update only while NULL)
+letter.grant_global(privilege text, on_table regclass, role text, columns text[] DEFAULT NULL,
+                    if text DEFAULT NULL)
+letter.grant_scoped(privilege text, on_table regclass, role text, columns text[],
+                    scope regclass, via text[] DEFAULT NULL, if text DEFAULT NULL)
+letter.revoke_global(privilege text, on_table regclass, role text, columns text[] DEFAULT ARRAY['*'])
+letter.revoke_scoped(privilege text, on_table regclass, role text, columns text[], scope regclass)
 
-letter.assign  (source_table regclass, user_column text, scope_table regclass DEFAULT NULL,
-                role_name text DEFAULT NULL, role_column text DEFAULT NULL, if_fn text DEFAULT NULL)
-letter.unassign(source_table regclass, user_column text, scope_table regclass DEFAULT NULL,
-                role_name text DEFAULT NULL, role_column text DEFAULT NULL)
+letter.assign  (source_table regclass, user_column text,
+                role text DEFAULT NULL, role_column text DEFAULT NULL,
+                scope regclass DEFAULT NULL, if text DEFAULT NULL)
+letter.unassign(source_table regclass, user_column text,
+                role text DEFAULT NULL, role_column text DEFAULT NULL, scope regclass DEFAULT NULL)
 
 letter.visible_columns(rel regclass, pk anyelement)        -- text[]: what this user may read of that row
-letter.forget_user(user_id text)                            -- remove every role the user holds; bigint
-letter.read(table_name text, condition text DEFAULT NULL)   -- DEPRECATED: plain SELECT is the enforced read
+letter.forget_user(user_id text)                            -- remove every membership the user holds; bigint
+letter.user_id()                                       -- the current user id as text, NULL when unset
 letter.list_grants(role text DEFAULT NULL)
 letter.user_permissions(user_id text)
-letter.barrier_sql(rel regclass)                            -- the read-enforcement subquery
+letter.read_policy(rel regclass)                            -- the read-enforcement subquery
 letter.check_health()                                       -- (severity, object, message)
 ```
 
-`columns` may be `ARRAY['*']`. A grant on a table that does not exist is refused; a
-scoped grant whose `using_path` is not a chain of foreign keys, or whose scope or hop
-tables have composite primary keys, is refused. Primary-key columns are always
-readable.
+`columns` may be `ARRAY['*']`, and for `insert` and `delete` — row-level privileges —
+it may be omitted. A grant on a table that does not exist is refused; a scoped grant
+whose `via` is not a chain of foreign keys, or whose scope or hop tables have
+composite primary keys, is refused. Primary-key columns are always readable.
+`revoke_*` removes every rule under its key.
 
 Example:
 
 ```sql
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-                     role_column := 'role');
-SELECT letter.grant('select', 'public.tasks',    'editor', ARRAY['title', 'estimate'],
-                    'public.projects');                       -- FK tasks.project_id inferred
-SELECT letter.grant('update', 'public.comments', 'editor', ARRAY['body'],
-                    'public.projects', ARRAY['task_id']);     -- comments → tasks → projects
-SELECT letter.grant('select', 'public.projects', 'auditor', ARRAY['name']);   -- unscoped
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role',
+                     scope := 'public.projects');
+SELECT letter.grant_scoped('select', 'public.tasks',    'editor', ARRAY['title', 'estimate'],
+                           'public.projects');                    -- FK tasks.project_id inferred
+SELECT letter.grant_scoped('update', 'public.comments', 'editor', ARRAY['body'],
+                           'public.projects', via := ARRAY['task_id']);  -- comments → tasks → projects
+SELECT letter.grant_global('select', 'public.projects', 'auditor', ARRAY['name']);
+SELECT letter.grant_global('insert', 'public.log', 'logger');    -- row-level: no column list
+SELECT letter.grant_scoped('update', 'public.tasks',    'editor', ARRAY['title'],
+                           'public.projects', if := 'status <> ''done''');       -- open tasks only
+SELECT letter.grant_scoped('delete', 'public.comments', 'editor', NULL,
+                           'public.projects', via := ARRAY['task_id'],
+                           if := 'author_id = letter.user_id()::uuid');         -- your own
 
-SET letter.current_user_id = '…';
+SET letter.user_id = '…';
 ```
 
 A hidden column reads as NULL. When an application needs to tell a hidden column from
@@ -96,7 +122,7 @@ a NULL one — a lock icon, no edit box — `letter.visible_columns('public.proj
 id)` returns the columns of that row the current user may read, or NULL if the row is
 not visible at all.
 
-Hand-written queries against `letter.grants` or `letter.roles` must compare table
+Hand-written queries against `letter.grants` or `letter.memberships` must compare table
 columns with a `regclass`, e.g. `WHERE on_table = 'public.tasks'::regclass` (a bare
 string literal is taken as an OID).
 
@@ -136,7 +162,8 @@ bypassed implicitly — the same `ALTER ROLE` opts them in. `letter.assign()` an
 
 ## Backup and restore
 
-`pg_dump` includes letter's grants, assignments, roles and role assignments. Restore
+`pg_dump` includes letter's grants, memberships, membership rules and membership
+sources. Restore
 with letter switched off, so that nothing is re-derived or re-validated while the
 schema is half-built:
 
@@ -158,21 +185,21 @@ on have not been added yet. The dump role should have `letter.bypass = on` by de
 Letter keeps its state consistent with your schema:
 
 - **Dropping** a table or column removes the letter state that depended on it — grants
-  on it, grants whose scope path crosses it, assignments that use it, roles scoped to
-  it — with a `NOTICE`.
+  on it, grants whose scope path or `if` crosses it, membership rules that use it,
+  memberships scoped to it — with a `NOTICE`.
 - **Altering** something so that existing letter state stops making sense — renaming a
-  granted column, dropping a foreign key on a scope path, adding a second foreign key
-  that makes an inferred hop ambiguous, giving a scope table a composite key — is
-  **refused**. Revoke or unassign first.
+  granted column or one an `if` names, dropping a foreign key on a scope path, adding a
+  second foreign key that makes an inferred hop ambiguous, giving a scope table a
+  composite key — is **refused**. Revoke or unassign first.
 - Renames and schema moves need nothing: identity is by OID.
-- `DROP EXTENSION letter` is refused while enforcement or assignment triggers exist on
+- `DROP EXTENSION letter` is refused while enforcement or membership-rule triggers exist on
   your tables; `DROP EXTENSION letter CASCADE` removes them all.
 - `letter.check_health()` reports what the above cannot prevent: state edited by hand,
   disabled triggers, tables with grants but no triggers, scope-path columns without an
   index, and the deployment settings.
 
 Scope-path columns should be indexed (`CREATE INDEX ON comments (task_id)`);
-`letter.grant()` warns when they are not, since scoped reads are driven from the
+`letter.grant_scoped()` warns when they are not, since scoped reads are driven from the
 user's scopes through those indexes.
 
 ## Known gaps
@@ -181,7 +208,8 @@ user's scopes through those indexes.
   statement writes to (`UPDATE t … RETURNING t`).
 - `COPY table TO` is refused (use `COPY (SELECT …) TO`, which is enforced); `COPY table
   FROM` needs an insert grant; `TRUNCATE` needs bypass.
-- A foreign-key column used in a join condition must itself be granted, or it is NULL
-  in the join and nothing matches.
+- A foreign-key column that is *not* on a grant's scope path must be granted like any
+  other column before it can be used in a join; the path's own column is visible with
+  the grant.
 - Partitions and inheritance children are not protected unless granted on directly.
 - Logical replication of `letter.*` rows between databases carries the wrong OIDs.

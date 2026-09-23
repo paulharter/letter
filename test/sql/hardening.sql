@@ -10,7 +10,7 @@
 --      gained or lost mid-session takes effect on the next check.
 --   4. Role names are handled as data, never interpolated into SQL —
 --      a role name containing quotes/SQL must not break enforcement.
---   5. letter.read() quotes identifiers — a table name cannot smuggle SQL.
+--   5. letter._read() quotes identifiers — a table name cannot smuggle SQL.
 
 CREATE EXTENSION letter;
 SET letter.enforce_reads = off;   -- this test is not about the read hook
@@ -62,18 +62,15 @@ INSERT INTO comments (id, task_id, body) VALUES
     ('e0000000-0000-0000-0000-000000000002', 'd0000000-0000-0000-0000-000000000002', 'beta comment');
 
 SET letter.bypass = on;
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
 RESET letter.bypass;
 
 -- Alice: editor on Alpha only.
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
 
-SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
-    'public.projects', ARRAY['task_id'], NULL);
-SELECT letter.grant('update', 'public.comments', 'editor', ARRAY['body', 'task_id'],
-    'public.projects', ARRAY['task_id'], NULL);
+SELECT letter.grant_scoped('select', 'public.comments', 'editor', ARRAY['body'], 'public.projects', ARRAY['task_id']);
+SELECT letter.grant_scoped('update', 'public.comments', 'editor', ARRAY['body', 'task_id'], 'public.projects', ARRAY['task_id']);
 
 -- ============================================================
 -- Test 1: letter.bypass is superuser-only.
@@ -92,7 +89,7 @@ DROP ROLE letter_test_nosuper;
 -- Test 2a: scope migration within the same scope is allowed
 -- (Alice moves an Alpha comment between two Alpha tasks).
 -- ============================================================
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
 
 UPDATE comments SET task_id = 'd0000000-0000-0000-0000-000000000011'
     WHERE id = 'e0000000-0000-0000-0000-000000000001';
@@ -122,7 +119,7 @@ UPDATE comments SET task_id = 'd0000000-0000-0000-0000-000000000001'
 -- same user id) makes it visible on the next read; removing the
 -- role hides it again.
 -- ============================================================
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
 
 INSERT INTO team_members (id, user_id, project_id, role) VALUES
@@ -130,12 +127,12 @@ INSERT INTO team_members (id, user_id, project_id, role) VALUES
      'a0000000-0000-0000-0000-000000000001',
      'b0000000-0000-0000-0000-000000000002', 'editor');
 
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
 
 DELETE FROM team_members WHERE id = 'c0000000-0000-0000-0000-000000000099';
 
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
 
 -- ============================================================
@@ -148,33 +145,32 @@ INSERT INTO team_members (user_id, project_id, role) VALUES
      'b0000000-0000-0000-0000-000000000001',
      'ev''il; DROP TABLE users;--');
 
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000003';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000003';
 
 -- No grants for the role yet: zero rows, no syntax error.
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
 
-SELECT letter.grant('select', 'public.comments', 'ev''il; DROP TABLE users;--',
-    ARRAY['body'], 'public.projects', ARRAY['task_id'], NULL);
+SELECT letter.grant_scoped('select', 'public.comments', 'ev''il; DROP TABLE users;--', ARRAY['body'], 'public.projects', ARRAY['task_id']);
 
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
 
 -- users table is still there.
 SELECT count(*) AS users_intact FROM users;
 
 -- ============================================================
--- Test 5: letter.read() cannot be used to smuggle SQL through
+-- Test 5: letter._read() cannot be used to smuggle SQL through
 -- the table name — identifiers are quoted.
 -- ============================================================
 \set VERBOSITY terse
-SELECT * FROM letter.read('public.comments"; DROP TABLE users;--') t(row_data);
+SELECT * FROM letter._read('public.comments"; DROP TABLE users;--') t(row_data);
 \set VERBOSITY default
 
 SELECT count(*) AS users_still_intact FROM users;
 
 -- Clean up
-RESET letter.current_user_id;
+RESET letter.user_id;
 SET letter.bypass = true;
 DROP TABLE team_members CASCADE;
 DROP TABLE comments CASCADE;

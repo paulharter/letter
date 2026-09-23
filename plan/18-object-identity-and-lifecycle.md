@@ -270,6 +270,8 @@ deletes a user? *(Proposed: yes, trivial, and it documents the responsibility.)*
 
 ## 0. Status — resume here
 
+> **2026-09-23 — plan `20` (API rework) renamed the surface:** roles → `memberships`, assignments → `membership_rules` / `membership_sources`, `using_path` → `via`, `check_fn` → `if` (now enforced), `set` → `fill`, `letter.grant/revoke` → `grant_global/grant_scoped` and `revoke_*`, `assign/unassign` reshaped, `letter.read` → `letter._read` (test oracle only), `current_user_id` → `letter.user_id`, `barrier_sql` → `read_policy`/`write_policy`. Names in this document are as they were when it was written.
+
 **2026-09-23: everything in this plan is done** — I1–I5, R1 (D6, verified by a real
 `pg_dump | psql` round trip) and U1 (D7, `letter.forget_user`). **Next: `17` H3** (substitution) with
 `/implement-plan plan/17-planner-hook-implementation.md`.

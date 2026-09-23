@@ -16,13 +16,13 @@ SELECT nspname FROM pg_namespace WHERE nspname = 'letter';
 SELECT tablename FROM pg_tables
     WHERE schemaname = 'letter'
     ORDER BY tablename;
-    tablename     
-------------------
- assignments
+     tablename      
+--------------------
+ _membership_signal
  grants
- role_assignments
- roles
- roles_epoch
+ membership_rules
+ membership_sources
+ memberships
 (5 rows)
 
 -- The four data tables are registered for pg_dump (plan/18 D6); the
@@ -30,17 +30,17 @@ SELECT tablename FROM pg_tables
 SELECT e::regclass::text AS dumped
     FROM (SELECT unnest(extconfig) AS e FROM pg_extension WHERE extname = 'letter') x
     ORDER BY 1;
-         dumped          
--------------------------
- letter.assignments
+          dumped           
+---------------------------
  letter.grants
- letter.role_assignments
- letter.roles
+ letter.membership_rules
+ letter.membership_sources
+ letter.memberships
 (4 rows)
 
--- Verify roles table columns
+-- Verify memberships table columns
 SELECT column_name, data_type FROM information_schema.columns
-    WHERE table_schema = 'letter' AND table_name = 'roles'
+    WHERE table_schema = 'letter' AND table_name = 'memberships'
     ORDER BY ordinal_position;
  column_name |     data_type     
 -------------+-------------------
@@ -62,13 +62,13 @@ SELECT column_name, data_type FROM information_schema.columns
  role        | character varying
  column_name | character varying
  scope       | regclass
- using_path  | ARRAY
- check_fn    | text
+ via         | ARRAY
+ if          | text
 (7 rows)
 
--- Verify assignments table columns
+-- Verify membership_rules table columns
 SELECT column_name, data_type FROM information_schema.columns
-    WHERE table_schema = 'letter' AND table_name = 'assignments'
+    WHERE table_schema = 'letter' AND table_name = 'membership_rules'
     ORDER BY ordinal_position;
  column_name |     data_type     
 -------------+-------------------
@@ -76,14 +76,14 @@ SELECT column_name, data_type FROM information_schema.columns
  table_name  | regclass
  scope_table | regclass
  user_column | character varying
- role_name   | character varying
+ role        | character varying
  role_column | character varying
- if_fn       | text
+ if          | text
 (7 rows)
 
--- Verify role_assignments table columns
+-- Verify membership_sources table columns
 SELECT column_name, data_type FROM information_schema.columns
-    WHERE table_schema = 'letter' AND table_name = 'role_assignments'
+    WHERE table_schema = 'letter' AND table_name = 'membership_sources'
     ORDER BY ordinal_position;
   column_name  | data_type 
 ---------------+-----------
@@ -97,37 +97,37 @@ SELECT column_name, data_type FROM information_schema.columns
  scope_id      | text
 (8 rows)
 
--- Verify assignments CHECK constraint: must have role_name or role_column but not both
+-- Verify assignments CHECK constraint: must have role or role_column but not both
 \set VERBOSITY terse
-INSERT INTO letter.assignments (table_name, user_column, role_name, role_column)
+INSERT INTO letter.membership_rules (table_name, user_column, role, role_column)
     VALUES ('t', 'user_id', 'admin', 'role_col');
-ERROR:  new row for relation "assignments" violates check constraint "role_name_or_column"
-INSERT INTO letter.assignments (table_name, user_column)
+ERROR:  new row for relation "membership_rules" violates check constraint "role_or_column"
+INSERT INTO letter.membership_rules (table_name, user_column)
     VALUES ('t', 'user_id');
-ERROR:  new row for relation "assignments" violates check constraint "role_name_or_column"
+ERROR:  new row for relation "membership_rules" violates check constraint "role_or_column"
 \set VERBOSITY default
--- Verify FK cascade: deleting assignment cascades to role_assignments
-INSERT INTO letter.assignments (table_name, user_column, role_name)
+-- Verify FK cascade: deleting assignment cascades to membership_sources
+INSERT INTO letter.membership_rules (table_name, user_column, role)
     VALUES ('t', 'user_id', 'admin')
     RETURNING id \gset assign_
-INSERT INTO letter.roles (role, user_id) VALUES ('admin', 'user1') RETURNING id \gset role_
-INSERT INTO letter.role_assignments (assignment_id, role_id, source_table, source_id, user_id)
+INSERT INTO letter.memberships (role, user_id) VALUES ('admin', 'user1') RETURNING id \gset role_
+INSERT INTO letter.membership_sources (assignment_id, role_id, source_table, source_id, user_id)
     VALUES (:'assign_id', :'role_id', 't', '1', 'user1');
-SELECT count(*) AS before_delete FROM letter.role_assignments;
+SELECT count(*) AS before_delete FROM letter.membership_sources;
  before_delete 
 ---------------
              1
 (1 row)
 
-DELETE FROM letter.assignments WHERE id = :'assign_id';
-SELECT count(*) AS after_delete FROM letter.role_assignments;
+DELETE FROM letter.membership_rules WHERE id = :'assign_id';
+SELECT count(*) AS after_delete FROM letter.membership_sources;
  after_delete 
 --------------
             0
 (1 row)
 
 -- Verify cleanup trigger also removed the role
-SELECT count(*) AS orphaned_roles FROM letter.roles WHERE id = :'role_id';
+SELECT count(*) AS orphaned_roles FROM letter.memberships WHERE id = :'role_id';
  orphaned_roles 
 ----------------
               0

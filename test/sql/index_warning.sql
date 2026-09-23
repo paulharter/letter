@@ -27,34 +27,28 @@ CREATE TABLE comments (
 
 -- 1. Both the declared hop (comments.task_id) and the inferred final
 --    hop (tasks.project_id) are unindexed.
-SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
-    'public.projects', ARRAY['task_id'], NULL);
+SELECT letter.grant_scoped('select', 'public.comments', 'editor', ARRAY['body'], 'public.projects', ARRAY['task_id']);
 SELECT count(*) FROM letter.grants;
 
 -- Direct-FK scope: only the inferred final hop.
-SELECT letter.grant('select', 'public.tasks', 'editor', ARRAY['title'],
-    'public.projects', NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.tasks', 'editor', ARRAY['title'], 'public.projects');
 
 -- 2. Same path, update privilege: no warning.
-SELECT letter.grant('update', 'public.comments', 'editor', ARRAY['body'],
-    'public.projects', ARRAY['task_id'], NULL);
+SELECT letter.grant_scoped('update', 'public.comments', 'editor', ARRAY['body'], 'public.projects', ARRAY['task_id']);
 
 -- 3. Indexes that do not count: path column not leading, and partial.
 CREATE INDEX comments_body_task ON comments (body, task_id);
 CREATE INDEX tasks_project_partial ON tasks (project_id) WHERE title IS NOT NULL;
-SELECT letter.grant('select', 'public.comments', 'viewer', ARRAY['body'],
-    'public.projects', ARRAY['task_id'], NULL);
+SELECT letter.grant_scoped('select', 'public.comments', 'viewer', ARRAY['body'], 'public.projects', ARRAY['task_id']);
 
 --    Indexes that do: leading column of a multi-column index, and a plain one.
 CREATE INDEX comments_task_body ON comments (task_id, body);
 CREATE INDEX tasks_project ON tasks (project_id);
-SELECT letter.grant('select', 'public.comments', 'reader', ARRAY['body'],
-    'public.projects', ARRAY['task_id'], NULL);
+SELECT letter.grant_scoped('select', 'public.comments', 'reader', ARRAY['body'], 'public.projects', ARRAY['task_id']);
 
 -- 4. Unscoped, and table-is-scope: nothing to index.
-SELECT letter.grant('select', 'public.comments', 'admin', ARRAY['*'], NULL, NULL, NULL);
-SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['name'],
-    'public.projects', NULL, NULL);
+SELECT letter.grant_global('select', 'public.comments', 'admin', ARRAY['*']);
+SELECT letter.grant_scoped('select', 'public.projects', 'editor', ARRAY['name'], 'public.projects');
 
 -- Cleanup
 DROP TABLE comments CASCADE;

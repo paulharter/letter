@@ -10,7 +10,7 @@
 --      gained or lost mid-session takes effect on the next check.
 --   4. Role names are handled as data, never interpolated into SQL —
 --      a role name containing quotes/SQL must not break enforcement.
---   5. letter.read() quotes identifiers — a table name cannot smuggle SQL.
+--   5. letter._read() quotes identifiers — a table name cannot smuggle SQL.
 CREATE EXTENSION letter;
 WARNING:  letter: library loaded on demand, not preloaded
 DETAIL:  Read enforcement is a planner hook; sessions that never call a letter function will not have it.
@@ -54,8 +54,7 @@ INSERT INTO comments (id, task_id, body) VALUES
     ('e0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000001', 'alpha comment'),
     ('e0000000-0000-0000-0000-000000000002', 'd0000000-0000-0000-0000-000000000002', 'beta comment');
 SET letter.bypass = on;
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
  assign 
 --------
  t
@@ -65,21 +64,19 @@ RESET letter.bypass;
 -- Alice: editor on Alpha only.
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
-SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
-    'public.projects', ARRAY['task_id'], NULL);
-WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+SELECT letter.grant_scoped('select', 'public.comments', 'editor', ARRAY['body'], 'public.projects', ARRAY['task_id']);
+WARNING:  letter: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.comments (task_id);
-WARNING:  letter.grant: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
+WARNING:  letter: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.tasks (project_id);
- grant 
--------
+ grant_scoped 
+--------------
  t
 (1 row)
 
-SELECT letter.grant('update', 'public.comments', 'editor', ARRAY['body', 'task_id'],
-    'public.projects', ARRAY['task_id'], NULL);
- grant 
--------
+SELECT letter.grant_scoped('update', 'public.comments', 'editor', ARRAY['body', 'task_id'], 'public.projects', ARRAY['task_id']);
+ grant_scoped 
+--------------
  t
 (1 row)
 
@@ -98,7 +95,7 @@ DROP ROLE letter_test_nosuper;
 -- Test 2a: scope migration within the same scope is allowed
 -- (Alice moves an Alpha comment between two Alpha tasks).
 -- ============================================================
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
 UPDATE comments SET task_id = 'd0000000-0000-0000-0000-000000000011'
     WHERE id = 'e0000000-0000-0000-0000-000000000001';
 SELECT body FROM comments WHERE id = 'e0000000-0000-0000-0000-000000000001';
@@ -130,7 +127,7 @@ ERROR:  letter: UPDATE denied on "public.comments" column "task_id" for user "a0
 -- same user id) makes it visible on the next read; removing the
 -- role hides it again.
 -- ============================================================
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
      body      
 ---------------
@@ -141,7 +138,7 @@ INSERT INTO team_members (id, user_id, project_id, role) VALUES
     ('c0000000-0000-0000-0000-000000000099',
      'a0000000-0000-0000-0000-000000000001',
      'b0000000-0000-0000-0000-000000000002', 'editor');
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
      body      
 ---------------
@@ -150,7 +147,7 @@ SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
 (2 rows)
 
 DELETE FROM team_members WHERE id = 'c0000000-0000-0000-0000-000000000099';
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
      body      
 ---------------
@@ -166,26 +163,25 @@ INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000003',
      'b0000000-0000-0000-0000-000000000001',
      'ev''il; DROP TABLE users;--');
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000003';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000003';
 -- No grants for the role yet: zero rows, no syntax error.
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
  body 
 ------
 (0 rows)
 
-SELECT letter.grant('select', 'public.comments', 'ev''il; DROP TABLE users;--',
-    ARRAY['body'], 'public.projects', ARRAY['task_id'], NULL);
-WARNING:  letter.grant: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
+SELECT letter.grant_scoped('select', 'public.comments', 'ev''il; DROP TABLE users;--', ARRAY['body'], 'public.projects', ARRAY['task_id']);
+WARNING:  letter: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.comments (task_id);
-WARNING:  letter.grant: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
+WARNING:  letter: scope path column "project_id" on public.tasks has no index — reads scoped through it will scan the whole table
 HINT:  CREATE INDEX ON public.tasks (project_id);
- grant 
--------
+ grant_scoped 
+--------------
  t
 (1 row)
 
-SELECT row_data->>'body' AS body FROM letter.read('public.comments') t(row_data)
+SELECT row_data->>'body' AS body FROM letter._read('public.comments') t(row_data)
     ORDER BY 1;
      body      
 ---------------
@@ -200,11 +196,11 @@ SELECT count(*) AS users_intact FROM users;
 (1 row)
 
 -- ============================================================
--- Test 5: letter.read() cannot be used to smuggle SQL through
+-- Test 5: letter._read() cannot be used to smuggle SQL through
 -- the table name — identifiers are quoted.
 -- ============================================================
 \set VERBOSITY terse
-SELECT * FROM letter.read('public.comments"; DROP TABLE users;--') t(row_data);
+SELECT * FROM letter._read('public.comments"; DROP TABLE users;--') t(row_data);
 ERROR:  relation "public.comments"; DROP TABLE users;--" does not exist
 \set VERBOSITY default
 SELECT count(*) AS users_still_intact FROM users;
@@ -214,7 +210,7 @@ SELECT count(*) AS users_still_intact FROM users;
 (1 row)
 
 -- Clean up
-RESET letter.current_user_id;
+RESET letter.user_id;
 SET letter.bypass = true;
 DROP TABLE team_members CASCADE;
 NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 assignment(s), 0 role(s)

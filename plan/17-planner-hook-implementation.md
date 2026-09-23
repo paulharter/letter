@@ -232,7 +232,7 @@ changes the cost of everything below.
   *plan*, which legitimately does not depend on role rows.) Do this only if it stays
   ≤ ~40 lines; otherwise split it out.
 
-### H5 — Behavioural tests, then flip the default — ✅ DONE 2026-09-22 (H5.9 bench comparison not run), notes in §7
+### H5 — Behavioural tests, then flip the default — ✅ DONE 2026-09-22; H5.9 run 2026-09-23 (`bench/barrier/RESULTS.md`, second section: plans match form E; three constant-factor gaps reported, decision pending — S7 in §0)
 `test/sql/hook_read.sql` (+ `hook_cache.sql`), switch on:
 1. Parity: `SELECT *` matches `letter.read()` row/column visibility for two users
    (same fixtures as `read.sql` / `multihop.sql`), native types preserved.
@@ -311,7 +311,12 @@ Settled here (argue before starting, not during):
   `perminfoindex` is the caller's privilege check.
 - **D7 — no caching of generated `Query` trees** in this plan.
 - **D2 — `letter.current_user_id` unset → reads return zero rows.** *(Decided
-  2026-09-21.)* The generated SQL yields this naturally (no role row matches `''`); no
+  2026-09-21. **Amended 2026-09-23: reads ERROR too.** The asymmetry was the friendlier
+  choice for tooling but hid application bugs as an empty database. Every generated
+  barrier now reads the user through `letter.require_user()`, a C function that errors
+  when the GUC is unset — a run-time call, so a plan cached with a user set fails
+  correctly when executed without one. `letter.current_user()` (NULL when unset)
+  remains for application SQL. The rest of this entry is historical.)* The generated SQL yields this naturally (no role row matches `''`); no
   extra gate or function call. Deliberately asymmetric with writes, where the triggers
   *error*: a denied write must be loud, an unidentified read is simply entitled to
   nothing — leak-free, and friendlier to tooling and health checks. Document the
@@ -408,6 +413,25 @@ Settled here (argue before starting, not during):
     PostgreSQL-level fact, noted, not closed.
   - The protected set therefore records a **privilege bitmask per OID**, not just "has
     a select grant".
+- **D15 — a grant's identity is the whole rule.** *(Decided 2026-09-23; Paul's
+  invariant: grants are a set of permissive rules that cannot contradict each other
+  and whose order does not matter.)* `letter.grants` is unique on `(privilege,
+  on_table, role, scope, column_name, using_path, check_fn)` (`NULLS NOT DISTINCT`), not
+  on the first five: granting the same rule twice is a no-op, a rule differing in its
+  path or check is an additional rule OR-ed with the rest, and narrowing means
+  revoking. `revoke()` still removes every rule under its key. Before this, the
+  primary key made the second of two such grants silently *replace* the first — the
+  one place the invariant did not hold.
+- **D16 — a select grant makes its own path column visible.** *(Decided 2026-09-23.)*
+  The first column of a scoped grant's `using_path` (or the FK an inferred path starts
+  with) counts as covered by that grant, as if listed: the row is visible *because* of
+  where that column points, so the grant already disclosed it, and it is the column the
+  natural join uses (`projects p JOIN tasks t ON t.project_id = p.id`). Per grant, so it
+  follows the grant's tests like any column. Other FKs — authorship, approvals,
+  anything not on the path — remain ordinary columns. Not "all FKs of a visible row":
+  a sideways relationship can be the sensitive fact. Implemented in the generator
+  (`path_col` per group) and `check_grant` (`grant_path_covers`), so `letter.read()`,
+  `visible_columns()` and the write path all agree.
 
 Deferred:
 
@@ -443,10 +467,40 @@ Halt and raise, rather than work around, if any of these occur:
 
 ## 0. Status — resume here
 
+> **2026-09-23 — plan `20` (API rework) renamed the surface:** roles → `memberships`, assignments → `membership_rules` / `membership_sources`, `using_path` → `via`, `check_fn` → `if` (now enforced), `set` → `fill`, `letter.grant/revoke` → `grant_global/grant_scoped` and `revoke_*`, `assign/unassign` reshaped, `letter.read` → `letter._read` (test oracle only), `current_user_id` → `letter.user_id`, `barrier_sql` → `read_policy`/`write_policy`. Names in this document are as they were when it was written.
+
 **As of 2026-09-22 (night). H0–H6 ✅ — this plan is complete**, and so is `19`
 (write-path redaction of the result relation, the `15` §8 gap). Plan `18` complete;
 18 tests green. Left over, none blocking: PG16 build (`11` 5.9), the `bench`
 plan-shape comparisons (H5.9, `19` W3), `MERGE`, `18` R1 (dump/restore) and U1.
+
+### S7 — H5.9 bench: three generator gaps — ✅ RESOLVED 2026-09-23 → D17 (Paul: do fixes 2 and 3; gap 1 stays)
+The hook's plans match the hand-written form E (`bench/barrier/RESULTS.md` §2026-09-23):
+scope-driven, PK lookups preserved on read and write. Constant-factor gaps: (1) under
+`UNION ALL` unreferenced CASE columns are computed (47 vs 31 ms at 200k rows,
+`count(*)`); (2) the admin branch joins chains it does not need (205 vs 131 ms for
+root) — fixable by treating branch *i*'s own test as TRUE inside branch *i*; (3) `if`
+runs as a correlated SubPlan per row, up to twice (64 → 122 ms at 200k rows) —
+fixable by deparsing the expression over alias `b` and folding it into the branch's
+WHERE. (2) and (3) are generator-only changes that alter the golden text in
+`barrier_sql.sql`; (1) is PostgreSQL's set-op handling and stays.
+
+**D17 (2026-09-23, Paul):** the generator (a) renders a rule's `if` as an ordinary
+expression over the base alias `b` — the text is analysed against the table and
+deparsed with the row named `b` (`b.author <> 'author 0'`, the whole row as `b`) — no
+sublink, no per-row SubPlan; (b) in branch *i* of the `UNION ALL`, group *i*'s test is
+TRUE: a column every role of group *i* covers is emitted as plain `b.col`, and another
+group's joins appear in branch *i* only where a column of that branch still tests it
+(or the group precedes *i*, for the exclusion). An unscoped `*` grant's branch is then
+`SELECT b.* FROM t b WHERE <gate>`. The barrier's meaning is unchanged: the same rows,
+the same columns. **Landed 2026-09-23** (`deparse_if_over_b`, `group_covers_column`,
+per-branch target lists, `chain_owner`): also (c) each distinct (scope, via) chain is
+rendered once and shared by the groups that differ only in `if` or roles — without it
+the exclusion test in a later branch joined the same hop table twice. Deparse uses
+`forceprefix` so a hop alias can never capture a column name. Results: root 205 → 137
+ms (form E 131), Q5 with `if` 122 → 58 ms, Q1 with `if` 0.91 → 0.28 ms; everything
+else unchanged; `barrier_sql.sql` golden text regenerated, parity 0/0 throughout; 18
+tests green on PG 16 and 17.
 
 ### S6 — what an *unscoped* grant requires of the user's role row — ✅ RESOLVED 2026-09-22 → D11
 `16` §3.2 rule 5 and the barrier experiment (`bench/barrier/views_or.sql`) gate the

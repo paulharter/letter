@@ -26,10 +26,7 @@ INSERT INTO projects (id, name) VALUES
     ('b0000000-0000-0000-0000-000000000001', 'Project Alpha');
 -- Create a scoped assignment
 SET letter.bypass = on;
-SELECT letter.assign(
-    'public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL
-);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
  assign 
 --------
  t
@@ -39,13 +36,13 @@ RESET letter.bypass;
 -- Add a team member to generate a role
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor');
-SELECT count(*) AS roles_before FROM letter.roles;
+SELECT count(*) AS roles_before FROM letter.memberships;
  roles_before 
 --------------
             1
 (1 row)
 
-SELECT count(*) AS assignments_before FROM letter.assignments;
+SELECT count(*) AS assignments_before FROM letter.membership_rules;
  assignments_before 
 --------------------
                   1
@@ -53,10 +50,7 @@ SELECT count(*) AS assignments_before FROM letter.assignments;
 
 -- Unassign the rule
 SET letter.bypass = on;
-SELECT letter.unassign(
-    'public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role'
-);
+SELECT letter.unassign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
  unassign 
 ----------
  t
@@ -64,29 +58,29 @@ SELECT letter.unassign(
 
 RESET letter.bypass;
 -- Assignment rule should be gone
-SELECT count(*) AS assignments_after FROM letter.assignments;
+SELECT count(*) AS assignments_after FROM letter.membership_rules;
  assignments_after 
 -------------------
                  0
 (1 row)
 
--- Roles and role_assignments should be cleaned up
-SELECT count(*) AS roles_after FROM letter.roles;
+-- Memberships and membership_sources should be cleaned up
+SELECT count(*) AS roles_after FROM letter.memberships;
  roles_after 
 -------------
            0
 (1 row)
 
-SELECT count(*) AS role_assignments_after FROM letter.role_assignments;
- role_assignments_after 
-------------------------
-                      0
+SELECT count(*) AS membership_sources_after FROM letter.membership_sources;
+ membership_sources_after 
+--------------------------
+                        0
 (1 row)
 
 -- Triggers should be removed - inserting should not create roles
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'admin');
-SELECT count(*) AS roles_no_trigger FROM letter.roles;
+SELECT count(*) AS roles_no_trigger FROM letter.memberships;
  roles_no_trigger 
 ------------------
                 0
@@ -100,10 +94,7 @@ CREATE TABLE admins (
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE
 );
 SET letter.bypass = on;
-SELECT letter.assign(
-    'public.admins', 'user_id', NULL,
-    role_name := 'superadmin', role_column := NULL, if_fn := NULL
-);
+SELECT letter.assign('public.admins', 'user_id', role := 'superadmin');
  assign 
 --------
  t
@@ -111,30 +102,27 @@ SELECT letter.assign(
 
 RESET letter.bypass;
 INSERT INTO admins (user_id) VALUES ('a0000000-0000-0000-0000-000000000001');
-SELECT count(*) AS roles_before_unscp FROM letter.roles;
+SELECT count(*) AS roles_before_unscp FROM letter.memberships;
  roles_before_unscp 
 --------------------
                   1
 (1 row)
 
 SET letter.bypass = on;
-SELECT letter.unassign(
-    'public.admins', 'user_id', NULL,
-    role_name := 'superadmin', role_column := NULL
-);
+SELECT letter.unassign('public.admins', 'user_id', role := 'superadmin');
  unassign 
 ----------
  t
 (1 row)
 
 RESET letter.bypass;
-SELECT count(*) AS roles_after_unscp FROM letter.roles;
+SELECT count(*) AS roles_after_unscp FROM letter.memberships;
  roles_after_unscp 
 -------------------
                  0
 (1 row)
 
-SELECT count(*) AS assignments_after_unscp FROM letter.assignments;
+SELECT count(*) AS assignments_after_unscp FROM letter.membership_rules;
  assignments_after_unscp 
 -------------------------
                        0

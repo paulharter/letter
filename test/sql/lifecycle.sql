@@ -53,10 +53,8 @@ INSERT INTO reactions VALUES
     ('e0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000001', 'r1');
 
 SET letter.bypass = on;
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
-SELECT letter.assign('public.auditors', 'user_id', NULL,
-    role_name := 'auditor', role_column := NULL, if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
+SELECT letter.assign('public.auditors', 'user_id', role := 'auditor');
 RESET letter.bypass;
 
 INSERT INTO team_members (user_id, project_id, role) VALUES
@@ -64,15 +62,11 @@ INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000002', 'editor');
 INSERT INTO auditors (user_id) VALUES ('a0000000-0000-0000-0000-000000000002');
 
-SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'],
-    'public.projects', ARRAY['task_id'], NULL);
-SELECT letter.grant('update', 'public.comments', 'editor', ARRAY['body'],
-    'public.projects', ARRAY['task_id'], NULL);
-SELECT letter.grant('select', 'public.comments', 'auditor', ARRAY['author'], NULL);
-SELECT letter.grant('select', 'public.reactions', 'editor', ARRAY['emoji'],
-    'public.projects', ARRAY['comment_id', 'task_id'], NULL);
-SELECT letter.grant('select', 'public.tasks', 'editor', ARRAY['title'],
-    'public.projects', NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.comments', 'editor', ARRAY['body'], 'public.projects', ARRAY['task_id']);
+SELECT letter.grant_scoped('update', 'public.comments', 'editor', ARRAY['body'], 'public.projects', ARRAY['task_id']);
+SELECT letter.grant_global('select', 'public.comments', 'auditor', ARRAY['author']);
+SELECT letter.grant_scoped('select', 'public.reactions', 'editor', ARRAY['emoji'], 'public.projects', ARRAY['comment_id', 'task_id']);
+SELECT letter.grant_scoped('select', 'public.tasks', 'editor', ARRAY['title'], 'public.projects');
 
 -- letter's state, as text; OIDs and assignment ids are normalised away so
 -- the expected output is stable.
@@ -81,17 +75,17 @@ CREATE VIEW state AS
     FROM letter.grants g
     UNION ALL
     SELECT 'assignment', a.table_name::text, COALESCE(a.scope_table::text, '-')
-    FROM letter.assignments a
+    FROM letter.membership_rules a
     UNION ALL
     SELECT 'role', COALESCE(r.scope_table::text, '-'), r.role || '@' || left(r.user_id, 8)
-    FROM letter.roles r
+    FROM letter.memberships r
     UNION ALL
-    SELECT 'trigger', t.tgrelid::regclass::text, regexp_replace(t.tgname, '_[0-9a-f_]{36}$', '_<id>')
+    SELECT 'trigger', t.tgrelid::regclass::text, regexp_replace(t.tgname, 'rule_[0-9a-f]{8}', 'rule_<id>')
     FROM pg_trigger t WHERE t.tgname LIKE 'letter\_%' AND NOT t.tgisinternal
     UNION ALL
-    SELECT 'function', 'letter', regexp_replace(p.proname, '_[0-9a-f_]{36}$', '_<id>')
+    SELECT 'function', 'letter', regexp_replace(p.proname, 'rule_[0-9a-f]{8}', 'rule_<id>')
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname = 'letter' AND p.proname LIKE 'source\_%' OR n.nspname = 'letter' AND p.proname LIKE 'scope\_%';
+    WHERE n.nspname = 'letter' AND p.proname LIKE '\_rule\_%';
 
 SELECT * FROM state ORDER BY 1, 2, 3;
 
@@ -106,15 +100,16 @@ ALTER TABLE remarks SET SCHEMA other;
 SELECT tbl, detail FROM state WHERE kind = 'grant' AND tbl LIKE '%remarks' ORDER BY 2;
 
 -- write enforcement still applies under the new name
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
 UPDATE other.remarks SET body = 'edited by alice' WHERE id = 'd0000000-0000-0000-0000-000000000001';
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000002';
 UPDATE other.remarks SET body = 'edited by bob' WHERE id = 'd0000000-0000-0000-0000-000000000001';
-RESET letter.current_user_id;
+RESET letter.user_id;
 SELECT body FROM other.remarks;
 
--- and the planner hook still substitutes it (no user id set: zero rows, 17 D2)
+-- and the planner hook still substitutes it
 SET letter.enforce_reads = on;
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
 SET client_min_messages = debug1;
 SELECT count(*) FROM other.remarks;
 RESET client_min_messages;
@@ -128,7 +123,7 @@ ALTER TABLE remarks RENAME TO comments;
 -- ============================================================
 -- a granted column
 ALTER TABLE comments RENAME COLUMN body TO text;
--- a using_path column
+-- a via column
 ALTER TABLE comments RENAME COLUMN task_id TO task;
 -- an assignment's user column
 ALTER TABLE team_members RENAME COLUMN user_id TO member_id;
@@ -169,7 +164,7 @@ SELECT count(*) FROM reactions;
 
 -- ============================================================
 -- 4. Dropping a column removes the grants on it; dropping a
---    using_path column removes the grants through it.
+--    via column removes the grants through it.
 -- ============================================================
 ALTER TABLE comments DROP COLUMN author;
 SELECT tbl, detail FROM state WHERE kind = 'grant' ORDER BY 1, 2;
@@ -196,8 +191,7 @@ SELECT * FROM state WHERE kind IN ('assignment', 'role', 'function') ORDER BY 1,
 --    (with their triggers on the surviving source table), the roles
 --    scoped to it, and the grants scoped to it.
 -- ============================================================
-SELECT letter.grant('select', 'public.team_members', 'editor', ARRAY['role'],
-    'public.projects', NULL, NULL);
+SELECT letter.grant_scoped('select', 'public.team_members', 'editor', ARRAY['role'], 'public.projects');
 DROP TABLE projects CASCADE;
 SELECT * FROM state ORDER BY 1, 2, 3;
 
@@ -208,36 +202,35 @@ SELECT * FROM state ORDER BY 1, 2, 3;
 -- ============================================================
 SET letter.bypass = on;
 CREATE TABLE members (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL);
-SELECT letter.assign('public.members', 'user_id', NULL, role_name := 'member');
+SELECT letter.assign('public.members', 'user_id', role := 'member');
 SET letter.bypass = off;
 INSERT INTO members (user_id) VALUES
     ('a0000000-0000-0000-0000-000000000001'), ('a0000000-0000-0000-0000-000000000002');
-INSERT INTO letter.roles (role, user_id) VALUES
+INSERT INTO letter.memberships (role, user_id) VALUES
     ('vip', 'a0000000-0000-0000-0000-000000000001'),
     ('vip', 'a0000000-0000-0000-0000-000000000002');
-SELECT role, right(user_id, 4) AS who FROM letter.roles ORDER BY 1, 2;
+SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
 SELECT letter.forget_user('a0000000-0000-0000-0000-000000000001') AS forgotten;
-SELECT role, right(user_id, 4) AS who FROM letter.roles ORDER BY 1, 2;
-SELECT count(*) AS assignment_records_left FROM letter.role_assignments
+SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
+SELECT count(*) AS assignment_records_left FROM letter.membership_sources
     WHERE user_id = 'a0000000-0000-0000-0000-000000000001';
 SELECT letter.forget_user('nobody') AS forgotten;
 DROP TABLE members;
 
 -- ============================================================
 -- 8. Hygiene: a role row with an empty user id is refused
---    (it would match sessions with no letter.current_user_id).
+--    (it would match sessions with no letter.user_id).
 -- ============================================================
-INSERT INTO letter.roles (role, user_id) VALUES ('editor', '');
+INSERT INTO letter.memberships (role, user_id) VALUES ('editor', '');
 
 -- ============================================================
 -- 9. DROP EXTENSION … CASCADE takes the assignment machinery with
 --    it (18 D5): no letter trigger or function is left on user
 --    tables, and writes to a former source table just work.
 -- ============================================================
-SELECT letter.grant('select', 'public.comments', 'editor', ARRAY['body'], NULL);
+SELECT letter.grant_global('select', 'public.comments', 'editor', ARRAY['body']);
 SET letter.bypass = on;
-SELECT letter.assign('public.team_members', 'user_id', NULL,
-    role_name := 'member', role_column := NULL, if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role := 'member');
 RESET letter.bypass;
 SELECT count(*) AS letter_triggers FROM pg_trigger WHERE tgname LIKE 'letter\_%';
 

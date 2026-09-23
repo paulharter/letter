@@ -49,21 +49,20 @@ INSERT INTO notes (id, project_id, body, extra) VALUES
     ('c0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000002', 'n2', 'x2'),
     ('c0000000-0000-0000-0000-000000000003', 'b0000000-0000-0000-0000-000000000003', 'n3', 'x3');
 
-SELECT letter.assign('public.team_members', 'user_id', 'public.projects',
-    role_name := NULL, role_column := 'role', if_fn := NULL);
+SELECT letter.assign('public.team_members', 'user_id', role_column := 'role', scope := 'public.projects');
 INSERT INTO team_members (user_id, project_id, role) VALUES
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'editor'),
     ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000002', 'viewer'),
     ('a0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'viewer');
 
-SELECT letter.grant('select', 'public.projects', 'editor', ARRAY['*'],              'public.projects');
-SELECT letter.grant('select', 'public.projects', 'viewer', ARRAY['name'],           'public.projects');
-SELECT letter.grant('update', 'public.projects', 'editor', ARRAY['name', 'status'], 'public.projects');
-SELECT letter.grant('delete', 'public.projects', 'editor', ARRAY['*'],              'public.projects');
-SELECT letter.grant('select', 'public.notes',    'editor', ARRAY['body'],           'public.projects');
-SELECT letter.grant('update', 'public.notes',    'editor', ARRAY['body', 'extra'],  'public.projects');
-SELECT letter.grant('insert', 'public.notes',    'editor', ARRAY['*'],              'public.projects');
-SELECT letter.grant('delete', 'public.notes',    'editor', ARRAY['*'],              'public.projects');
+SELECT letter.grant_scoped('select', 'public.projects', 'editor', ARRAY['*'], 'public.projects');
+SELECT letter.grant_scoped('select', 'public.projects', 'viewer', ARRAY['name'], 'public.projects');
+SELECT letter.grant_scoped('update', 'public.projects', 'editor', ARRAY['name', 'status'], 'public.projects');
+SELECT letter.grant_scoped('delete', 'public.projects', 'editor', ARRAY['*'], 'public.projects');
+SELECT letter.grant_scoped('select', 'public.notes', 'editor', ARRAY['body'], 'public.projects');
+SELECT letter.grant_scoped('update', 'public.notes', 'editor', ARRAY['body', 'extra'], 'public.projects');
+SELECT letter.grant_scoped('insert', 'public.notes', 'editor', ARRAY['*'], 'public.projects');
+SELECT letter.grant_scoped('delete', 'public.notes', 'editor', ARRAY['*'], 'public.projects');
 
 CREATE FUNCTION truth() RETURNS TABLE (tbl text, id uuid, a text, b text) LANGUAGE plpgsql AS $$
 BEGIN
@@ -73,7 +72,7 @@ END $$ SET letter.bypass = on;
 
 SET letter.bypass = off;
 SET letter.enforce_reads = on;
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000001';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
 \set VERBOSITY terse
 
 -- ============================================================
@@ -143,9 +142,9 @@ UPDATE notes SET body = 'n1' WHERE id = 'c0000000-0000-0000-0000-000000000001';
 
 -- ============================================================
 -- 6. UPDATE … FROM a protected table, and a sublink back to the
---    result relation. notes.project_id is not granted, so — as on
---    the read path — it is NULL wherever the statement reads it and
---    the join finds nothing; a hidden column in a sublink likewise.
+--    result relation. notes.project_id is the grant's path column
+--    (visible, 17 D16) so the join finds alice's note; extra is
+--    hidden, so the sublink on it finds nothing.
 -- ============================================================
 WITH u AS (UPDATE notes SET body = p.name FROM projects p WHERE p.id = notes.project_id RETURNING 1) SELECT count(*) AS updated FROM u;
 WITH u AS (UPDATE notes SET body = body || '?' WHERE EXISTS (SELECT 1 FROM projects p WHERE p.secret = notes.extra) RETURNING 1) SELECT count(*) AS updated FROM u;
@@ -162,13 +161,44 @@ UPDATE notes SET body = body RETURNING row_to_json(notes);
 -- ============================================================
 PREPARE u AS UPDATE notes SET body = body RETURNING body, extra;
 EXECUTE u;
-SET letter.current_user_id = 'a0000000-0000-0000-0000-000000000002';
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000002';
 EXECUTE u;
 DEALLOCATE u;
 
+-- ============================================================
+-- 9. A select-grant if in the write path (plan/20 §3): tickets are
+--    visible to editors while open. A closed ticket is not there for
+--    UPDATE or DELETE; closing one is the last thing an editor does to it.
+-- ============================================================
+SET letter.bypass = on;
+CREATE TABLE tickets (
+    id uuid PRIMARY KEY,
+    project_id uuid NOT NULL REFERENCES projects(id),
+    title TEXT,
+    state TEXT
+);
+CREATE INDEX ON tickets (project_id);
+INSERT INTO tickets VALUES
+    ('e0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 't1', 'open'),
+    ('e0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 't2', 'closed');
+SELECT letter.grant_scoped('select', 'public.tickets', 'editor', ARRAY['*'], 'public.projects', if := 'state = ''open''');
+SELECT letter.grant_scoped('update', 'public.tickets', 'editor', ARRAY['title', 'state'], 'public.projects');
+SELECT letter.grant_scoped('delete', 'public.tickets', 'editor', ARRAY['*'], 'public.projects');
+SET letter.bypass = off;
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT title, state FROM tickets ORDER BY title;
+UPDATE tickets SET title = title || '!' RETURNING title;                 -- t2 is not there
+DELETE FROM tickets WHERE state = 'closed';                              -- nothing to delete
+UPDATE tickets SET state = 'closed' WHERE title = 't1!' RETURNING title, state;   -- allowed; the row returned is already hidden
+UPDATE tickets SET title = 'again' RETURNING title;
+SET letter.bypass = on;
+SELECT title, state FROM tickets ORDER BY title;
+DROP TABLE tickets;
+SET letter.bypass = off;
+
 \set VERBOSITY default
 -- Cleanup
-RESET letter.current_user_id;
+RESET letter.user_id;
 RESET letter.enforce_reads;
 DROP FUNCTION truth();
 DROP TABLE team_members, notes, projects, users CASCADE;
