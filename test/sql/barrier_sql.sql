@@ -303,6 +303,36 @@ SET letter.current_user_id = 'carol';
 SELECT author, body FROM v_comments ORDER BY id;
 SELECT * FROM parity('v_comments', 'public.comments');
 
+-- The write path's correlated form (plan/19 W1): the row qual and the
+-- per-column tests over alias b, hops as scalar sublinks. Executable: the
+-- qual must select exactly the rows letter.read() shows.
+SELECT letter.barrier_write_sql('public.comments') AS wsql \gset
+SELECT show_sql(:'wsql') AS wsql_shown \gset
+\echo :wsql_shown
+SELECT letter.barrier_write_sql('public.reactions') AS wsql \gset
+SELECT show_sql(:'wsql') AS wsql_shown \gset
+\echo :wsql_shown
+
+CREATE FUNCTION write_qual_parity(tbl regclass, OUT by_qual bigint, OUT by_read bigint)
+LANGUAGE plpgsql AS $$
+DECLARE q text;
+BEGIN
+    q := split_part(letter.barrier_write_sql(tbl), E'\n', 1);   -- the WHERE line
+    EXECUTE format('SELECT count(*) FROM %s b %s', tbl, q) INTO by_qual;
+    EXECUTE format('SELECT count(*) FROM letter.read(%L)', letter._qualname(tbl)) INTO by_read;
+END $$;
+SET letter.current_user_id = 'alice';
+SELECT * FROM write_qual_parity('public.comments');
+SELECT * FROM write_qual_parity('public.reactions');
+SET letter.current_user_id = 'bob';
+SELECT * FROM write_qual_parity('public.comments');
+SELECT * FROM write_qual_parity('public.reactions');
+SET letter.current_user_id = 'carol';
+SELECT * FROM write_qual_parity('public.comments');
+SET letter.current_user_id = 'erin';
+SELECT * FROM write_qual_parity('public.comments');
+DROP FUNCTION write_qual_parity(regclass);
+
 -- ============================================================
 -- Fixture 8: composite primary keys (D4). Allowed on a leaf — every
 -- PK column is visible. (letter.read() shows only the first PK column,

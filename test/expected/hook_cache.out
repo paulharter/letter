@@ -36,7 +36,7 @@ SELECT letter.grant('select', 'public.notes', 'editor', ARRAY['body'],
 (1 row)
 
 CREATE FUNCTION other(sql text) RETURNS text LANGUAGE sql AS $$
-    SELECT x FROM dblink('dbname=' || current_database(), sql) AS t(x text);
+    SELECT x FROM dblink('dbname=' || current_database() || ' port=' || current_setting('port'), sql) AS t(x text);
 $$;
 SET letter.bypass = off;
 SET letter.enforce_reads = on;
@@ -138,9 +138,9 @@ EXECUTE p;
 ------+-------
 (0 rows)
 
--- bob has no role yet: the trigger denies
+-- bob has no role yet: the row is not there for him (plan/19 D1) — nothing
+-- happens, no error
 UPDATE notes SET body = 'by bob' WHERE id = 'b0000000-0000-0000-0000-000000000001';
-ERROR:  letter: UPDATE denied on "public.notes" column "body" for user "bob" — requires 'update' privilege
 SELECT other($$INSERT INTO letter.roles (role, user_id, scope_table, scope_id)
     VALUES ('editor', 'bob', 'public.projects', 'a0000000-0000-0000-0000-000000000001')
     RETURNING 'inserted'$$);

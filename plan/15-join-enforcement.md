@@ -302,6 +302,8 @@ principled answer to 2.4.4's open NULL-chain question. Not a separate epic.
 
 ## 8. Write-path evaluation: the B + targeted-substitution hybrid
 
+> **Implemented 2026-09-22 — `19-write-path-redaction.md`.** Row visibility as a security qual on the result RTE (PG applies it as a security-ordered filter), hidden-column Vars in qual/SET/RETURNING/ON CONFLICT as `CASE WHEN <test> THEN col END`. Invisible rows are skipped silently (`19` D1); whole-row references refused (`19` D3); `MERGE` still refused.
+
 Option B covers every *source* reference, but the **result relation** of an
 `UPDATE`/`DELETE`/`INSERT` cannot be swapped for a barrier subquery — the executor
 needs the real relation to write to. Protected columns of the target table therefore

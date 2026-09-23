@@ -8,7 +8,7 @@ triggers; reads will be enforced transparently by a planner hook (in progress, s
 
 **Status:** pre-release. Write enforcement, transparent read enforcement (the planner
 hook, `letter.enforce_reads`, on by default), assignments, `letter.read()` and the
-lifecycle machinery are complete and tested. PostgreSQL 16 and 17 (17 tested).
+lifecycle machinery are complete and tested on PostgreSQL 16 and 17.
 
 ## Install
 
@@ -41,6 +41,9 @@ otherwise run without it. The library warns when loaded any other way, and
   `using_path`. The final hop is inferred when it is unambiguous.
 - **Assignments** derive role rows from your own tables (a `team_members` table with a
   `user_id`, a `project_id` and a `role` column) and keep them in step through triggers.
+- **Users** are opaque strings to letter. Roles derived by assignments follow their
+  source rows; roles the application inserts directly are the application's to remove
+  — `letter.forget_user(user_id)` removes every role a user holds, of both kinds.
 - **The current user** is the session setting `letter.current_user_id`, which the
   application sets per request. Letter assumes end users never hold a raw SQL
   connection: the application layer that sets it is the enforcement perimeter.
@@ -61,6 +64,7 @@ letter.unassign(source_table regclass, user_column text, scope_table regclass DE
                 role_name text DEFAULT NULL, role_column text DEFAULT NULL)
 
 letter.visible_columns(rel regclass, pk anyelement)        -- text[]: what this user may read of that row
+letter.forget_user(user_id text)                            -- remove every role the user holds; bigint
 letter.read(table_name text, condition text DEFAULT NULL)   -- DEPRECATED: plain SELECT is the enforced read
 letter.list_grants(role text DEFAULT NULL)
 letter.user_permissions(user_id text)
@@ -107,6 +111,15 @@ privileges (`REVOKE ALL ON ALL TABLES IN SCHEMA letter FROM app`). Scope and hop
 are ordinary tables in this respect: directly readable only with a grant, and readable
 *through* a scope path exactly as far as the path's author decided.
 
+### Writes
+
+The table a statement writes to is protected the same way. Rows the user cannot see
+are not there for `UPDATE` or `DELETE` either — they are skipped, silently, so neither
+a row count nor an error reveals them. Rows the user can see but may not change are
+refused loudly by the enforcement triggers. Hidden columns read as NULL wherever a
+write reads them: in the `WHERE`, in `SET` expressions, in `RETURNING`, in
+`ON CONFLICT`. `INSERT … RETURNING` is redacted too.
+
 ## Deployment model
 
 Enforcement is a property of the connecting database role. The application connects
@@ -120,6 +133,25 @@ ALTER ROLE migrator SET letter.bypass = on;
 `letter.bypass` is superuser-settable only (`PGC_SUSET`). Superusers are **not**
 bypassed implicitly — the same `ALTER ROLE` opts them in. `letter.assign()` and
 `letter.unassign()` require bypass. `TRUNCATE` on a protected table requires bypass.
+
+## Backup and restore
+
+`pg_dump` includes letter's grants, assignments, roles and role assignments. Restore
+with letter switched off, so that nothing is re-derived or re-validated while the
+schema is half-built:
+
+```sh
+PGOPTIONS='-c letter.bypass=on -c session_replication_role=replica' psql -d newdb -f dump.sql
+```
+
+Both are needed. `pg_dump` loads letter's tables first, then your data, then the
+constraints and triggers. Without `letter.bypass` the restore stops at the first
+`COPY` into a table whose grants are already loaded ("no insert grant"). Without
+`session_replication_role = replica` — which disables ordinary triggers *and* event
+triggers — it stops at the first `ALTER TABLE … ADD CONSTRAINT`, because letter
+revalidates every grant after an `ALTER TABLE` and the foreign keys the grants depend
+on have not been added yet. The dump role should have `letter.bypass = on` by default
+(see above).
 
 ## Lifecycle
 
@@ -145,14 +177,11 @@ user's scopes through those indexes.
 
 ## Known gaps
 
-- The result relation of an UPDATE/DELETE is not redacted: `RETURNING` and the SET
-  expressions see true values (`plan/15` §8). `MERGE` on a protected table is refused.
+- `MERGE` on a protected table is refused, as is a whole-row reference to the table a
+  statement writes to (`UPDATE t … RETURNING t`).
 - `COPY table TO` is refused (use `COPY (SELECT …) TO`, which is enforced); `COPY table
   FROM` needs an insert grant; `TRUNCATE` needs bypass.
 - A foreign-key column used in a join condition must itself be granted, or it is NULL
   in the join and nothing matches.
-- Dump and restore: letter's tables are not yet registered with
-  `pg_extension_config_dump`, so `pg_dump` omits grants, roles and assignments.
-  (`plan/18` §4.)
 - Partitions and inheritance children are not protected unless granted on directly.
 - Logical replication of `letter.*` rows between databases carries the wrong OIDs.

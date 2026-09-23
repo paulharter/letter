@@ -234,7 +234,23 @@ decided.
   on `letter.assign()` itself, so `DROP EXTENSION` refuses without `CASCADE` and removes
   them (and their triggers) with it, while `pg_dump` still dumps them as ordinary objects.
 
-Open: **R1** (dump/restore, §4); **U1** — does letter want a `letter.forget_user(user_id)`
+- **D6 — all four tables are dumped; restore with triggers off.** *(Decided 2026-09-23;
+  resolves R1.)* `grants`, `assignments`, `roles` and `role_assignments` are registered
+  with `pg_extension_config_dump` (not `roles_epoch`). Regenerating roles on restore
+  would lose directly-managed ones, and the restore has to switch letter off anyway
+  (§8, 2026-09-23). The rule: **restore as a role with `letter.bypass = on` and with
+  `session_replication_role = replica`** — ordinary triggers and event triggers are
+  off, everything reloads verbatim, regclass columns re-resolve by name because every
+  `CREATE TABLE` precedes the data. Verified by a real `pg_dump | psql` round trip.
+
+- **D7 — `letter.forget_user(user_id) → bigint`.** *(Decided 2026-09-23; resolves U1.)*
+  Removes every role row for the user — assignment-derived (with their
+  `role_assignments`) and directly managed — and returns how many. No bypass needed:
+  it is data-level, the thing an application calls when it deletes a user. Roles whose
+  source rows still exist come back on the next write to those rows, so the source rows
+  go first. `lifecycle.sql` §7b.
+
+Open: ~~R1~~ (resolved → D6); ~~U1~~ (resolved → D7); **U1** — does letter want a `letter.forget_user(user_id)`
 that deletes every role row for a user id, as the one hook an application needs when it
 deletes a user? *(Proposed: yes, trivial, and it documents the responsibility.)*
 
@@ -254,10 +270,8 @@ deletes a user? *(Proposed: yes, trivial, and it documents the responsibility.)*
 
 ## 0. Status — resume here
 
-**2026-09-22: I1–I5 ✅ done; 15 regression tests green (twice).** D1–D5 decided; S1
-resolved. Still open, neither blocking: **R1** (dump/restore — `pg_extension_config_dump`
-is *not* yet called, so `pg_dump` omits letter's tables) and **U1**
-(`letter.forget_user`). **Next: `17` H3** (substitution) with
+**2026-09-23: everything in this plan is done** — I1–I5, R1 (D6, verified by a real
+`pg_dump | psql` round trip) and U1 (D7, `letter.forget_user`). **Next: `17` H3** (substitution) with
 `/implement-plan plan/17-planner-hook-implementation.md`.
 
 ### S1 — `DROP EXTENSION letter CASCADE` leaves the assignment machinery behind — ✅ RESOLVED 2026-09-22 → D5 (option a)
@@ -409,3 +423,27 @@ at the DDL). Built: `letter.enforce_truncate()` (D3); `letter.on_sql_drop()` and
 - README written from scratch (it was a title): install and preload, the API, the
   deployment model (`17` D13), identity and lifecycle (this doc), `check_health`,
   known gaps. Dump/restore is stated as open pending R1.
+
+### 2026-09-23 — R1: dump/restore, measured
+
+A `pg_dump` of a lettered database (extension, four tables, an assignment, three
+grants, one directly-managed role) restored into a fresh database three ways:
+
+- **No options:** stops at `COPY public.projects … FROM stdin` — "letter: no insert
+  grant on public.projects". `pg_dump` loads letter's config tables *before* the user
+  tables, so the D14 `COPY FROM` gate sees the grants and refuses. (Everything after is
+  psql trying to run the COPY data as SQL.)
+- **`letter.bypass = on` only:** the data loads; the very first `ALTER TABLE … ADD
+  CONSTRAINT` — a primary key — is refused by the `ddl_command_end` revalidation:
+  "the select grant … on public.tasks would no longer be valid: no foreign key path …".
+  Foreign keys come last in a dump, so every grant with a path is invalid until then.
+- **Both settings:** exit 0; grants 3, assignments 1, roles 2 (the directly-managed one
+  included), role_assignments 1, 12 letter triggers — identical to the source.
+  `check_health()` reports no errors.
+
+Also learned: `pg_dump` emits `CREATE TRIGGER` *after* all data, so the assignment
+triggers cannot re-derive roles during a restore whatever the settings; the
+"derived vs configuration" worry was moot for the dump path. And a plain `psql` session
+that only runs `SET letter.current_user_id` + `SELECT` against the restored database
+reads unredacted — D12 in the flesh: without preloading, a session that never calls a
+letter function has no hook.

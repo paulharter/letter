@@ -470,21 +470,20 @@ DELETE FROM projects WHERE name = 'Beta';
 ERROR:  letter: no delete grant on "public.projects"
 UPDATE notes SET body = 'x';
 ERROR:  letter: no update grant on "public.notes"
--- the privilege is granted: the gate passes and the trigger decides
+-- the privilege is granted: the gate passes. projects has no select grant,
+-- so no row is visible to a write either (plan/19 D1): both touch nothing
 UPDATE projects SET name = 'Alpha!' WHERE id = 'a0000000-0000-0000-0000-000000000001';
 UPDATE projects SET name = 'Beta!'  WHERE id = 'a0000000-0000-0000-0000-000000000002';
-ERROR:  letter: UPDATE denied on "public.projects" column "name" for user "alice" — requires 'update' privilege
 -- other tables in a write statement are substituted like any read
 INSERT INTO widgets SELECT 3, body FROM notes;
 ERROR:  letter: no insert grant on "public.widgets"
 UPDATE projects SET name = name WHERE id IN (SELECT project_id FROM notes);
--- the result relation itself is not substituted (plan/15 §8 gap):
--- RETURNING shows true values
+-- the result relation is redacted too (plan/19): with no select grant,
+-- RETURNING has no row to show
 UPDATE projects SET name = name WHERE id = 'a0000000-0000-0000-0000-000000000001' RETURNING secret;
  secret 
 --------
- s1
-(1 row)
+(0 rows)
 
 -- ============================================================
 -- Test 10: the ways round the planner (H6). COPY table TO would

@@ -443,12 +443,10 @@ Halt and raise, rather than work around, if any of these occur:
 
 ## 0. Status — resume here
 
-**As of 2026-09-22 (night). H0–H6 ✅ — this plan is complete.** Plan `18` complete;
-17 tests green. `letter.enforce_reads` defaults to on; `letter.read()` is deprecated
-(D3) and `letter.visible_columns()` added. Left over, none blocking: PG16 build (`11`
-5.9), the `bench` plan-shape comparison (H5.9), the result-relation gap (`15` §8),
-`MERGE`, `18` R1 (dump/restore) and U1. Possible next: `15` §8 write-path redaction,
-or R1.
+**As of 2026-09-22 (night). H0–H6 ✅ — this plan is complete**, and so is `19`
+(write-path redaction of the result relation, the `15` §8 gap). Plan `18` complete;
+18 tests green. Left over, none blocking: PG16 build (`11` 5.9), the `bench`
+plan-shape comparisons (H5.9, `19` W3), `MERGE`, `18` R1 (dump/restore) and U1.
 
 ### S6 — what an *unscoped* grant requires of the user's role row — ✅ RESOLVED 2026-09-22 → D11
 `16` §3.2 rule 5 and the barrier experiment (`bench/barrier/views_or.sql`) gate the

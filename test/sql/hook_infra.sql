@@ -264,14 +264,15 @@ INSERT INTO widgets VALUES (2, 'w2');
 -- grants, but not this privilege
 DELETE FROM projects WHERE name = 'Beta';
 UPDATE notes SET body = 'x';
--- the privilege is granted: the gate passes and the trigger decides
+-- the privilege is granted: the gate passes. projects has no select grant,
+-- so no row is visible to a write either (plan/19 D1): both touch nothing
 UPDATE projects SET name = 'Alpha!' WHERE id = 'a0000000-0000-0000-0000-000000000001';
 UPDATE projects SET name = 'Beta!'  WHERE id = 'a0000000-0000-0000-0000-000000000002';
 -- other tables in a write statement are substituted like any read
 INSERT INTO widgets SELECT 3, body FROM notes;
 UPDATE projects SET name = name WHERE id IN (SELECT project_id FROM notes);
--- the result relation itself is not substituted (plan/15 §8 gap):
--- RETURNING shows true values
+-- the result relation is redacted too (plan/19): with no select grant,
+-- RETURNING has no row to show
 UPDATE projects SET name = name WHERE id = 'a0000000-0000-0000-0000-000000000001' RETURNING secret;
 
 -- ============================================================

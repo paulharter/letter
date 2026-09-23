@@ -166,7 +166,7 @@ Extension hooks that operate on the parse tree and plan tree. Two related workst
 
 Replace `letter.read()` with invisible enforcement on normal SELECT queries.
 
-**Status 2026-09-22 (night): `17` complete (H0–H6) and `18` complete — transparent read enforcement ON by default (planner hook, D14 universal default-deny, cross-backend invalidation, D12 preload warning, ProcessUtility hook), `letter.read()` deprecated, `letter.visible_columns()` added; 17 tests green. Left: 5.9 PG16 build, H5.9 bench comparison, `15` §8 write-path redaction, MERGE, `18` R1 (dump/restore), U1.**
+**Status 2026-09-23: `17`, `18`, `19` complete, R1 (dump/restore) and U1 (`forget_user`) done, 5.9 done — the suite is green on PG 16.15 and 17.9. Left: bench plan comparisons (`17` H5.9, `19` W3), `MERGE`, a first deployment trial with `shared_preload_libraries`, housekeeping (`.gitignore`, `spike/`).**
 
 **Implementation plan: `17-planner-hook-implementation.md`** — steps H0 (spike) → H1 (infrastructure: 5.1, 5.2, 5.8) → H2 (SQL generator: 5.3, 5.5, 5.6) → H3 (substitution, nested from day one: 5.3, 5.7) → H4 (plan/cache invalidation: 5.6) → H5 (behavioural tests, flip `letter.enforce_reads` on) → H6 (`COPY TO` side door, `letter.read()` fate: 5.10). Key simplifications: convert the RTE *in place* like view expansion (no Var fix-up), and generate the barrier as SQL text parsed by the real parser. Decided 2026-09-21: unset user id → reads return zero rows (D2); composite PKs rejected at grant time for scope/hop tables, allowed on leaves (D4). `letter.read()`/`_redacted` (D3) deferred to H6.
 
@@ -179,7 +179,7 @@ Replace `letter.read()` with invisible enforcement on normal SELECT queries.
 - [x] **5.6** *(done 2026-09-22, `17` H2–H4; `hook_cache.sql`)* User's scope sets read from `letter.roles` at execution time — nothing user-specific in the rewritten tree (`16` §3.2 rule 3, §7 option a). Test asserts it. Cached plans reset when `letter.grants` changes. Injected `letter.roles` RTE must not require the caller to hold `SELECT` on it. *(Generator side done 2026-09-21, `17` H2: `build_barrier_sql` / `letter.barrier_sql()`, entry-criterion test in `barrier_sql.sql`. Ticks for 5.3/5.5/5.6 wait for H3–H4 to wire it into the hook.)*
 - [x] **5.7** Handle: SELECT *, subqueries, CTEs, joins across enforced/non-enforced tables — done 2026-09-22 (`17` H3, `hook_infra.sql`); hardening continues in H5
 - [x] **5.8** Fast early exit for queries not touching tables with grants — done 2026-09-21 (`17` H1): switch off / bypass / internal guard / RI query / utility / empty set / no protected RTE.
-- [ ] **5.9** Version compatibility testing (PG16, PG17)
+- [x] **5.9** Version compatibility testing (PG16, PG17) — 2026-09-23: full suite green on PostgreSQL 16.15 and 17.9 (Homebrew). Build with `PG_CONFIG=/opt/homebrew/opt/postgresql@16/bin/pg_config`, run the 16 server on port 5433 (`PGPORT=5433 make installcheck PG_CONFIG=…`). `hook_cache.sql`'s dblink connection now passes the server's port.
 - [x] **5.10** *(`17` D3, 2026-09-22: deprecated; `letter.visible_columns()` added for the hidden-vs-NULL distinction)* Deprecate `letter.read()` or keep as explicit alternative — if kept, it must be rebuilt on the hook's barrier-subquery machinery; it cannot survive unchanged. Once the planner hook lands, `letter.read()` is the leakier path (raw-interpolated `condition` + sink redaction = injection + predicate oracle). See `15-join-enforcement.md` §9 decision 3.
 
 ### 5b. INSERT Column-Level Enforcement via post_parse_analyze_hook

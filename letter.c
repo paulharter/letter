@@ -13,6 +13,8 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
+#include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/array.h"
@@ -147,6 +149,7 @@ PG_FUNCTION_INFO_V1(letter_on_ddl_command_end);
 PG_FUNCTION_INFO_V1(letter_enforce_truncate);
 PG_FUNCTION_INFO_V1(letter_problems);
 PG_FUNCTION_INFO_V1(letter_visible_columns);
+PG_FUNCTION_INFO_V1(letter_barrier_write_sql);
 
 void _PG_init(void);
 static void split_table_name(const char *qualified, char **schema_out, char **table_out);
@@ -163,8 +166,29 @@ static char *lookup_fk_to_table(const char *schema_name, const char *table_name,
 static void remove_assignment(const char *assignment_id, Oid source_oid, Oid scope_oid);
 static void depend_on_assign(const char *funcname, Oid assign_fn_oid);
 static char *build_barrier_sql(Oid relid);
-static char *build_barrier_sql_ext(Oid relid, bool visibility,
-								   char **pk_col_out, char **pk_type_out);
+
+/* What the write path needs of a protected result relation (plan/19 §1.3):
+ * expressions over alias "b", hops rendered as correlated sublinks. */
+typedef struct WriteRedaction
+{
+	int			natts;
+	char	   *row_qual;			/* OR of every group's row test; "false" if none */
+	char	  **col_test;			/* per attnum-1: the column's test, or NULL */
+	bool	   *always_visible;		/* per attnum-1: primary key column */
+	bool	   *dropped;
+} WriteRedaction;
+
+typedef enum BarrierMode
+{
+	BARRIER_SUBQUERY,		/* the security_barrier subquery (plan/17 §2) */
+	BARRIER_VISIBILITY,		/* letter.visible_columns() */
+	BARRIER_CORRELATED		/* plan/19: qual + column tests over "b" */
+} BarrierMode;
+
+static char *build_barrier_sql_ext(Oid relid, BarrierMode mode,
+								   char **pk_col_out, char **pk_type_out,
+								   WriteRedaction **wr_out);
+static WriteRedaction *build_write_redaction(Oid relid);
 static void install_enforcement_triggers(Oid relid);
 static void maybe_remove_enforcement_triggers(Oid relid);
 static void validate_scope_path(const char *on_table_qualified, const char *scope_qualified,
@@ -1937,10 +1961,18 @@ typedef struct HookTarget
 	Index		rti;
 } HookTarget;
 
+typedef struct WriteTarget
+{
+	Query	   *query;
+	RangeTblEntry *rte;
+	Index		rti;
+} WriteTarget;
+
 typedef struct HookContext
 {
 	HTAB	   *set;
 	List	   *targets;		/* HookTarget * */
+	List	   *write_targets;	/* WriteTarget * (plan/19) */
 } HookContext;
 
 static const char *
@@ -2016,6 +2048,16 @@ collect_walker(Node *node, void *context)
 							 errmsg("letter: no %s grant on \"%s\"",
 									privilege_name(q->commandType),
 									rel_qualified_name(rte->relid))));
+
+				/* plan/19: redacted after the source RTEs are converted */
+				{
+					WriteTarget *wt = (WriteTarget *) palloc(sizeof(WriteTarget));
+
+					wt->query = q;
+					wt->rte = rte;
+					wt->rti = rti;
+					cxt->write_targets = lappend(cxt->write_targets, wt);
+				}
 				continue;
 			}
 
@@ -2159,6 +2201,160 @@ convert_rte_in_place(HookTarget *t)
 	rte->inh = false;
 }
 
+/* ----------------------------------------------------------------
+ * Write-path redaction of the result relation (plan/19).
+ *
+ * The table a statement writes to must stay a real relation, so it
+ * gets what RLS gives its targets: a security qual (row visibility,
+ * §1.1) and, in the places the statement reads its columns — qual,
+ * SET right-hand sides, RETURNING, ON CONFLICT — each hidden-column
+ * Var becomes CASE WHEN <column test> THEN Var END (§1.2). Both
+ * come from the generator's correlated mode: expressions over "b",
+ * parsed as the WHERE of "SELECT 1 FROM t b" and repointed at the
+ * result relation's range-table index.
+ * ---------------------------------------------------------------- */
+
+/* Parse an expression over alias b into an analysed qual tree whose Vars
+ * reference range-table index 1; sublinks get requiredPerms = 0 (D6). */
+static Node *
+parse_expr_over_b(Oid relid, const char *expr)
+{
+	char	   *sql = psprintf("SELECT 1 FROM %s b WHERE %s", rel_quoted_name(relid), expr);
+	List	   *raw = pg_parse_query(sql);
+	Query	   *q;
+
+	if (list_length(raw) != 1)
+		elog(ERROR, "letter: generated expression is not a single statement");
+	q = parse_analyze_fixedparams(linitial_node(RawStmt, raw), sql, NULL, 0, NULL);
+	(void) zero_perms_walker(q->jointree->quals, NULL);
+	return q->jointree->quals;
+}
+
+typedef struct WriteMutatorContext
+{
+	Index		rti;
+	int			level;
+	Oid			relid;
+	WriteRedaction *wr;			/* NULL: no select grant — everything hidden */
+	Node	  **col_tree;		/* parsed column tests, filled lazily */
+	Query	   *cur;			/* the Query being mutated: gets hasSubLinks */
+} WriteMutatorContext;
+
+static Node *
+write_mutator(Node *node, void *context)
+{
+	WriteMutatorContext *cxt = (WriteMutatorContext *) context;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, TargetEntry) && ((TargetEntry *) node)->resjunk)
+		return node;			/* the executor's own row-locating columns */
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		int			attno = var->varattno;
+		Node	   *test;
+		CaseExpr   *c;
+		CaseWhen   *w;
+
+		if (var->varno != cxt->rti || (int) var->varlevelsup != cxt->level || attno < 0)
+			return node;
+		if (attno == 0)
+			letter_unsupported("a whole-row reference to the result relation", cxt->relid);	/* D3 */
+		if (cxt->wr != NULL &&
+			(cxt->wr->always_visible[attno - 1] || cxt->wr->dropped[attno - 1]))
+			return node;
+		if (cxt->wr == NULL || cxt->wr->col_test[attno - 1] == NULL)
+			return (Node *) makeNullConst(var->vartype, var->vartypmod, var->varcollid);
+
+		if (cxt->col_tree[attno - 1] == NULL)
+			cxt->col_tree[attno - 1] = parse_expr_over_b(cxt->relid, cxt->wr->col_test[attno - 1]);
+		test = copyObject(cxt->col_tree[attno - 1]);
+		ChangeVarNodes(test, 1, cxt->rti, 0);
+		if (cxt->level > 0)
+			IncrementVarSublevelsUp(test, cxt->level, 0);
+
+		/* The tests contain sublinks; the planner only looks for them where
+		 * the flag says so. */
+		cxt->cur->hasSubLinks = true;
+
+		w = makeNode(CaseWhen);
+		w->expr = (Expr *) test;
+		w->result = (Expr *) var;
+		w->location = -1;
+		c = makeNode(CaseExpr);
+		c->casetype = var->vartype;
+		c->casecollid = var->varcollid;
+		c->arg = NULL;
+		c->args = list_make1(w);
+		c->defresult = (Expr *) makeNullConst(var->vartype, var->vartypmod, var->varcollid);
+		c->location = -1;
+		return (Node *) c;
+	}
+	if (IsA(node, Query))
+	{
+		Query	   *result;
+		Query	   *saved = cxt->cur;
+
+		cxt->level++;
+		cxt->cur = (Query *) node;
+		result = query_tree_mutator((Query *) node, write_mutator, context, QTW_DONT_COPY_QUERY);
+		cxt->cur = saved;
+		cxt->level--;
+		return (Node *) result;
+	}
+	return expression_tree_mutator(node, write_mutator, context);
+}
+
+static void
+redact_write_target(WriteTarget *t)
+{
+	Query	   *q = t->query;
+	RangeTblEntry *rte = t->rte;
+	WriteRedaction *wr;
+	WriteMutatorContext cxt;
+
+	if (rte->securityQuals != NIL)
+		letter_unsupported("row-level security", rte->relid);
+
+	wr = build_write_redaction(rte->relid);
+
+	/* Column visibility first (§1.2, D2–D4), everywhere the statement reads
+	 * the result relation: qual, SET, RETURNING, ON CONFLICT, and any sublink
+	 * or LATERAL subquery referring back to it. (The mutator also walks the
+	 * RTEs' securityQuals, so the row qual below is added afterwards — it
+	 * must read the true scope columns.) */
+	cxt.rti = t->rti;
+	cxt.level = 0;
+	cxt.relid = rte->relid;
+	cxt.wr = wr;
+	cxt.col_tree = wr ? (Node **) palloc0(sizeof(Node *) * wr->natts) : NULL;
+	cxt.cur = q;
+	(void) query_tree_mutator(q, write_mutator, &cxt, QTW_DONT_COPY_QUERY);
+
+	/* range_table_mutator copies every RTE: take the live one. */
+	rte = rt_fetch(t->rti, q->rtable);
+
+	/* Row visibility (§1.1, D1): not for INSERT — the rows do not exist yet. */
+	if (q->commandType == CMD_UPDATE || q->commandType == CMD_DELETE)
+	{
+		Node	   *qual;
+
+		if (wr == NULL)
+			qual = (Node *) makeBoolConst(false, false);
+		else
+		{
+			qual = parse_expr_over_b(rte->relid, wr->row_qual);
+			ChangeVarNodes(qual, 1, t->rti, 0);
+			q->hasSubLinks = true;
+		}
+		rte->securityQuals = lappend(rte->securityQuals, qual);
+	}
+
+	elog(DEBUG1, "letter: planner hook: redacting result relation \"%s\"",
+		 rel_qualified_name(rte->relid));
+}
+
 static PlannedStmt *
 letter_planner(Query *parse, const char *query_string, int cursorOptions,
 			   ParamListInfo boundParams)
@@ -2181,10 +2377,13 @@ letter_planner(Query *parse, const char *query_string, int cursorOptions,
 
 			cxt.set = set;
 			cxt.targets = NIL;
+			cxt.write_targets = NIL;
 			(void) collect_walker((Node *) parse, &cxt);
 			foreach(lc, cxt.targets)
 				convert_rte_in_place((HookTarget *) lfirst(lc));
-			nsubst = list_length(cxt.targets);
+			foreach(lc, cxt.write_targets)
+				redact_write_target((WriteTarget *) lfirst(lc));
+			nsubst = list_length(cxt.targets) + list_length(cxt.write_targets);
 		}
 	}
 
@@ -2915,6 +3114,8 @@ typedef struct BarrierGroup
 	List	   *columns;		/* char *; parallel to roles, sorted by role */
 	char	   *joins;			/* rendered LEFT JOINs up the chain ('' if none) */
 	char	   *scope_expr;		/* column holding the row's scope id */
+	char	   *scope_expr_corr;	/* the same, as a scalar sublink over "b" (plan/19) */
+	bool		correlated;		/* render tests with scope_expr_corr */
 	char	   *cast_type;		/* scope table's PK type */
 	bool		used_by_columns;	/* some column's CASE tests this group */
 } BarrierGroup;
@@ -2958,6 +3159,41 @@ barrier_render_chain(BarrierGroup *g, int ordinal, Oid relid)
 	g->scope_expr = psprintf("%s.%s", prev_alias,
 							 quote_identifier(cp->hops[cp->nhops - 1].col_name));
 	g->cast_type = pstrdup(cp->scope_pk_type);
+
+	/* The same chain as a scalar sublink correlated on b (plan/19 §1.1):
+	 * (SELECT hN.<last col> FROM h1 JOIN … WHERE h1.<pk> = b.<col0>). */
+	if (cp->nhops == 1)
+		g->scope_expr_corr = g->scope_expr;
+	else
+	{
+		StringInfoData sub;
+
+		initStringInfo(&sub);
+		appendStringInfo(&sub, "(SELECT %s.%s FROM ",
+						 psprintf("g%dh%d", ordinal, cp->nhops - 1),
+						 quote_identifier(cp->hops[cp->nhops - 1].col_name));
+		for (i = 1; i < cp->nhops; i++)
+		{
+			ScopePathHop *hop = &cp->hops[i];
+			char	   *alias = psprintf("g%dh%d", ordinal, i);
+
+			if (i == 1)
+				appendStringInfo(&sub, "%s.%s %s",
+								 quote_identifier(hop->schema_name),
+								 quote_identifier(hop->table_name), alias);
+			else
+				appendStringInfo(&sub, " JOIN %s.%s %s ON %s.%s = g%dh%d.%s",
+								 quote_identifier(hop->schema_name),
+								 quote_identifier(hop->table_name), alias,
+								 alias, quote_identifier(hop->pk_col),
+								 ordinal, i - 1,
+								 quote_identifier(cp->hops[i - 1].col_name));
+		}
+		appendStringInfo(&sub, " WHERE g%dh1.%s = b.%s)", ordinal,
+						 quote_identifier(cp->hops[1].pk_col),
+						 quote_identifier(cp->hops[0].col_name));
+		g->scope_expr_corr = sub.data;
+	}
 }
 
 /* Append a group's test, restricted to the roles whose grants cover
@@ -3000,7 +3236,8 @@ barrier_append_test(StringInfo buf, BarrierGroup *g, const char *column_name)
 						 "%s IN (SELECT r.scope_id::%s FROM letter.roles r"
 						 " WHERE r.user_id = " BARRIER_USER_ID
 						 " AND r.role IN (%s) AND r.scope_table = %u)",
-						 g->scope_expr, g->cast_type, roles.data, g->scope_oid);
+						 g->correlated ? g->scope_expr_corr : g->scope_expr,
+						 g->cast_type, roles.data, g->scope_oid);
 	pfree(roles.data);
 	return true;
 }
@@ -3010,7 +3247,17 @@ barrier_append_test(StringInfo buf, BarrierGroup *g, const char *column_name)
 static char *
 build_barrier_sql(Oid relid)
 {
-	return build_barrier_sql_ext(relid, false, NULL, NULL);
+	return build_barrier_sql_ext(relid, BARRIER_SUBQUERY, NULL, NULL, NULL);
+}
+
+/* NULL if the relation has no select grants. */
+static WriteRedaction *
+build_write_redaction(Oid relid)
+{
+	WriteRedaction *wr = NULL;
+
+	(void) build_barrier_sql_ext(relid, BARRIER_CORRELATED, NULL, NULL, &wr);
+	return wr;
 }
 
 /* The same generator in "visibility" mode (letter.visible_columns): one
@@ -3019,9 +3266,13 @@ build_barrier_sql(Oid relid)
  * OR-ed rather than branched (a single indexed row, so strictness does
  * not matter). Reports the PK column and type for the caller's WHERE. */
 static char *
-build_barrier_sql_ext(Oid relid, bool visibility, char **pk_col_out, char **pk_type_out)
+build_barrier_sql_ext(Oid relid, BarrierMode mode, char **pk_col_out, char **pk_type_out,
+					  WriteRedaction **wr_out)
 {
 	MemoryContext caller_cxt = CurrentMemoryContext;
+	bool		visibility = (mode == BARRIER_VISIBILITY);
+	bool		correlated = (mode == BARRIER_CORRELATED);
+	WriteRedaction *wr = NULL;
 	StringInfoData vis;
 	int			npk = 0;
 	Relation	rel;
@@ -3096,8 +3347,18 @@ build_barrier_sql_ext(Oid relid, bool visibility, char **pk_col_out, char **pk_t
 	foreach(lc, groups)
 	{
 		g = (BarrierGroup *) lfirst(lc);
+		g->correlated = correlated;
 		if (g->scope[0] != '\0')
 			barrier_render_chain(g, ++nscoped, relid);
+	}
+
+	if (correlated)
+	{
+		wr = (WriteRedaction *) MemoryContextAllocZero(caller_cxt, sizeof(WriteRedaction));
+		wr->natts = tupdesc->natts;
+		wr->col_test = (char **) MemoryContextAllocZero(caller_cxt, sizeof(char *) * tupdesc->natts);
+		wr->always_visible = (bool *) MemoryContextAllocZero(caller_cxt, sizeof(bool) * tupdesc->natts);
+		wr->dropped = (bool *) MemoryContextAllocZero(caller_cxt, sizeof(bool) * tupdesc->natts);
 	}
 
 	/* The target list — the same in every branch, one entry per attnum. */
@@ -3116,12 +3377,16 @@ build_barrier_sql_ext(Oid relid, bool visibility, char **pk_col_out, char **pk_t
 		{
 			/* placeholder: keeps resno == attnum across the hole */
 			appendStringInfo(&cols, "NULL::integer AS %s", col);
+			if (wr)
+				wr->dropped[i] = true;
 		}
 		else if (bms_is_member(att->attnum - FirstLowInvalidHeapAttributeNumber, pkattrs))
 		{
 			/* primary key columns are always visible */
 			appendStringInfo(&cols, "b.%s", col);
 			appendStringInfo(&vis, "%s%s", vis.len ? ", " : "", col_lit);
+			if (wr)
+				wr->always_visible[i] = true;
 			npk++;
 			if (pk_col_out)
 			{
@@ -3160,6 +3425,8 @@ build_barrier_sql_ext(Oid relid, bool visibility, char **pk_col_out, char **pk_t
 								 tests.data, col, col);
 				appendStringInfo(&vis, "%sCASE WHEN %s THEN %s END",
 								 vis.len ? ",\n       " : "", tests.data, col_lit);
+				if (wr)
+					wr->col_test[i] = MemoryContextStrdup(caller_cxt, tests.data);
 			}
 			else
 				appendStringInfo(&cols, "NULL::%s AS %s",
@@ -3167,6 +3434,25 @@ build_barrier_sql_ext(Oid relid, bool visibility, char **pk_col_out, char **pk_t
 								 col);
 			pfree(tests.data);
 		}
+	}
+
+	if (correlated)
+	{
+		StringInfoData q;
+
+		initStringInfo(&q);
+		i = 0;
+		foreach(lc, groups)
+		{
+			g = (BarrierGroup *) lfirst(lc);
+			appendStringInfoString(&q, i++ > 0 ? "\n    OR " : "");
+			(void) barrier_append_test(&q, g, NULL);
+		}
+		wr->row_qual = MemoryContextStrdup(caller_cxt, q.len ? q.data : "false");
+		*wr_out = wr;
+		SPI_finish();
+		table_close(rel, AccessShareLock);
+		return NULL;
 	}
 
 	if (visibility)
@@ -3274,6 +3560,68 @@ letter_barrier_sql(PG_FUNCTION_ARGS)
 }
 
 /* ----------------------------------------------------------------
+ * letter.barrier_write_sql(regclass) → text. Debugging aid for the
+ * write path (plan/19): the row-visibility qual, then one line per
+ * column — its test, "pk" if always visible, "-" if never.
+ * ---------------------------------------------------------------- */
+Datum
+letter_barrier_write_sql(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	WriteRedaction *wr = build_write_redaction(relid);
+	Relation	rel;
+	TupleDesc	tupdesc;
+	StringInfoData out;
+	int			i;
+
+	if (wr == NULL)
+		PG_RETURN_NULL();
+
+	rel = table_open(relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+	initStringInfo(&out);
+	appendStringInfo(&out, "WHERE %s", wr->row_qual);
+	for (i = 0; i < wr->natts; i++)
+	{
+		if (wr->dropped[i])
+			continue;
+		appendStringInfo(&out, "\n%s: %s", NameStr(TupleDescAttr(tupdesc, i)->attname),
+						 wr->always_visible[i] ? "pk" : (wr->col_test[i] ? wr->col_test[i] : "-"));
+	}
+	/* one line per item: the tests themselves are formatted over several */
+	{
+		char	   *c;
+		bool		in_item = false;
+
+		for (c = out.data; *c; c++)
+		{
+			if (*c == '\n' && in_item && (c[1] == ' ' || c[1] == '\t'))
+				*c = ' ';
+			else if (*c == '\n')
+				in_item = true;
+			else
+				in_item = true;
+		}
+		/* collapse the runs of spaces that formatting left behind */
+		{
+			char	   *w = out.data;
+			bool		sp = false;
+
+			for (c = out.data; *c; c++)
+			{
+				if (*c == ' ' && sp)
+					continue;
+				sp = (*c == ' ');
+				*w++ = *c;
+			}
+			*w = '\0';
+		}
+	}
+	table_close(rel, AccessShareLock);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/* ----------------------------------------------------------------
  * letter.visible_columns(rel regclass, pk anyelement) → text[]
  * (plan/17 D3): the columns of that row the current user may read;
  * NULL if the row is not visible to them at all. The one in-band
@@ -3316,7 +3664,7 @@ letter_visible_columns(PG_FUNCTION_ARGS)
 
 	SPI_connect();
 
-	sql = build_barrier_sql_ext(relid, true, &pk_col, &pk_type);
+	sql = build_barrier_sql_ext(relid, BARRIER_VISIBILITY, &pk_col, &pk_type, NULL);
 	if (sql == NULL)
 		elog(ERROR, "letter: no barrier for protected table \"%s\"", rel_qualified_name(relid));
 

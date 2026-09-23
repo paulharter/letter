@@ -25,6 +25,19 @@ SELECT tablename FROM pg_tables
  roles_epoch
 (5 rows)
 
+-- The four data tables are registered for pg_dump (plan/18 D6); the
+-- roles_epoch signal table is not.
+SELECT e::regclass::text AS dumped
+    FROM (SELECT unnest(extconfig) AS e FROM pg_extension WHERE extname = 'letter') x
+    ORDER BY 1;
+         dumped          
+-------------------------
+ letter.assignments
+ letter.grants
+ letter.role_assignments
+ letter.roles
+(4 rows)
+
 -- Verify roles table columns
 SELECT column_name, data_type FROM information_schema.columns
     WHERE table_schema = 'letter' AND table_name = 'roles'

@@ -202,6 +202,28 @@ DROP TABLE projects CASCADE;
 SELECT * FROM state ORDER BY 1, 2, 3;
 
 -- ============================================================
+-- 7b. letter.forget_user(): every role a user holds goes — the
+--     assignment-derived ones with their assignment records, and the
+--     directly-managed ones — and nobody else's.
+-- ============================================================
+SET letter.bypass = on;
+CREATE TABLE members (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL);
+SELECT letter.assign('public.members', 'user_id', NULL, role_name := 'member');
+SET letter.bypass = off;
+INSERT INTO members (user_id) VALUES
+    ('a0000000-0000-0000-0000-000000000001'), ('a0000000-0000-0000-0000-000000000002');
+INSERT INTO letter.roles (role, user_id) VALUES
+    ('vip', 'a0000000-0000-0000-0000-000000000001'),
+    ('vip', 'a0000000-0000-0000-0000-000000000002');
+SELECT role, right(user_id, 4) AS who FROM letter.roles ORDER BY 1, 2;
+SELECT letter.forget_user('a0000000-0000-0000-0000-000000000001') AS forgotten;
+SELECT role, right(user_id, 4) AS who FROM letter.roles ORDER BY 1, 2;
+SELECT count(*) AS assignment_records_left FROM letter.role_assignments
+    WHERE user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT letter.forget_user('nobody') AS forgotten;
+DROP TABLE members;
+
+-- ============================================================
 -- 8. Hygiene: a role row with an empty user id is refused
 --    (it would match sessions with no letter.current_user_id).
 -- ============================================================

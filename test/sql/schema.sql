@@ -13,6 +13,12 @@ SELECT tablename FROM pg_tables
     WHERE schemaname = 'letter'
     ORDER BY tablename;
 
+-- The four data tables are registered for pg_dump (plan/18 D6); the
+-- roles_epoch signal table is not.
+SELECT e::regclass::text AS dumped
+    FROM (SELECT unnest(extconfig) AS e FROM pg_extension WHERE extname = 'letter') x
+    ORDER BY 1;
+
 -- Verify roles table columns
 SELECT column_name, data_type FROM information_schema.columns
     WHERE table_schema = 'letter' AND table_name = 'roles'

@@ -31,7 +31,7 @@ SELECT letter.grant('select', 'public.notes', 'editor', ARRAY['body'],
     'public.projects', NULL, NULL);
 
 CREATE FUNCTION other(sql text) RETURNS text LANGUAGE sql AS $$
-    SELECT x FROM dblink('dbname=' || current_database(), sql) AS t(x text);
+    SELECT x FROM dblink('dbname=' || current_database() || ' port=' || current_setting('port'), sql) AS t(x text);
 $$;
 
 SET letter.bypass = off;
@@ -82,7 +82,8 @@ SELECT letter.grant('update', 'public.notes', 'editor', ARRAY['body'],
 -- (that grant invalidated p; plan it again, as bob)
 SET letter.current_user_id = 'bob';
 EXECUTE p;
--- bob has no role yet: the trigger denies
+-- bob has no role yet: the row is not there for him (plan/19 D1) — nothing
+-- happens, no error
 UPDATE notes SET body = 'by bob' WHERE id = 'b0000000-0000-0000-0000-000000000001';
 
 SELECT other($$INSERT INTO letter.roles (role, user_id, scope_table, scope_id)

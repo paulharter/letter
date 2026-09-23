@@ -50,6 +50,16 @@ CREATE TABLE letter.role_assignments (
     scope_id TEXT
 );
 
+-- All four tables are configuration as far as pg_dump is concerned (plan/18
+-- D6): roles and role_assignments are normally derived by the assignment
+-- triggers, but roles the application manages directly would otherwise be
+-- lost. Restore with session_replication_role = replica and letter.bypass
+-- (README): triggers and event triggers off, everything reloaded verbatim.
+SELECT pg_catalog.pg_extension_config_dump('letter.grants', '');
+SELECT pg_catalog.pg_extension_config_dump('letter.assignments', '');
+SELECT pg_catalog.pg_extension_config_dump('letter.roles', '');
+SELECT pg_catalog.pg_extension_config_dump('letter.role_assignments', '');
+
 -- Indexes for enforcement query performance
 CREATE INDEX roles_user_id_idx ON letter.roles (user_id);
 CREATE INDEX roles_role_idx ON letter.roles (role);
@@ -170,6 +180,23 @@ CREATE FUNCTION letter.unassign(
 AS 'MODULE_PATHNAME', 'letter_unassign'
 LANGUAGE C VOLATILE;
 
+-- letter.forget_user(user_id): remove every role the user holds — the ones
+-- assignments derived and the ones the application inserted directly — and
+-- the assignment records behind them (plan/18 D7). The one call an
+-- application needs when it deletes a user. Returns the number of role rows
+-- removed. Roles derived from source rows that still exist will be derived
+-- again on the next write to those rows: delete the source rows first.
+CREATE FUNCTION letter.forget_user(p_user_id text) RETURNS bigint
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM letter.roles WHERE user_id = p_user_id;
+    DELETE FROM letter.role_assignments WHERE user_id = p_user_id;   -- cleanup trigger drops their roles
+    DELETE FROM letter.roles WHERE user_id = p_user_id;              -- the directly-managed rest
+    RETURN n;
+END $$;
+
 -- Read enforcement
 
 -- The columns of one row that the current user may read, or NULL if the
@@ -196,6 +223,12 @@ LANGUAGE C VOLATILE;
 -- protected table (NULL if the table has no select grants).
 CREATE FUNCTION letter.barrier_sql(rel regclass) RETURNS text
 AS 'MODULE_PATHNAME', 'letter_barrier_sql'
+LANGUAGE C STABLE STRICT;
+
+-- Debugging aid for the write path (plan/19): the row-visibility qual and
+-- the per-column tests applied to a protected result relation.
+CREATE FUNCTION letter.barrier_write_sql(rel regclass) RETURNS text
+AS 'MODULE_PATHNAME', 'letter_barrier_write_sql'
 LANGUAGE C STABLE STRICT;
 
 -- Health check (plan/18 I4). Severity: error (enforcement is not what the

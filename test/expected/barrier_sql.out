@@ -639,6 +639,73 @@ SELECT * FROM parity('v_comments', 'public.comments');
             0 |            0
 (1 row)
 
+-- The write path's correlated form (plan/19 W1): the row qual and the
+-- per-column tests over alias b, hops as scalar sublinks. Executable: the
+-- qual must select exactly the rows letter.read() shows.
+SELECT letter.barrier_write_sql('public.comments') AS wsql \gset
+SELECT show_sql(:'wsql') AS wsql_shown \gset
+\echo :wsql_shown
+WHERE (SELECT EXISTS (SELECT 1 FROM letter.roles r WHERE r.user_id = pg_catalog.current_setting('letter.current_user_id') AND r.role IN ('auditor') AND r.scope_table IS NULL)) OR (SELECT g1h1.project_id FROM public.tasks g1h1 WHERE g1h1.id = b.task_id) IN (SELECT r.scope_id::uuid FROM letter.roles r WHERE r.user_id = pg_catalog.current_setting('letter.current_user_id') AND r.role IN ('editor', 'viewer') AND r.scope_table = <projects>) OR b.task_id IN (SELECT r.scope_id::uuid FROM letter.roles r WHERE r.user_id = pg_catalog.current_setting('letter.current_user_id') AND r.role IN ('assignee') AND r.scope_table = <tasks>)
+id: pk
+task_id: -
+author: (SELECT EXISTS (SELECT 1 FROM letter.roles r WHERE r.user_id = pg_catalog.current_setting('letter.current_user_id') AND r.role IN ('auditor') AND r.scope_table IS NULL)) OR (SELECT g1h1.project_id FROM public.tasks g1h1 WHERE g1h1.id = b.task_id) IN (SELECT r.scope_id::uuid FROM letter.roles r WHERE r.user_id = pg_catalog.current_setting('letter.current_user_id') AND r.role IN ('viewer') AND r.scope_table = <projects>)
+body: (SELECT g1h1.project_id FROM public.tasks g1h1 WHERE g1h1.id = b.task_id) IN (SELECT r.scope_id::uuid FROM letter.roles r WHERE r.user_id = pg_catalog.current_setting('letter.current_user_id') AND r.role IN ('editor') AND r.scope_table = <projects>) OR b.task_id IN (SELECT r.scope_id::uuid FROM letter.roles r WHERE r.user_id = pg_catalog.current_setting('letter.current_user_id') AND r.role IN ('assignee') AND r.scope_table = <tasks>)
+SELECT letter.barrier_write_sql('public.reactions') AS wsql \gset
+SELECT show_sql(:'wsql') AS wsql_shown \gset
+\echo :wsql_shown
+WHERE (SELECT g1h2.project_id FROM public.comments g1h1 JOIN public.tasks g1h2 ON g1h2.id = g1h1.task_id WHERE g1h1.id = b.comment_id) IN (SELECT r.scope_id::uuid FROM letter.roles r WHERE r.user_id = pg_catalog.current_setting('letter.current_user_id') AND r.role IN ('viewer') AND r.scope_table = <projects>)
+id: pk
+comment_id: -
+emoji: (SELECT g1h2.project_id FROM public.comments g1h1 JOIN public.tasks g1h2 ON g1h2.id = g1h1.task_id WHERE g1h1.id = b.comment_id) IN (SELECT r.scope_id::uuid FROM letter.roles r WHERE r.user_id = pg_catalog.current_setting('letter.current_user_id') AND r.role IN ('viewer') AND r.scope_table = <projects>)
+CREATE FUNCTION write_qual_parity(tbl regclass, OUT by_qual bigint, OUT by_read bigint)
+LANGUAGE plpgsql AS $$
+DECLARE q text;
+BEGIN
+    q := split_part(letter.barrier_write_sql(tbl), E'\n', 1);   -- the WHERE line
+    EXECUTE format('SELECT count(*) FROM %s b %s', tbl, q) INTO by_qual;
+    EXECUTE format('SELECT count(*) FROM letter.read(%L)', letter._qualname(tbl)) INTO by_read;
+END $$;
+SET letter.current_user_id = 'alice';
+SELECT * FROM write_qual_parity('public.comments');
+ by_qual | by_read 
+---------+---------
+       2 |       2
+(1 row)
+
+SELECT * FROM write_qual_parity('public.reactions');
+ by_qual | by_read 
+---------+---------
+       1 |       1
+(1 row)
+
+SET letter.current_user_id = 'bob';
+SELECT * FROM write_qual_parity('public.comments');
+ by_qual | by_read 
+---------+---------
+       2 |       2
+(1 row)
+
+SELECT * FROM write_qual_parity('public.reactions');
+ by_qual | by_read 
+---------+---------
+       1 |       1
+(1 row)
+
+SET letter.current_user_id = 'carol';
+SELECT * FROM write_qual_parity('public.comments');
+ by_qual | by_read 
+---------+---------
+       4 |       4
+(1 row)
+
+SET letter.current_user_id = 'erin';
+SELECT * FROM write_qual_parity('public.comments');
+ by_qual | by_read 
+---------+---------
+       0 |       0
+(1 row)
+
+DROP FUNCTION write_qual_parity(regclass);
 -- ============================================================
 -- Fixture 8: composite primary keys (D4). Allowed on a leaf — every
 -- PK column is visible. (letter.read() shows only the first PK column,
