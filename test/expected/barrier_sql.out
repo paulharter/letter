@@ -693,7 +693,7 @@ SELECT * FROM parity('v_messages', 'public.messages');
 
 DROP VIEW v_messages;
 DROP TABLE messages;
-NOTICE:  letter: dropped table public.messages: removed 2 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.messages: removed 2 grant(s), 0 rule(s), 0 membership(s)
 -- The write path's correlated form (plan/19 W1): the row qual and the
 -- per-column tests over alias b, hops as scalar sublinks. Executable: the
 -- qual must select exactly the rows letter._read() shows.
@@ -884,11 +884,11 @@ SELECT letter.grant_global('select', 'public.notes', 'auditor', ARRAY['kind'],
 (1 row)
 
 SELECT role, column_name, "if" FROM letter.grants WHERE on_table = 'public.notes'::regclass ORDER BY 1, 2, 3;
-  role   | column_name |            if             
----------+-------------+---------------------------
- auditor | kind        | is_public(notes)
- editor  | *           | author = letter.user_id()
- editor  | body        | kind <> 'private'
+  role   | column_name |             if              
+---------+-------------+-----------------------------
+ auditor | kind        | public.is_public(notes.*)
+ editor  | *           | (author = letter.user_id())
+ editor  | body        | (kind <> 'private'::text)
 (3 rows)
 
 SELECT letter.read_policy('public.notes') AS sql \gset
@@ -905,7 +905,7 @@ SELECT b.id,
             THEN b.body END AS body,
        b.kind
 FROM public.notes b
-WHERE ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (is_public(b.*)))
+WHERE ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (public.is_public(b.*)))
 UNION ALL
 SELECT b.id,
        b.project_id,
@@ -914,19 +914,19 @@ SELECT b.id,
        b.kind
 FROM public.notes b
 WHERE (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id())))
-  AND NOT ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (is_public(b.*)))
+  AND NOT ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (public.is_public(b.*)))
 UNION ALL
 SELECT b.id,
        b.project_id,
        CASE WHEN (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id())))
             THEN b.author END AS author,
        b.body,
-       CASE WHEN ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (is_public(b.*)))
+       CASE WHEN ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (public.is_public(b.*)))
               OR (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id())))
             THEN b.kind END AS kind
 FROM public.notes b
 WHERE (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.kind <> 'private'::text)))
-  AND NOT ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (is_public(b.*)))
+  AND NOT ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (public.is_public(b.*)))
   AND ((b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id())))) IS NOT TRUE
 CREATE VIEW v_notes WITH (security_barrier) AS :sql;
 CREATE FUNCTION vc_parity(v regclass, tbl regclass, OUT mismatches bigint, OUT hidden_rows bigint)
@@ -989,12 +989,12 @@ SELECT * FROM vc_parity('v_notes', 'public.notes');
 SELECT letter.write_policy('public.notes') AS wsql \gset
 SELECT show_sql(:'wsql') AS wsql_shown \gset
 \echo :wsql_shown
-WHERE ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (is_public(b.*))) OR (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id()))) OR (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.kind <> 'private'::text)))
+WHERE ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (public.is_public(b.*))) OR (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id()))) OR (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.kind <> 'private'::text)))
 id: pk
 project_id: (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id()))) OR (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.kind <> 'private'::text)))
 author: (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id())))
 body: (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id()))) OR (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.kind <> 'private'::text)))
-kind: ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (is_public(b.*))) OR (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id())))
+kind: ((SELECT EXISTS (SELECT 1 FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('auditor') AND r.scope_table IS NULL)) AND (public.is_public(b.*))) OR (b.project_id IN (SELECT r.scope_id::uuid FROM letter.memberships r WHERE r.user_id = letter._user_id() AND r.role IN ('editor') AND r.scope_table = <projects>) AND ((b.author = letter.user_id())))
 CREATE FUNCTION if_qual_rows(tbl regclass) RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE n bigint;
 BEGIN
@@ -1093,14 +1093,14 @@ ERROR:  letter: the select grant to "editor" on public.notes (column "body") wou
 ALTER TABLE notes DROP COLUMN kind;
 NOTICE:  letter: removed the select grant to "editor" on public.notes (column "body"): letter: invalid if expression for select on public.notes: column "kind" does not exist
 SELECT role, column_name, "if" FROM letter.grants WHERE on_table = 'public.notes'::regclass ORDER BY 1, 2, 3;
-  role  | column_name |            if             
---------+-------------+---------------------------
- editor | *           | author = letter.user_id()
+  role  | column_name |             if              
+--------+-------------+-----------------------------
+ editor | *           | (author = letter.user_id())
 (1 row)
 
 DROP FUNCTION is_public(notes);
 DROP TABLE notes;
-NOTICE:  letter: dropped table public.notes: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.notes: removed 1 grant(s), 0 rule(s), 0 membership(s)
 -- ============================================================
 -- Fixture 11: the built-in roles (plan/22). anyone reads titles of
 -- published pages — with no user set at all; any_user reads bodies too
@@ -1272,10 +1272,10 @@ DROP FUNCTION vc_parity(regclass, regclass);
 DROP FUNCTION show_sql(text);
 DROP TABLE pages, ungranted, odd_leaf, "Odd Hop", "Odd Scope", pair_leaf, pair_scope,
     memberships, reactions, comments, tasks, projects, orgs CASCADE;
-NOTICE:  letter: dropped table public.orgs: removed 2 grant(s), 0 assignment(s), 1 role(s)
-NOTICE:  letter: dropped table public.projects: removed 8 grant(s), 0 assignment(s), 6 role(s)
-NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 assignment(s), 2 role(s)
-NOTICE:  letter: dropped table public.comments: removed 1 grant(s), 0 assignment(s), 0 role(s)
-NOTICE:  letter: dropped table public."Odd Scope": removed 1 grant(s), 0 assignment(s), 1 role(s)
-NOTICE:  letter: dropped table public.pages: removed 3 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.orgs: removed 2 grant(s), 0 rule(s), 1 membership(s)
+NOTICE:  letter: dropped table public.projects: removed 8 grant(s), 0 rule(s), 6 membership(s)
+NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 rule(s), 2 membership(s)
+NOTICE:  letter: dropped table public.comments: removed 1 grant(s), 0 rule(s), 0 membership(s)
+NOTICE:  letter: dropped table public."Odd Scope": removed 1 grant(s), 0 rule(s), 1 membership(s)
+NOTICE:  letter: dropped table public.pages: removed 3 grant(s), 0 rule(s), 0 membership(s)
 DROP EXTENSION letter CASCADE;

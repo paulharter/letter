@@ -1,4 +1,4 @@
--- letter: role-based access control extension
+-- letter: relationship-based access control extension
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION letter" to load this file. \quit
@@ -15,7 +15,7 @@ CREATE TABLE letter.memberships (
 );
 
 CREATE TABLE letter.grants (
-    privilege VARCHAR(20) NOT NULL,
+    privilege VARCHAR(20) NOT NULL CHECK (privilege IN ('select', 'insert', 'update', 'delete', 'fill')),
     on_table regclass NOT NULL,
     role VARCHAR(64) NOT NULL,
     column_name VARCHAR(64) NOT NULL,
@@ -37,6 +37,11 @@ CREATE TABLE letter.membership_rules (
     role VARCHAR(64) CHECK (role NOT IN ('anyone', 'any_user')),   -- a rule cannot confer what everyone holds (plan/22)
     role_column VARCHAR(64),
     if TEXT,
+    -- The generated functions bake these in (plan/24 B1): the source
+    -- table's key, and the FK to the scope (the key again when the table
+    -- is its own scope). Stored so that renaming either is refused.
+    pk_column VARCHAR(64) NOT NULL,
+    scope_column VARCHAR(64),
     CONSTRAINT unique_assign UNIQUE (table_name, scope_table, user_column, role, role_column),
     CONSTRAINT role_or_column CHECK (
         (role IS NOT NULL AND role_column IS NULL) OR
@@ -55,33 +60,41 @@ CREATE TABLE letter.membership_sources (
     scope_id TEXT
 );
 
--- All four tables are configuration as far as pg_dump is concerned (plan/18
--- D6): memberships and membership_sources are normally derived by the assignment
--- triggers, but roles the application manages directly would otherwise be
--- lost. Restore with session_replication_role = replica and letter.bypass
+-- The users table(s) (plan/24 B8): deleting a row of one forgets the user its
+-- key names. The key column is stored so that renaming it is refused.
+CREATE TABLE letter.user_tables (
+    table_name regclass PRIMARY KEY,
+    key_column VARCHAR(64) NOT NULL
+);
+
+-- All five tables are configuration as far as pg_dump is concerned (plan/18
+-- D6): memberships and membership_sources are normally derived by the rule
+-- triggers, but memberships the application manages directly would otherwise
+-- be lost. Restore with session_replication_role = replica and letter.bypass
 -- (README): triggers and event triggers off, everything reloaded verbatim.
 SELECT pg_catalog.pg_extension_config_dump('letter.grants', '');
 SELECT pg_catalog.pg_extension_config_dump('letter.membership_rules', '');
 SELECT pg_catalog.pg_extension_config_dump('letter.memberships', '');
 SELECT pg_catalog.pg_extension_config_dump('letter.membership_sources', '');
+SELECT pg_catalog.pg_extension_config_dump('letter.user_tables', '');
 
 -- Indexes for enforcement query performance
-CREATE INDEX roles_user_id_idx ON letter.memberships (user_id);
-CREATE INDEX roles_role_idx ON letter.memberships (role);
+CREATE INDEX memberships_user_id_idx ON letter.memberships (user_id);
+CREATE INDEX memberships_role_idx ON letter.memberships (role);
 CREATE INDEX grants_on_table_role_idx ON letter.grants (on_table, role);
 
--- Cleanup trigger: when a role_assignment is deleted, remove the associated role
+-- Cleanup trigger: when a membership source is deleted, remove the membership it derived
 CREATE FUNCTION letter._membership_cleanup() RETURNS trigger
-AS 'MODULE_PATHNAME', 'letter_role_cleanup'
+AS 'MODULE_PATHNAME', 'letter_membership_cleanup'
 LANGUAGE C;
 
 -- An empty table whose only purpose is to carry a relcache invalidation
--- (plan/17 H4): the roles trigger invalidates it, and every backend's
+-- (plan/17 H4): the memberships trigger invalidates it, and every backend's
 -- session cache follows, without invalidating the rewritten plans, which
--- depend on letter.grants but not on role rows.
+-- depend on letter.grants but not on membership rows.
 CREATE TABLE letter._membership_signal ();
 
--- Session-cache invalidation: any write to roles or grants invalidates this
+-- Session-cache invalidation: any write to memberships or grants invalidates this
 -- backend's cache at once and, through the relcache, every other backend's
 -- at commit; a grants write also invalidates every rewritten plan.
 CREATE FUNCTION letter._cache_inval() RETURNS trigger
@@ -115,6 +128,11 @@ CREATE FUNCTION letter._enforce_truncate() RETURNS trigger
 AS 'MODULE_PATHNAME', 'letter_enforce_truncate'
 LANGUAGE C;
 
+-- The users table's trigger (plan/24 B8): installed by letter.users().
+CREATE FUNCTION letter._users_forget() RETURNS trigger
+AS 'MODULE_PATHNAME', 'letter_users_forget'
+LANGUAGE C;
+
 -- Lifecycle (plan/18 §3): drop cascades, alter refuses.
 CREATE FUNCTION letter._on_sql_drop() RETURNS event_trigger
 AS 'MODULE_PATHNAME', 'letter_on_sql_drop'
@@ -127,8 +145,10 @@ LANGUAGE C;
 CREATE EVENT TRIGGER letter_sql_drop ON sql_drop
     EXECUTE FUNCTION letter._on_sql_drop();
 
+-- CREATE FUNCTION: a CREATE OR REPLACE can change a function an if names
+-- (plan/24); the handler skips letter's own generated functions.
 CREATE EVENT TRIGGER letter_ddl_command_end ON ddl_command_end
-    WHEN TAG IN ('ALTER TABLE')
+    WHEN TAG IN ('ALTER TABLE', 'ALTER FUNCTION', 'CREATE FUNCTION')
     EXECUTE FUNCTION letter._on_ddl_command_end();
 
 CREATE TRIGGER _membership_cleanup
@@ -142,6 +162,9 @@ CREATE TRIGGER _membership_cleanup
 -- renames. scope NULL = unscoped (stored as 0).
 -- Plumbing: the C entry points. The API is grant_global / grant_scoped,
 -- revoke_global / revoke_scoped, assign / unassign below.
+-- scoped: called through grant_scoped/revoke_scoped, whose scope may not
+-- be NULL — checked in C so the wrappers stay inlinable SQL functions,
+-- which add no CONTEXT line to an error (plan/24 C).
 CREATE FUNCTION letter._grant(
     privilege text,
     on_table regclass,
@@ -149,7 +172,8 @@ CREATE FUNCTION letter._grant(
     columns text[],
     scope regclass DEFAULT NULL,
     via text[] DEFAULT NULL,
-    if text DEFAULT NULL
+    if text DEFAULT NULL,
+    scoped boolean DEFAULT false
 ) RETURNS boolean
 AS 'MODULE_PATHNAME', 'letter_grant'
 LANGUAGE C VOLATILE;
@@ -159,7 +183,8 @@ CREATE FUNCTION letter._revoke(
     on_table regclass,
     role text,
     columns text[],
-    scope regclass DEFAULT NULL
+    scope regclass DEFAULT NULL,
+    scoped boolean DEFAULT false
 ) RETURNS boolean
 AS 'MODULE_PATHNAME', 'letter_revoke'
 LANGUAGE C VOLATILE;
@@ -235,15 +260,10 @@ CREATE FUNCTION letter.grant_scoped(
     via text[] DEFAULT NULL,
     if text DEFAULT NULL
 ) RETURNS boolean
-LANGUAGE plpgsql VOLATILE AS $$
-BEGIN
-    IF scope IS NULL THEN
-        RAISE EXCEPTION 'letter: grant_scoped needs a scope (use grant_global for the global scope)'
-            USING ERRCODE = 'null_value_not_allowed';
-    END IF;
-    RETURN letter._grant(privilege, on_table, role,
-                         letter._columns_or_default(privilege, columns), scope, via, "if");
-END $$;
+LANGUAGE sql VOLATILE AS $$
+    SELECT letter._grant(privilege, on_table, role,
+                         letter._columns_or_default(privilege, columns), scope, via, "if", true)
+$$;
 
 -- Revoke removes every rule under its key.
 CREATE FUNCTION letter.revoke_global(
@@ -263,14 +283,9 @@ CREATE FUNCTION letter.revoke_scoped(
     columns text[],
     scope regclass
 ) RETURNS boolean
-LANGUAGE plpgsql VOLATILE AS $$
-BEGIN
-    IF scope IS NULL THEN
-        RAISE EXCEPTION 'letter: revoke_scoped needs a scope (use revoke_global for the global scope)'
-            USING ERRCODE = 'null_value_not_allowed';
-    END IF;
-    RETURN letter._revoke(privilege, on_table, role, columns, scope);
-END $$;
+LANGUAGE sql VOLATILE AS $$
+    SELECT letter._revoke(privilege, on_table, role, columns, scope, true)
+$$;
 
 -- Memberships come from one of your tables: each row confers on the user in
 -- user_column the role (a constant, or read from role_column), in the scope
@@ -299,20 +314,33 @@ LANGUAGE sql VOLATILE AS $$
     SELECT letter._unassign(source_table, user_column, scope, role, role_column)
 $$;
 
--- letter.forget_user(user_id): remove every role the user holds — the ones
--- assignments derived and the ones the application inserted directly — and
--- the assignment records behind them (plan/18 D7). The one call an
--- application needs when it deletes a user. Returns the number of role rows
--- removed. Roles derived from source rows that still exist will be derived
--- again on the next write to those rows: delete the source rows first.
-CREATE FUNCTION letter.forget_user(p_user_id text) RETURNS bigint
+-- The users table (plan/24 B8): a row of it going — or its key changing —
+-- forgets the user the key names: every membership they hold, the ones
+-- rules derived (with their sources) and the ones an administrator inserted
+-- directly. So an identifier that is later reused starts from nothing. The
+-- trigger runs with letter's authority: the application's own delete of a
+-- user forgets them too. Configuration: a superuser's.
+CREATE FUNCTION letter.users(rel regclass) RETURNS boolean
+AS 'MODULE_PATHNAME', 'letter_users'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION letter.unusers(rel regclass) RETURNS boolean
+AS 'MODULE_PATHNAME', 'letter_unusers'
+LANGUAGE C VOLATILE;
+
+-- Plumbing: what the users trigger does (plan/18 D7, demoted from the API by
+-- plan/24 B8). Removes every membership the user holds and the membership
+-- sources behind them; returns the number of memberships removed.
+-- Memberships derived from source rows that still exist will be derived
+-- again on the next write to those rows.
+CREATE FUNCTION letter._forget_user(p_user_id text) RETURNS bigint
 LANGUAGE plpgsql VOLATILE AS $$
 DECLARE
     n bigint;
 BEGIN
     SELECT count(*) INTO n FROM letter.memberships WHERE user_id = p_user_id;
-    DELETE FROM letter.membership_sources WHERE user_id = p_user_id;   -- cleanup trigger drops their roles
-    DELETE FROM letter.memberships WHERE user_id = p_user_id;              -- the directly-managed rest
+    DELETE FROM letter.membership_sources WHERE user_id = p_user_id;   -- cleanup trigger drops their memberships
+    DELETE FROM letter.memberships WHERE user_id = p_user_id;          -- the directly-managed rest
     RETURN n;
 END $$;
 
@@ -328,13 +356,15 @@ LANGUAGE C STABLE STRICT;
 -- Plumbing, test-only (plan/20 S2): the walker-based read, kept as the
 -- parity oracle for the generator (plan/15 D5). Not an API: plain SELECT is
 -- the enforced read. Returns strings; its raw condition is evaluated against
--- true values.
+-- true values — with letter's authority, so never the application's to call
+-- (plan/24 A3).
 CREATE FUNCTION letter._read(
     table_name text,
     condition text DEFAULT NULL
 ) RETURNS SETOF jsonb
 AS 'MODULE_PATHNAME', 'letter_read'
 LANGUAGE C VOLATILE;
+REVOKE EXECUTE ON FUNCTION letter._read(text, text) FROM PUBLIC;
 
 -- The current end user, as the application set it — or NULL when unset. For
 -- application SQL and for check expressions ("only the author may edit"):
@@ -349,6 +379,13 @@ LANGUAGE C STABLE PARALLEL SAFE;
 CREATE FUNCTION letter.user_id() RETURNS text
 AS 'MODULE_PATHNAME', 'letter_user_id_fn'
 LANGUAGE C STABLE PARALLEL SAFE;
+
+-- Plumbing the planner hook puts into an INSERT … ON CONFLICT DO UPDATE on a
+-- protected table (plan/24 A4): reached when the conflicting row is one the
+-- user cannot see, it raises the refusal. VOLATILE so it is never folded away.
+CREATE FUNCTION letter._hidden_conflict(rel oid) RETURNS boolean
+AS 'MODULE_PATHNAME', 'letter_hidden_conflict'
+LANGUAGE C VOLATILE;
 
 -- Nobody, in either identity mode.
 CREATE FUNCTION letter.logout() RETURNS void
@@ -372,6 +409,11 @@ DECLARE
     claims text := pg_catalog.current_setting(setting, true);
     uid text;
 BEGIN
+    IF pg_catalog.current_setting('letter.identity') = 'token' THEN
+        RAISE EXCEPTION 'letter: letter.identity is token: the setting user_from_claims() would make is ignored'
+            USING ERRCODE = 'invalid_authorization_specification',
+                  HINT = 'In token mode the database verifies the token itself: call letter.login(token).';
+    END IF;
     IF claims IS NOT NULL AND claims <> '' THEN
         uid := (claims::jsonb) ->> claim;
     END IF;
@@ -402,12 +444,14 @@ LANGUAGE C STABLE PARALLEL SAFE;
 CREATE FUNCTION letter.read_policy(rel regclass) RETURNS text
 AS 'MODULE_PATHNAME', 'letter_barrier_sql'
 LANGUAGE C STABLE STRICT;
+REVOKE EXECUTE ON FUNCTION letter.read_policy(regclass) FROM PUBLIC;   -- configuration, not the application's (plan/24 A3)
 
 -- Debugging aid for the write path (plan/19): the row-visibility qual and
 -- the per-column tests applied to a protected result relation.
 CREATE FUNCTION letter.write_policy(rel regclass) RETURNS text
 AS 'MODULE_PATHNAME', 'letter_barrier_write_sql'
 LANGUAGE C STABLE STRICT;
+REVOKE EXECUTE ON FUNCTION letter.write_policy(regclass) FROM PUBLIC;
 
 -- Health check (plan/18 I4). Severity: error (enforcement is not what the
 -- catalogue says), warning (works, but not as intended), info.
@@ -415,6 +459,7 @@ CREATE FUNCTION letter._problems()
 RETURNS TABLE (severity text, object text, message text)
 AS 'MODULE_PATHNAME', 'letter_problems'
 LANGUAGE C VOLATILE;
+REVOKE EXECUTE ON FUNCTION letter._problems() FROM PUBLIC;
 
 CREATE FUNCTION letter._qualname(rel oid) RETURNS text
 LANGUAGE sql STABLE AS $$
@@ -429,7 +474,7 @@ LANGUAGE sql VOLATILE AS $$
         SELECT string_to_array(replace(current_setting('shared_preload_libraries'), ' ', ''), ',')
             || string_to_array(replace(current_setting('session_preload_libraries'), ' ', ''), ',') AS libs
     ),
-    assignment AS (
+    rule AS (
         SELECT a.*, left(a.id::text, 8) AS short_id,
                EXISTS (SELECT 1 FROM pg_class WHERE oid = a.table_name) AS source_exists
         FROM letter.membership_rules a
@@ -504,40 +549,54 @@ LANGUAGE sql VOLATILE AS $$
     SELECT 'warning', 'table ' || letter._qualname(tr.tgrelid), 'letter trigger ' || tr.tgname || ' is disabled'
     FROM pg_trigger tr WHERE tr.tgname LIKE 'letter\_%' AND tr.tgenabled = 'D'
     UNION ALL
-    -- assignments
-    SELECT 'error', 'assignment ' || a.id::text, 'source table no longer exists (OID ' || a.table_name::oid || ')'
-    FROM assignment a WHERE NOT a.source_exists
+    -- membership rules
+    SELECT 'error', 'rule ' || a.id::text, 'source table no longer exists (OID ' || a.table_name::oid || ')'
+    FROM rule a WHERE NOT a.source_exists
     UNION ALL
-    SELECT 'error', 'assignment on ' || letter._qualname(a.table_name),
+    SELECT 'error', 'rule on ' || letter._qualname(a.table_name),
            'scope table no longer exists (OID ' || a.scope_table::oid || ')'
-    FROM assignment a
+    FROM rule a
     WHERE a.source_exists AND a.scope_table IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = a.scope_table)
     UNION ALL
-    SELECT 'error', 'assignment on ' || letter._qualname(a.table_name), 'is missing function letter.' || f.name
-    FROM assignment a
+    SELECT 'error', 'rule on ' || letter._qualname(a.table_name), 'is missing function letter.' || f.name
+    FROM rule a
     CROSS JOIN LATERAL (VALUES ('_rule_' || a.short_id || '_upsert'), ('_rule_' || a.short_id || '_delete')) f(name)
     WHERE a.source_exists
       AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                       WHERE n.nspname = 'letter' AND p.proname = f.name)
     UNION ALL
-    SELECT 'error', 'assignment on ' || letter._qualname(a.table_name), 'is missing trigger ' || tg.name
-    FROM assignment a
+    SELECT 'error', 'rule on ' || letter._qualname(a.table_name), 'is missing trigger ' || tg.name
+    FROM rule a
     CROSS JOIN LATERAL (VALUES ('letter_rule_' || a.short_id || '_insert'), ('letter_rule_' || a.short_id || '_update'),
                                ('letter_rule_' || a.short_id || '_delete')) tg(name)
     WHERE a.source_exists
       AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = a.table_name AND tgname = tg.name)
     UNION ALL
-    -- roles
-    SELECT 'error', 'role ' || r.role || ' of ' || r.user_id,
+    -- memberships
+    SELECT 'error', 'membership ' || r.role || ' of ' || r.user_id,
            'is scoped to a table that no longer exists (OID ' || r.scope_table::oid || ')'
     FROM letter.memberships r
     WHERE r.scope_table IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = r.scope_table)
     UNION ALL
-    SELECT 'info', 'roles', count(*) || ' role row(s) are managed directly, not by an assignment'
+    SELECT 'info', 'memberships', count(*) || ' membership(s) are managed directly, not by a rule'
     FROM letter.memberships r
     WHERE NOT EXISTS (SELECT 1 FROM letter.membership_sources ra WHERE ra.role_id = r.id)
     HAVING count(*) > 0
+    UNION ALL
+    -- users tables (plan/24 B8)
+    SELECT 'error', 'users table (OID ' || u.table_name::oid || ')', 'no longer exists'
+    FROM letter.user_tables u WHERE NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = u.table_name)
+    UNION ALL
+    SELECT 'error', 'users table ' || letter._qualname(u.table_name), 'has no letter_users_forget trigger'
+    FROM letter.user_tables u
+    WHERE EXISTS (SELECT 1 FROM pg_class WHERE oid = u.table_name)
+      AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = u.table_name AND tgname = 'letter_users_forget')
+    UNION ALL
+    SELECT 'warning', 'table ' || letter._qualname(tr.tgrelid), 'has the users trigger but is not a declared users table'
+    FROM pg_trigger tr
+    WHERE tr.tgname = 'letter_users_forget'
+      AND NOT EXISTS (SELECT 1 FROM letter.user_tables u WHERE u.table_name = tr.tgrelid)
     UNION ALL
     -- validation and index coverage
     SELECT DISTINCT p.severity, p.object, p.message FROM letter._problems() p;

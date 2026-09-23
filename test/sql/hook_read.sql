@@ -287,6 +287,53 @@ SELECT letter.user_id() IS NULL AS still_unset;
 ROLLBACK;
 SET letter.bypass = on;
 
+-- ============================================================
+-- 11. FROM ONLY is honoured (plan/24 B5): an inheritance child's rows
+--     come through the parent's barrier, and ONLY leaves them out, as
+--     it does for an unprotected table.
+-- ============================================================
+CREATE TABLE tasks_archive () INHERITS (tasks);
+INSERT INTO tasks_archive (project_id, title) VALUES ('b0000000-0000-0000-0000-000000000001', 'Alpha task, archived');
+SET letter.bypass = off;
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT title FROM tasks ORDER BY title;
+SELECT title FROM ONLY tasks ORDER BY title;
+SELECT count(*) FROM ONLY tasks t JOIN projects p ON p.id = t.project_id;
+SET letter.bypass = on;
+DROP TABLE tasks_archive;
+
+-- ============================================================
+-- 12. A session's search_path cannot reach into letter's SQL (plan/24,
+--     2026-09-23): the barrier, the write path's tests and every stored
+--     if are parsed with search_path pinned to pg_catalog, and an if is
+--     stored resolved and schema-qualified. A schema named first in the
+--     application's search_path — or pg_temp — with its own is_ok() and
+--     its own "=" changes nothing. dora is a global auditor: names only.
+-- ============================================================
+CREATE FUNCTION public.is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT t <> 'Gamma' $$;
+SELECT letter.grant_global('select', 'public.projects', 'auditor', ARRAY['status'], if := 'is_ok(name)');
+SELECT letter.grant_global('update', 'public.projects', 'auditor', ARRAY['status'], if := 'is_ok(name)');
+SELECT "if" FROM letter.grants WHERE role = 'auditor' AND privilege = 'update';   -- stored resolved
+CREATE SCHEMA evil;
+CREATE FUNCTION evil.is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;
+CREATE FUNCTION evil.always(a uuid, b uuid) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;
+CREATE OPERATOR evil.= (LEFTARG = uuid, RIGHTARG = uuid, FUNCTION = evil.always);
+CREATE FUNCTION pg_temp.is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;
+SET letter.bypass = off;
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000004';
+SET search_path = evil, pg_temp, pg_catalog, public;
+SELECT name, status FROM projects ORDER BY name;                   -- Gamma's status stays hidden
+UPDATE projects SET status = 'hijacked' WHERE name = 'Gamma';     -- and unwritable
+SELECT name, status FROM projects ORDER BY name;
+SET search_path = pg_temp, public, pg_catalog;
+SELECT name, status FROM projects ORDER BY name;
+RESET search_path;
+SET letter.bypass = on;
+SELECT letter.revoke_global('select', 'public.projects', 'auditor', ARRAY['status']);
+SELECT letter.revoke_global('update', 'public.projects', 'auditor', ARRAY['status']);
+DROP SCHEMA evil CASCADE;
+DROP FUNCTION public.is_ok(text);
+
 \set VERBOSITY default
 -- Cleanup
 RESET letter.user_id;

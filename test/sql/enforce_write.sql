@@ -268,6 +268,57 @@ RESET letter.user_id;
 SELECT letter.revoke_global('insert', 'public.users', 'any_user');
 DROP TABLE guestbook;
 
+-- ============================================================
+-- Test 14: no cap on a user's memberships or grants (plan/24 B4). The
+-- session cache used to hold 256 memberships and 1024 grants and drop the
+-- rest silently — a user past the cap was refused writes the barrier
+-- permitted. Membership 300 and grant 1100 are the ones that matter.
+-- ============================================================
+CREATE TABLE rooms (id int PRIMARY KEY, name text);
+CREATE TABLE room_notes (id serial PRIMARY KEY, room_id int NOT NULL REFERENCES rooms(id), body text);
+CREATE INDEX ON room_notes (room_id);
+INSERT INTO rooms SELECT g, 'room ' || g FROM generate_series(1, 300) g;
+INSERT INTO letter.memberships (role, user_id, scope_table, scope_id)
+    SELECT 'member', 'many', 'public.rooms', g::text FROM generate_series(1, 300) g;
+SELECT letter.grant_scoped('insert', 'public.room_notes', 'member', NULL, 'public.rooms');
+SET letter.user_id = 'many';
+INSERT INTO room_notes (room_id, body) VALUES (300, 'in the last room');
+-- 1100 global roles, only the last of which may delete; 1099 select grants first
+INSERT INTO letter.memberships (role, user_id) SELECT 'r' || g, 'many' FROM generate_series(1, 1100) g;
+SELECT letter.grant_global('select', 'public.room_notes', 'r1', ARRAY['body']);    -- installs the triggers
+INSERT INTO letter.grants (privilege, on_table, role, column_name, scope)
+    SELECT 'select', 'public.room_notes'::regclass, 'r' || g, 'body', 0 FROM generate_series(2, 1099) g;
+INSERT INTO letter.grants (privilege, on_table, role, column_name, scope)
+    VALUES ('delete', 'public.room_notes'::regclass, 'r1100', '*', 0);
+DELETE FROM room_notes WHERE body = 'in the last room';
+SELECT count(*) AS notes_left FROM room_notes;
+RESET letter.user_id;
+DELETE FROM letter.memberships WHERE user_id = 'many';
+DROP TABLE room_notes, rooms;
+
+-- ============================================================
+-- Test 15: an if runs as the writer, not as the extension owner
+-- (plan/24 A1). A function the if names sees the writer's identity;
+-- before, every write evaluated it as letter's owner, a superuser.
+-- ============================================================
+CREATE ROLE letter_test_writer;
+GRANT USAGE ON SCHEMA letter TO letter_test_writer;
+GRANT SELECT, INSERT ON users TO letter_test_writer;
+CREATE FUNCTION who_writes() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT current_user::text $$;
+SELECT letter.grant_global('insert', 'public.users', 'any_user', if := 'who_writes() = ''letter_test_writer''');
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000011';
+INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000011', 'as superuser');   -- refused: not the writer named
+SET ROLE letter_test_writer;
+INSERT INTO users (id, name) VALUES ('a0000000-0000-0000-0000-000000000011', 'as the writer');  -- allowed
+RESET ROLE;
+SELECT name FROM users WHERE id = 'a0000000-0000-0000-0000-000000000011';
+RESET letter.user_id;
+SELECT letter.revoke_global('insert', 'public.users', 'any_user');
+DROP FUNCTION who_writes();
+REVOKE ALL ON users FROM letter_test_writer;
+REVOKE USAGE ON SCHEMA letter FROM letter_test_writer;
+DROP ROLE letter_test_writer;
+
 -- Clean up
 DROP TABLE team_members CASCADE;
 DROP TABLE projects CASCADE;

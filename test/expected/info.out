@@ -13,7 +13,8 @@ CREATE TABLE users (
 );
 CREATE TABLE projects (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
+    status TEXT
 );
 CREATE TABLE team_members (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -157,9 +158,8 @@ SELECT letter.user_id(), letter.user_id()::uuid = 'a0000000-0000-0000-0000-00000
 RESET letter.user_id;
 -- Clean up
 DROP TABLE team_members CASCADE;
-NOTICE:  letter: dropped table public.team_members: removed 1 grant(s), 1 assignment(s), 0 role(s)
-NOTICE:  letter: removed the update grant to "editor" on public.projects (column "status"): column "status" of public.projects no longer exists
+NOTICE:  letter: dropped table public.team_members: removed 1 grant(s), 1 rule(s), 0 membership(s)
 DROP TABLE projects CASCADE;
-NOTICE:  letter: dropped table public.projects: removed 5 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.projects: removed 6 grant(s), 0 rule(s), 0 membership(s)
 DROP TABLE users CASCADE;
 DROP EXTENSION letter CASCADE;

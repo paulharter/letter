@@ -70,23 +70,28 @@ def test_removing_needs_to_see_the_row(seeded, app, dave):
     assert dave.execute(Q).fetchall() == []
 
 
-def test_offboarding_forgets_every_membership(seeded, app, dave):
-    """Dave is on Alpha's team and in Acme; forget_user() removes both
-    kinds of membership at once — a privileged step."""
+def test_offboarding_is_deleting_the_user(seeded, app, dave):
+    """Dave is on Alpha's team, in Acme, and an administrator made him a
+    vip directly. The users table is declared (app_rules.sql), so deleting
+    his row is the whole of offboarding: the memberships his rows conferred
+    go with the rows, and the vip goes with the declaration's trigger
+    (plan/24 B8)."""
     (acme,) = truth(seeded, "SELECT id FROM orgs WHERE name = 'Acme'")[0]
     with as_user(app, ALICE):                     # org admin of Acme and owner of Alpha
         app.execute("INSERT INTO org_members (org_id, user_id) VALUES (%s, %s)", (acme, DAVE))
         app.execute("INSERT INTO team_members (project_id, user_id, role) VALUES (%s, %s, 'editor')", (ALPHA, DAVE))
+    seeded.execute("INSERT INTO letter.memberships (role, user_id) VALUES ('vip', %s)", (DAVE,))   # RBAC-style, by the admin
     assert dave.execute(Q).fetchall() == [("Alpha", 1000)]
     assert dave.execute("SELECT count(*) FROM orgs").fetchone()[0] == 1
-    assert truth(seeded, "SELECT count(*) FROM letter.memberships WHERE user_id = %s", (DAVE,))[0][0] == 2   # org_member, editor
-    assert truth(seeded, "SELECT letter.forget_user(%s)", (DAVE,))[0][0] == 2
+    assert truth(seeded, "SELECT count(*) FROM letter.memberships WHERE user_id = %s", (DAVE,))[0][0] == 3   # org_member, editor, vip
+    seeded.execute("DELETE FROM users WHERE id = %s", (DAVE,))
+    assert truth(seeded, "SELECT count(*) FROM letter.memberships WHERE user_id = %s", (DAVE,))[0][0] == 0
     assert dave.execute(Q).fetchall() == []
     assert dave.execute("SELECT count(*) FROM orgs").fetchone()[0] == 0
-    # what needs no membership stays: any signed-in user sees who exists
-    assert dave.execute("SELECT count(*) FROM users").fetchone()[0] == 4
-    # his rows in the application's tables are the application's to clean up
-    assert truth(seeded, "SELECT count(*) FROM team_members WHERE user_id = %s", (DAVE,))[0][0] == 1
+    # what needs no membership stays: any signed-in user sees who exists — one fewer now
+    assert dave.execute("SELECT count(*) FROM users").fetchone()[0] == 3
+    # the application's own tables cascaded, as its schema says
+    assert truth(seeded, "SELECT count(*) FROM team_members WHERE user_id = %s", (DAVE,))[0][0] == 0
 
 
 def test_the_app_cannot_touch_memberships(app):

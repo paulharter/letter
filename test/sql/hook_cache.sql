@@ -71,28 +71,41 @@ SELECT other($$SELECT letter.grant_scoped('select', 'public.notes', 'editor', AR
 EXECUTE p;
 
 -- ============================================================
--- 3. Another backend changes the roles: this backend's session
+-- 3. Another backend changes the memberships: this backend's session
 --    cache follows (write path), and the plan is NOT dropped — the
---    roles are read at execution time.
+--    memberships are read at execution time.
 -- ============================================================
 SELECT letter.grant_scoped('update', 'public.notes', 'editor', ARRAY['body'], 'public.projects');
--- (that grant invalidated p; plan it again, as bob)
+SELECT letter.grant_scoped('insert', 'public.notes', 'editor', NULL, 'public.projects');
+SELECT letter.grant_scoped('select', 'public.notes', 'viewer', ARRAY['body'], 'public.projects');
+-- (those grants invalidated p; plan it again, as bob)
 SET letter.user_id = 'bob';
 EXECUTE p;
--- bob has no role yet: the row is not there for him (plan/19 D1) — nothing
--- happens, no error
+-- bob has no membership yet: the row is not there for him (plan/19 D1) —
+-- nothing happens, no error
 UPDATE notes SET body = 'by bob' WHERE id = 'b0000000-0000-0000-0000-000000000001';
+-- an insert reaches the trigger and is refused — and, having been checked,
+-- bob's (empty) membership set is now in this backend's session cache. The
+-- remote changes below must reach a WARM cache, not an empty one (plan/24 A2).
+INSERT INTO notes (id, project_id, body) VALUES
+    ('b0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000001', 'bob''s');
 
 SELECT other($$INSERT INTO letter.memberships (role, user_id, scope_table, scope_id)
-    VALUES ('editor', 'bob', 'public.projects', 'a0000000-0000-0000-0000-000000000001')
-    RETURNING 'inserted'$$);
+    VALUES ('editor', 'bob', 'public.projects', 'a0000000-0000-0000-0000-000000000001'),
+           ('viewer', 'bob', 'public.projects', 'a0000000-0000-0000-0000-000000000001')
+    RETURNING role$$);
 
 SET client_min_messages = debug1;
 -- the read plan is reused (no "substituting"), and bob now sees the row
 EXECUTE p;
 RESET client_min_messages;
--- and the write path sees bob's new role without any local roles write
+-- and the write path sees bob's new membership without any local memberships write
 UPDATE notes SET body = 'by bob' WHERE id = 'b0000000-0000-0000-0000-000000000001';
+SELECT body FROM notes;
+-- the other way too: the editor membership revoked elsewhere is gone here at
+-- once — bob still sees the row as a viewer, and may no longer change it
+SELECT other($$DELETE FROM letter.memberships WHERE user_id = 'bob' AND role = 'editor' RETURNING 'deleted'$$);
+UPDATE notes SET body = 'by bob again' WHERE id = 'b0000000-0000-0000-0000-000000000001';
 SELECT body FROM notes;
 
 -- ============================================================

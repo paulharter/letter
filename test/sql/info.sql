@@ -14,7 +14,8 @@ CREATE TABLE users (
 
 CREATE TABLE projects (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
+    status TEXT
 );
 
 CREATE TABLE team_members (

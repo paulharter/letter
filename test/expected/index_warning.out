@@ -96,9 +96,9 @@ SELECT letter.grant_scoped('select', 'public.projects', 'editor', ARRAY['name'],
 
 -- Cleanup
 DROP TABLE comments CASCADE;
-NOTICE:  letter: dropped table public.comments: removed 5 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.comments: removed 5 grant(s), 0 rule(s), 0 membership(s)
 DROP TABLE tasks CASCADE;
-NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 rule(s), 0 membership(s)
 DROP TABLE projects CASCADE;
-NOTICE:  letter: dropped table public.projects: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.projects: removed 1 grant(s), 0 rule(s), 0 membership(s)
 DROP EXTENSION letter CASCADE;

@@ -50,6 +50,37 @@ SELECT letter.grant_global('insert', 'public.rows_only', 'r', ARRAY['*']);      
 SELECT count(*) AS rules FROM letter.grants WHERE on_table = 'public.rows_only'::regclass;
 DROP TABLE rows_only;
 
+-- A grant names one of the five privileges and columns that exist (plan/24
+-- B2): a misspelt privilege would be stored and never enforced, a wrong
+-- column would break the next unrelated ALTER TABLE. Nothing is stored.
+CREATE TABLE checked (id int PRIMARY KEY, body text);
+\set VERBOSITY terse
+SELECT letter.grant_global('slect', 'public.checked', 'r', ARRAY['body']);
+SELECT letter.grant_global('select', 'public.checked', 'r', ARRAY['body', 'no_such']);
+SELECT letter.grant_global('select', 'public.checked', 'r', ARRAY['body', NULL]);
+INSERT INTO letter.grants (privilege, on_table, role, column_name, scope)
+    VALUES ('slect', 'public.checked'::regclass, 'r', '*', 0);        -- the table says so too
+-- the plumbing is not STRICT, so it checks what it needs (plan/24 D)
+SELECT letter._grant(NULL, 'public.checked', 'r', ARRAY['*']);
+SELECT letter._revoke('select', 'public.checked', NULL, ARRAY['*']);
+SET letter.bypass = on;
+SELECT letter._assign(NULL, 'body');
+RESET letter.bypass;
+\set VERBOSITY default
+SELECT count(*) AS stored FROM letter.grants WHERE on_table = 'public.checked'::regclass;
+SELECT count(*) AS triggers FROM pg_trigger WHERE tgrelid = 'public.checked'::regclass;
+DROP TABLE checked;
+
+-- A scope or hop table needs a single-column primary key (plan/17 D4; no
+-- key at all refused since plan/24): a unique column is enough for the
+-- foreign key but not for letter.
+CREATE TABLE keyless (id int UNIQUE, name text);
+CREATE TABLE keyless_leaf (id int PRIMARY KEY, keyless_id int REFERENCES keyless(id), body text);
+\set VERBOSITY terse
+SELECT letter.grant_scoped('select', 'public.keyless_leaf', 'r', ARRAY['body'], 'public.keyless');
+\set VERBOSITY default
+DROP TABLE keyless_leaf, keyless;
+
 -- Tables are regclass (plan/18 D1): letter.grant_global() refuses one that does
 -- not exist (plan/17 D10) and handles names that need quoting.
 CREATE TABLE orgs (id uuid PRIMARY KEY DEFAULT gen_random_uuid());

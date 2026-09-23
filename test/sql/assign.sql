@@ -195,6 +195,25 @@ RESET letter.bypass;
 SELECT count(*) AS owner_memberships FROM letter.memberships WHERE role = 'owner';
 DROP TABLE owned_projects CASCADE;
 
+-- ============================================================
+-- Test: names that need quoting are quoted wherever assign() writes
+-- them into SQL (plan/24 B6): a role with a quote in it, and columns
+-- and a table with spaces and capitals.
+-- ============================================================
+CREATE TABLE "Odd Members" ("Row Id" uuid PRIMARY KEY DEFAULT gen_random_uuid(), "User Id" uuid NOT NULL, "Their Role" text);
+INSERT INTO "Odd Members" ("User Id", "Their Role") VALUES ('a0000000-0000-0000-0000-000000000007', 'o''brien');
+SET letter.bypass = on;
+SELECT letter.assign('public."Odd Members"', 'User Id', role_column := 'Their Role');
+SELECT letter.assign('public."Odd Members"', 'User Id', role := 'it''s');
+RESET letter.bypass;
+INSERT INTO "Odd Members" ("User Id", "Their Role") VALUES ('a0000000-0000-0000-0000-000000000008', 'd''arcy');
+SELECT role, right(user_id, 4) AS who FROM letter.memberships WHERE user_id LIKE 'a0000000-0000-0000-0000-00000000000%' ORDER BY 1, 2;
+SET letter.bypass = on;
+SELECT letter.unassign('public."Odd Members"', 'User Id', role := 'it''s');
+SELECT letter.unassign('public."Odd Members"', 'User Id', role := 'it''s');     -- gone: an error with a proper code
+RESET letter.bypass;
+DROP TABLE "Odd Members";
+
 DROP TABLE admins CASCADE;
 DROP TABLE team_members CASCADE;
 DROP TABLE projects CASCADE;

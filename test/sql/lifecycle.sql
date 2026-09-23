@@ -125,8 +125,12 @@ ALTER TABLE remarks RENAME TO comments;
 ALTER TABLE comments RENAME COLUMN body TO text;
 -- a via column
 ALTER TABLE comments RENAME COLUMN task_id TO task;
--- an assignment's user column
+-- a rule's user column
 ALTER TABLE team_members RENAME COLUMN user_id TO member_id;
+-- a rule's key column and its scope column: the generated functions name
+-- them (plan/24 B1)
+ALTER TABLE team_members RENAME COLUMN id TO tm_id;
+ALTER TABLE team_members RENAME COLUMN project_id TO proj_id;
 -- an FK on a path (explicit hop, then inferred final hop)
 ALTER TABLE comments DROP CONSTRAINT comments_task_id_fkey;
 ALTER TABLE tasks DROP CONSTRAINT tasks_project_id_fkey;
@@ -134,11 +138,14 @@ ALTER TABLE tasks DROP CONSTRAINT tasks_project_id_fkey;
 ALTER TABLE tasks ADD COLUMN alt_project uuid REFERENCES projects(id);
 -- a composite PK on a hop table
 ALTER TABLE tasks DROP CONSTRAINT tasks_pkey CASCADE, ADD PRIMARY KEY (id, project_id);
--- an assignment's scope FK
+-- no PK at all on a scope table (plan/24, 2026-09-23)
+ALTER TABLE projects DROP CONSTRAINT projects_pkey CASCADE;
+-- a rule's scope FK
 ALTER TABLE team_members DROP CONSTRAINT team_members_project_id_fkey;
 
 -- nothing changed
 SELECT attname FROM pg_attribute WHERE attrelid = 'comments'::regclass AND attnum > 0 ORDER BY attnum;
+SELECT attname FROM pg_attribute WHERE attrelid = 'team_members'::regclass AND attnum > 0 ORDER BY attnum;
 SELECT conname FROM pg_constraint WHERE conrelid IN ('comments'::regclass, 'tasks'::regclass) ORDER BY 1;
 
 -- columns can be added, and an ungranted column renamed
@@ -152,6 +159,29 @@ ALTER TABLE reactions ADD PRIMARY KEY (id);
 -- dropping an index on a path column is allowed, with the grant-time warning
 DROP INDEX comments_task_id_idx;
 CREATE INDEX comments_task_id_idx ON comments (task_id);
+
+-- ============================================================
+-- 2b. A function an if names (plan/24 B3): changing it so that the
+--     if no longer validates is refused, dropping it removes the
+--     rules that name it — grants and membership rules alike.
+-- ============================================================
+CREATE FUNCTION is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT t <> 'no' $$;
+SELECT letter.grant_scoped('update', 'public.comments', 'editor', ARRAY['body'], 'public.projects',
+                           ARRAY['task_id'], if := 'is_ok(body)');
+SET letter.bypass = on;
+SELECT letter.assign('public.auditors', 'user_id', role := 'checked', if := 'is_ok(user_id::text)');
+RESET letter.bypass;
+ALTER FUNCTION is_ok(text) STABLE;                    -- no longer allowed in an if: refused
+CREATE OR REPLACE FUNCTION is_ok(t text) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT t <> 'no' $$;   -- the same by replacement: refused
+CREATE OR REPLACE FUNCTION is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT t <> 'never' $$;   -- a new body, still IMMUTABLE: fine
+CREATE FUNCTION unrelated() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;   -- any other function: fine
+DROP FUNCTION unrelated();
+ALTER FUNCTION is_ok(text) RENAME TO is_fine;         -- the if would not resolve: refused
+SELECT provolatile, proname FROM pg_proc WHERE proname IN ('is_ok', 'is_fine');
+DROP FUNCTION is_ok(text);                            -- cascades, with a NOTICE each
+SELECT count(*) AS grants_with_if FROM letter.grants WHERE "if" IS NOT NULL;
+SELECT count(*) AS rules_with_if FROM letter.membership_rules WHERE "if" IS NOT NULL;
+SELECT * FROM state ORDER BY 1, 2, 3;
 
 -- ============================================================
 -- 3. TRUNCATE on a protected table requires bypass (18 D3).
@@ -196,26 +226,65 @@ DROP TABLE projects CASCADE;
 SELECT * FROM state ORDER BY 1, 2, 3;
 
 -- ============================================================
--- 7b. letter.forget_user(): every role a user holds goes — the
---     assignment-derived ones with their assignment records, and the
---     directly-managed ones — and nobody else's.
+-- 7b. The users table (plan/24 B8): deleting a row of it forgets that
+--     user — every membership the key holds goes, the rule-derived ones
+--     with their sources and the directly-managed ones — and nobody
+--     else's. Changing the key forgets the old one. While declared, its
+--     key column may not be renamed; a trigger dropped by hand shows in
+--     check_health().
 -- ============================================================
 SET letter.bypass = on;
-CREATE TABLE members (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL);
+CREATE TABLE members (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL);   -- no FK: a source that outlives its user
 SELECT letter.assign('public.members', 'user_id', role := 'member');
-SET letter.bypass = off;
+DELETE FROM team_members;                     -- the application's own FK housekeeping (no cascade in this schema)
+SELECT letter.users('public.users');
+SELECT letter.users('public.users');          -- again: the same declaration
+SELECT letter.users('public.members');        -- a second one is allowed
+SELECT letter.unusers('public.members');
+ALTER TABLE users RENAME COLUMN id TO uid;    -- refused while declared
+-- a user may delete themselves: the application's own route
+SELECT letter.grant_global('delete', 'public.users', 'any_user', if := 'id = letter.user_id()::uuid');
+RESET letter.bypass;
 INSERT INTO members (user_id) VALUES
     ('a0000000-0000-0000-0000-000000000001'), ('a0000000-0000-0000-0000-000000000002');
 INSERT INTO letter.memberships (role, user_id) VALUES
     ('vip', 'a0000000-0000-0000-0000-000000000001'),
     ('vip', 'a0000000-0000-0000-0000-000000000002');
 SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
-SELECT letter.forget_user('a0000000-0000-0000-0000-000000000001') AS forgotten;
+-- alice deletes herself, as the application would: the trigger forgets
+-- her with letter's authority, not hers
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
+DELETE FROM users WHERE id = 'a0000000-0000-0000-0000-000000000001';
+RESET letter.user_id;
 SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
-SELECT count(*) AS assignment_records_left FROM letter.membership_sources
+SELECT count(*) AS sources_left FROM letter.membership_sources
     WHERE user_id = 'a0000000-0000-0000-0000-000000000001';
-SELECT letter.forget_user('nobody') AS forgotten;
+-- an administrator, bypass on, gives bob a new key: the old one is
+-- forgotten (the members source row, unchanged, will derive it again on its
+-- next write) — bypass does not switch the hygiene off
+SET letter.bypass = on;
+UPDATE users SET id = 'a0000000-0000-0000-0000-000000000003' WHERE id = 'a0000000-0000-0000-0000-000000000002';
+SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
+UPDATE users SET name = 'Robert' WHERE id = 'a0000000-0000-0000-0000-000000000003';   -- the key stayed: nothing happens
+INSERT INTO letter.memberships (role, user_id) VALUES ('vip', 'a0000000-0000-0000-0000-000000000003');
+DROP TRIGGER letter_users_forget ON users;
+SELECT severity, object, message FROM letter.check_health() WHERE object LIKE 'users table%';
+SELECT letter.users('public.users');          -- puts it back
+SELECT count(*) AS users_triggers FROM pg_trigger WHERE tgname = 'letter_users_forget';
+SELECT letter.unusers('public.users');
+SELECT letter.unusers('public.users');        -- not declared: an error
+SELECT count(*) AS users_triggers FROM pg_trigger WHERE tgname = 'letter_users_forget';
+DELETE FROM users WHERE id = 'a0000000-0000-0000-0000-000000000003';   -- undeclared: nothing is forgotten
+SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
+DELETE FROM letter.memberships WHERE role = 'vip';
+-- a users table that goes: its declaration goes with it
+SELECT letter.users('public.members');
 DROP TABLE members;
+SELECT count(*) AS users_tables FROM letter.user_tables;
+-- back, for the sections below
+INSERT INTO users VALUES ('a0000000-0000-0000-0000-000000000001', 'Alice'), ('a0000000-0000-0000-0000-000000000002', 'Bob');
+SELECT letter.revoke_global('delete', 'public.users', 'any_user');
+RESET letter.bypass;
 
 -- ============================================================
 -- 8. Hygiene: a role row with an empty user id is refused

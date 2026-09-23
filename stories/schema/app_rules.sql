@@ -8,6 +8,9 @@ SELECT letter.assign('public.org_members',  'user_id',  role_column := 'role', s
 SELECT letter.assign('public.projects',     'owner_id', role := 'owner', scope := 'public.projects');   -- the author of a project owns it (D8)
 SELECT letter.assign('public.team_members', 'user_id',  role_column := 'role', scope := 'public.projects');
 
+-- The users table (plan/24 B8): deleting a user forgets every membership they hold.
+SELECT letter.users('public.users');
+
 -- Sign-up: any session with a user may insert its own users row (plan/22). Then
 -- anyone signed in can see who else exists — names only — and start an org they own.
 SELECT letter.grant_global('insert', 'public.users', 'any_user', if := 'id = letter.user_id()::uuid');

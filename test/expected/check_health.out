@@ -117,30 +117,30 @@ RESET client_min_messages;
 CREATE ROLE letter_test_admin;
 ALTER ROLE letter_test_admin SET letter.bypass = on;
 SELECT * FROM health ORDER BY 1, 2, 3;
- severity |              object               |                                                                                      message                                                                                       
-----------+-----------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- error    | assignment on public.team_members | is missing function letter._rule_<id>_delete
- error    | assignment on public.team_members | is missing trigger letter_rule_<id>_delete
- error    | grant ghost/select                | refers to a table that no longer exists (OID 99999999)
- error    | role editor of u2                 | is scoped to a table that no longer exists (OID 99999999)
- error    | table public.unguarded            | has grants but no letter_enforce_delete trigger
- error    | table public.unguarded            | has grants but no letter_enforce_insert trigger
- error    | table public.unguarded            | has grants but no letter_enforce_truncate trigger
- error    | table public.unguarded            | has grants but no letter_enforce_update trigger
- info     | letter.enforce_reads              | read enforcement is switched off
- info     | role letter_test_admin            | has letter.bypass = on by default
- info     | roles                             | 2 role row(s) are managed directly, not by an assignment
- info     | table public.projects             | has no grants: neither readable nor writable by the application (default deny)
- info     | table public.stale                | has no grants: neither readable nor writable by the application (default deny)
- info     | table public.team_members         | has no grants: neither readable nor writable by the application (default deny)
- info     | table public.users                | has no grants: neither readable nor writable by the application (default deny)
- warning  | library                           | letter is not in shared_preload_libraries or session_preload_libraries: a session that never calls a letter function has no planner hook, so read enforcement does not apply to it
- warning  | table public.stale                | has enforcement trigger letter_enforce_delete but no grants
- warning  | table public.stale                | has enforcement trigger letter_enforce_insert but no grants
- warning  | table public.stale                | has enforcement trigger letter_enforce_truncate but no grants
- warning  | table public.stale                | has enforcement trigger letter_enforce_update but no grants
- warning  | table public.tasks                | letter trigger letter_enforce_update is disabled
- warning  | table public.tasks                | scope path column "project_id" has no index — reads scoped through it will scan the whole table; CREATE INDEX ON public.tasks (project_id)
+ severity |           object            |                                                                                      message                                                                                       
+----------+-----------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ error    | grant ghost/select          | refers to a table that no longer exists (OID 99999999)
+ error    | membership editor of u2     | is scoped to a table that no longer exists (OID 99999999)
+ error    | rule on public.team_members | is missing function letter._rule_<id>_delete
+ error    | rule on public.team_members | is missing trigger letter_rule_<id>_delete
+ error    | table public.unguarded      | has grants but no letter_enforce_delete trigger
+ error    | table public.unguarded      | has grants but no letter_enforce_insert trigger
+ error    | table public.unguarded      | has grants but no letter_enforce_truncate trigger
+ error    | table public.unguarded      | has grants but no letter_enforce_update trigger
+ info     | letter.enforce_reads        | read enforcement is switched off
+ info     | memberships                 | 2 membership(s) are managed directly, not by a rule
+ info     | role letter_test_admin      | has letter.bypass = on by default
+ info     | table public.projects       | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.stale          | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.team_members   | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.users          | has no grants: neither readable nor writable by the application (default deny)
+ warning  | library                     | letter is not in shared_preload_libraries or session_preload_libraries: a session that never calls a letter function has no planner hook, so read enforcement does not apply to it
+ warning  | table public.stale          | has enforcement trigger letter_enforce_delete but no grants
+ warning  | table public.stale          | has enforcement trigger letter_enforce_insert but no grants
+ warning  | table public.stale          | has enforcement trigger letter_enforce_truncate but no grants
+ warning  | table public.stale          | has enforcement trigger letter_enforce_update but no grants
+ warning  | table public.tasks          | letter trigger letter_enforce_update is disabled
+ warning  | table public.tasks          | scope path column "project_id" has no index — reads scoped through it will scan the whole table; CREATE INDEX ON public.tasks (project_id)
 (22 rows)
 
 -- Cleanup

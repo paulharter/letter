@@ -118,9 +118,9 @@ EXECUTE p;
 (1 row)
 
 -- ============================================================
--- 3. Another backend changes the roles: this backend's session
+-- 3. Another backend changes the memberships: this backend's session
 --    cache follows (write path), and the plan is NOT dropped — the
---    roles are read at execution time.
+--    memberships are read at execution time.
 -- ============================================================
 SELECT letter.grant_scoped('update', 'public.notes', 'editor', ARRAY['body'], 'public.projects');
  grant_scoped 
@@ -128,22 +128,41 @@ SELECT letter.grant_scoped('update', 'public.notes', 'editor', ARRAY['body'], 'p
  t
 (1 row)
 
--- (that grant invalidated p; plan it again, as bob)
+SELECT letter.grant_scoped('insert', 'public.notes', 'editor', NULL, 'public.projects');
+ grant_scoped 
+--------------
+ t
+(1 row)
+
+SELECT letter.grant_scoped('select', 'public.notes', 'viewer', ARRAY['body'], 'public.projects');
+ grant_scoped 
+--------------
+ t
+(1 row)
+
+-- (those grants invalidated p; plan it again, as bob)
 SET letter.user_id = 'bob';
 EXECUTE p;
  body | extra 
 ------+-------
 (0 rows)
 
--- bob has no role yet: the row is not there for him (plan/19 D1) — nothing
--- happens, no error
+-- bob has no membership yet: the row is not there for him (plan/19 D1) —
+-- nothing happens, no error
 UPDATE notes SET body = 'by bob' WHERE id = 'b0000000-0000-0000-0000-000000000001';
+-- an insert reaches the trigger and is refused — and, having been checked,
+-- bob's (empty) membership set is now in this backend's session cache. The
+-- remote changes below must reach a WARM cache, not an empty one (plan/24 A2).
+INSERT INTO notes (id, project_id, body) VALUES
+    ('b0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000001', 'bob''s');
+ERROR:  letter: INSERT denied on "public.notes" for user "bob"
 SELECT other($$INSERT INTO letter.memberships (role, user_id, scope_table, scope_id)
-    VALUES ('editor', 'bob', 'public.projects', 'a0000000-0000-0000-0000-000000000001')
-    RETURNING 'inserted'$$);
-  other   
-----------
- inserted
+    VALUES ('editor', 'bob', 'public.projects', 'a0000000-0000-0000-0000-000000000001'),
+           ('viewer', 'bob', 'public.projects', 'a0000000-0000-0000-0000-000000000001')
+    RETURNING role$$);
+ other  
+--------
+ editor
 (1 row)
 
 SET client_min_messages = debug1;
@@ -155,8 +174,24 @@ EXECUTE p;
 (1 row)
 
 RESET client_min_messages;
--- and the write path sees bob's new role without any local roles write
+-- and the write path sees bob's new membership without any local memberships write
 UPDATE notes SET body = 'by bob' WHERE id = 'b0000000-0000-0000-0000-000000000001';
+SELECT body FROM notes;
+  body  
+--------
+ by bob
+(1 row)
+
+-- the other way too: the editor membership revoked elsewhere is gone here at
+-- once — bob still sees the row as a viewer, and may no longer change it
+SELECT other($$DELETE FROM letter.memberships WHERE user_id = 'bob' AND role = 'editor' RETURNING 'deleted'$$);
+  other  
+---------
+ deleted
+(1 row)
+
+UPDATE notes SET body = 'by bob again' WHERE id = 'b0000000-0000-0000-0000-000000000001';
+ERROR:  letter: UPDATE denied on "public.notes" column "body" for user "bob" — requires 'update' privilege
 SELECT body FROM notes;
   body  
 --------
@@ -178,6 +213,6 @@ RESET letter.user_id;
 RESET letter.enforce_reads;
 DROP FUNCTION other(text);
 DROP TABLE notes, projects CASCADE;
-NOTICE:  letter: dropped table public.projects: removed 2 grant(s), 0 assignment(s), 2 role(s)
+NOTICE:  letter: dropped table public.projects: removed 4 grant(s), 0 rule(s), 2 membership(s)
 DROP EXTENSION dblink;
 DROP EXTENSION letter CASCADE;

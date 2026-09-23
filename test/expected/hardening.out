@@ -213,9 +213,9 @@ SELECT count(*) AS users_still_intact FROM users;
 RESET letter.user_id;
 SET letter.bypass = true;
 DROP TABLE team_members CASCADE;
-NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 rule(s), 0 membership(s)
 DROP TABLE comments CASCADE;
-NOTICE:  letter: dropped table public.comments: removed 4 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.comments: removed 4 grant(s), 0 rule(s), 0 membership(s)
 DROP TABLE tasks CASCADE;
 DROP TABLE projects CASCADE;
 DROP TABLE users CASCADE;

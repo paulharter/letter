@@ -148,6 +148,30 @@ INSERT INTO notes (project_id, body)
     RETURNING body, extra;
 SELECT * FROM truth() WHERE tbl = 'notes';
 UPDATE notes SET extra = 'x1' WHERE id = 'c0000000-0000-0000-0000-000000000001';
+-- An upsert that conflicts with a row alice cannot see (Beta's note) is
+-- refused (plan/24 A4): rows she cannot see are not there for UPDATE, and
+-- the unique violation would have revealed the row anyway — whatever the
+-- statement's own WHERE says, constant or not. DO NOTHING on the same
+-- conflict is what it says. A conflict with a visible row still updates it,
+-- the statement's own WHERE included.
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'take over')
+    ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body;
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'take over')
+    ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body WHERE notes.body = 'n2';
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'take over')
+    ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body WHERE false;
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'take over')
+    ON CONFLICT (id) DO NOTHING;
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'mine')
+    ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body WHERE notes.body = 'n1'
+    RETURNING body;
+SELECT * FROM truth() WHERE tbl = 'notes';
+UPDATE notes SET body = 'n1' WHERE id = 'c0000000-0000-0000-0000-000000000001';
 
 -- ============================================================
 -- 6. UPDATE … FROM a protected table, and a sublink back to the

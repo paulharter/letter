@@ -74,12 +74,12 @@ static int	letter_jwt_leeway = 30;
  * Internal guard (plan/17-planner-hook-implementation.md H1).
  *
  * A depth counter held only around letter's OWN SPI calls — walker
- * fetches, cache population, letter.read()'s scan, catalog lookups —
+ * fetches, cache population, letter._read()'s scan, catalog lookups —
  * which must see true values. The planner hook does nothing while it
  * is > 0. Keep guarded regions narrow: a query planned inside one is
  * cached UNREWRITTEN, so user-supplied functions must never run
- * there. The one exception is letter.read()'s raw condition, which
- * is why read() resets the plan cache as it leaves the guard (D9).
+ * there. The one exception is letter._read()'s raw condition, which
+ * is why _read() resets the plan cache as it leaves the guard (D9).
  * ---------------------------------------------------------------- */
 static int	letter_guard_depth = 0;
 
@@ -110,32 +110,31 @@ health_add(List **sink, const char *severity, const char *object, const char *me
 }
 
 /* ----------------------------------------------------------------
- * Session-level cache for the current user's roles and grants.
+ * Session-level cache for the current user's memberships and grants.
  * Populated on first enforcement check, invalidated when
  * letter.user_id changes.
  * ---------------------------------------------------------------- */
 
-#define LETTER_MAX_ROLES	256
-#define LETTER_MAX_GRANTS	1024
-
+/* Every string and both arrays live in letter_cache_cxt, sized to the
+ * user (plan/24 B4): no cap, so no user is ever silently denied what the
+ * barrier permits. */
 typedef struct LetterRole
 {
-	char		role[64];
+	char	   *role;
 	Oid			scope_table;		/* InvalidOid = the global scope (has_scope false) */
-	char		scope_id[256];
+	char	   *scope_id;			/* '' if none */
 	bool		has_scope;
 } LetterRole;
 
 typedef struct LetterGrant
 {
-	char		role[64];
-	char		privilege[20];
+	char	   *role;
+	char	   *privilege;
 	Oid			on_table;
-	char		column_name[64];
+	char	   *column_name;
 	Oid			scope;				/* InvalidOid = unscoped */
-	char		via[512];	/* comma-joined FK column chain, '' if none */
-	char	   *if_expr;			/* the rule's if, NULL if none (plan/20 §3);
-								 * lives in letter_cache_cxt */
+	char	   *via;				/* comma-joined FK column chain, '' if none */
+	char	   *if_expr;			/* the rule's if, NULL if none (plan/20 §3) */
 } LetterGrant;
 
 /* Outcome of walking a grant's scope path for one row. Configuration
@@ -150,10 +149,10 @@ typedef enum ScopePathResult
 
 typedef struct LetterCache
 {
-	char		user_id[256];
-	LetterRole	roles[LETTER_MAX_ROLES];
+	char	   *user_id;			/* '' for an anonymous session */
+	LetterRole *roles;
 	int			nroles;
-	LetterGrant	grants[LETTER_MAX_GRANTS];
+	LetterGrant *grants;
 	int			ngrants;
 	bool		valid;
 } LetterCache;
@@ -163,7 +162,7 @@ static MemoryContext letter_cache_cxt = NULL;	/* strings owned by the cache */
 
 PG_FUNCTION_INFO_V1(letter_grant);
 PG_FUNCTION_INFO_V1(letter_revoke);
-PG_FUNCTION_INFO_V1(letter_role_cleanup);
+PG_FUNCTION_INFO_V1(letter_membership_cleanup);
 PG_FUNCTION_INFO_V1(letter_cache_inval);
 PG_FUNCTION_INFO_V1(letter_assign);
 PG_FUNCTION_INFO_V1(letter_unassign);
@@ -184,12 +183,15 @@ PG_FUNCTION_INFO_V1(letter_login);
 PG_FUNCTION_INFO_V1(letter_logout);
 PG_FUNCTION_INFO_V1(letter_user_id_fn);
 PG_FUNCTION_INFO_V1(letter_jwt_keys_check);
+PG_FUNCTION_INFO_V1(letter_hidden_conflict);
+PG_FUNCTION_INFO_V1(letter_users);
+PG_FUNCTION_INFO_V1(letter_unusers);
+PG_FUNCTION_INFO_V1(letter_users_forget);
 
 void _PG_init(void);
 static void split_table_name(const char *qualified, char **schema_out, char **table_out);
 static void spi_exec(const char *sql);
 static char *spi_query_text(const char *sql);
-static bool table_exists(const char *schema_name, const char *table_name);
 static char *rel_qualified_name(Oid relid);
 static char *rel_quoted_name(Oid relid);
 static void require_bypass(const char *fn);
@@ -199,7 +201,7 @@ static char *lookup_fk_to_table(const char *schema_name, const char *table_name,
 								int *nfks_out);
 static void remove_assignment(const char *assignment_id, Oid source_oid, Oid scope_oid);
 static void depend_on_assign(const char *funcname, Oid assign_fn_oid);
-static char *build_barrier_sql(Oid relid);
+static char *build_barrier_sql(Oid relid, bool from_only);
 
 /* What the write path needs of a protected result relation (plan/19 §1.3):
  * expressions over alias "b", hops rendered as correlated sublinks. */
@@ -219,7 +221,7 @@ typedef enum BarrierMode
 	BARRIER_CORRELATED		/* plan/19: qual + column tests over "b" */
 } BarrierMode;
 
-static char *build_barrier_sql_ext(Oid relid, BarrierMode mode,
+static char *build_barrier_sql_ext(Oid relid, BarrierMode mode, bool from_only,
 								   char **pk_col_out, char **pk_type_out,
 								   WriteRedaction **wr_out);
 static WriteRedaction *build_write_redaction(Oid relid);
@@ -231,6 +233,9 @@ static ScopePathResult walk_scope_path(Oid relid, Oid scope_oid, const char *via
 									   HeapTuple tuple, TupleDesc tupdesc, char **scope_id_out);
 static void populate_cache(const char *user_id);
 static void invalidate_cache(void);
+static bool column_exists(Oid relid, const char *col);
+static uint32 privilege_bit(const char *privilege);
+static Oid membership_signal_oid(void);
 
 /* The two shapes of an `if` on a write privilege (plan/20 §3). */
 typedef enum IfForm
@@ -238,13 +243,18 @@ typedef enum IfForm
 	IF_ROW,						/* over the row: evaluated on OLD and on NEW for updates */
 	IF_TRANSITION				/* names old and new: evaluated once */
 } IfForm;
-static IfForm validate_if_expr(Oid relid, const char *privilege, const char *if_text);
+static IfForm validate_if_expr(Oid relid, const char *privilege, const char *if_text, bool canonical);
+static char *canonical_if(Oid relid, const char *raw, IfForm form);
+static void if_invalid(Oid relid, const char *privilege, const char *why_row, const char *why_transition) pg_attribute_noreturn();
+static int	pin_search_path(void);
+static void unpin_search_path(int nest);
 static void require_superuser(const char *fn);
 static void token_user_xact_callback(XactEvent event, void *arg);
 static void token_user_subxact_callback(SubXactEvent event, SubTransactionId mySubid, SubTransactionId parentSubid, void *arg);
 static const struct config_enum_entry identity_options[];
 static bool is_builtin_role(const char *role);
-static char *deparse_if_as(Oid relid, const char *if_expr, const char *out_alias, bool qualify);
+static char *deparse_if_as(Oid relid, const char *if_expr, const char *out_alias,
+						   bool qualify, bool forceprefix, bool pinned);
 static bool try_in_subxact(void (*fn) (void *), void *arg, char **errmsg_out);
 static void letter_replan_assign_hook(bool newval, void *extra);
 static void protected_set_xact_callback(XactEvent event, void *arg);
@@ -404,6 +414,32 @@ typedef struct LetterGuard
 	int			save_ctx;
 } LetterGuard;
 
+/* ----------------------------------------------------------------
+ * Parse-time search_path (plan/24, Paul 2026-09-23). Letter's generated
+ * SQL — the barrier, the write path's tests — and every stored if are
+ * parsed with search_path pinned to pg_catalog, in the application's
+ * session: an unqualified name in them is pg_catalog's and nothing the
+ * session's own search_path (pg_temp included) can shadow. So the
+ * generator qualifies what is not pg_catalog's, and an if is stored in
+ * its resolved, schema-qualified form (canonical_if), resolved once, in
+ * the author's search_path, when the rule is made. pg_dump's trick.
+ * ---------------------------------------------------------------- */
+static int
+pin_search_path(void)
+{
+	int			nest = NewGUCNestLevel();
+
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	return nest;
+}
+
+static void
+unpin_search_path(int nest)
+{
+	AtEOXact_GUC(true, nest);
+}
+
 static void
 guard_enter(LetterGuard *g)
 {
@@ -464,20 +500,21 @@ guarded_spi_execute_with_args(const char *sql, int nargs, Oid *argtypes,
 }
 
 /* ----------------------------------------------------------------
- * letter.grant()
+ * letter._grant() — the C half of grant_global / grant_scoped
  * ---------------------------------------------------------------- */
 Datum
 letter_grant(PG_FUNCTION_ARGS)
 {
-	text	   *privilege = PG_GETARG_TEXT_PP(0);
-	Oid			on_table = PG_GETARG_OID(1);
-	text	   *role = PG_GETARG_TEXT_PP(2);
-	ArrayType  *columns = PG_GETARG_ARRAYTYPE_P(3);
-	Oid			scope = PG_ARGISNULL(4) ? InvalidOid : PG_GETARG_OID(4);
+	text	   *privilege;
+	Oid			on_table;
+	text	   *role;
+	ArrayType  *columns;
+	Oid			scope;
 	bool		via_null = PG_ARGISNULL(5);
 	ArrayType  *via = via_null ? NULL : PG_GETARG_ARRAYTYPE_P(5);
-	bool		check_fn_null = PG_ARGISNULL(6);
-	text	   *check_fn = check_fn_null ? NULL : PG_GETARG_TEXT_PP(6);
+	bool		if_null = PG_ARGISNULL(6);
+	text	   *if_expr = if_null ? NULL : PG_GETARG_TEXT_PP(6);
+	bool		scoped = PG_ARGISNULL(7) ? false : PG_GETARG_BOOL(7);
 
 	Datum	   *col_datums;
 	bool	   *col_nulls;
@@ -488,6 +525,22 @@ letter_grant(PG_FUNCTION_ARGS)
 	const char *scope_name;
 
 	require_superuser("letter.grant_global/grant_scoped");
+	/* Not STRICT: scope, via and if are optional. The rest is required. */
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(3))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("letter: privilege, on_table, role and columns are required")));
+	/* grant_scoped's NULL-scope check lives here so that the wrapper can be
+	 * an inlined SQL function, which adds no CONTEXT line (plan/24 C). */
+	if (scoped && PG_ARGISNULL(4))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("letter: grant_scoped needs a scope (use grant_global for the global scope)")));
+	privilege = PG_GETARG_TEXT_PP(0);
+	on_table = PG_GETARG_OID(1);
+	role = PG_GETARG_TEXT_PP(2);
+	columns = PG_GETARG_ARRAYTYPE_P(3);
+	scope = PG_ARGISNULL(4) ? InvalidOid : PG_GETARG_OID(4);
 	if (OidIsValid(scope) && is_builtin_role(text_to_cstring(role)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -501,6 +554,29 @@ letter_grant(PG_FUNCTION_ARGS)
 	on_table_name = rel_qualified_name(on_table);
 	scope_name = OidIsValid(scope) ? rel_qualified_name(scope) : "";
 
+	/* The privilege is one of five, and every column exists (plan/24 B2):
+	 * a misspelt privilege would be stored and never enforced, a wrong
+	 * column would break the next unrelated ALTER TABLE. */
+	if (privilege_bit(text_to_cstring(privilege)) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("letter: \"%s\" is not a privilege", text_to_cstring(privilege)),
+				 errhint("The privileges are select, insert, update, delete and fill.")));
+	for (i = 0; i < col_count; i++)
+	{
+		const char *col;
+
+		if (col_nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("letter: columns contains NULL")));
+		col = TextDatumGetCString(col_datums[i]);
+		if (strcmp(col, "*") != 0 && !column_exists(on_table, col))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("letter: column \"%s\" of %s does not exist", col, on_table_name)));
+	}
+
 	SPI_connect();
 
 	/* Validate the scope path (FK chain) for scoped grants — every hop
@@ -509,9 +585,16 @@ letter_grant(PG_FUNCTION_ARGS)
 	validate_scope_path(on_table_name, scope_name,
 						via_null ? NULL : via,
 						strcmp(text_to_cstring(privilege), "select") == 0);
-	if (!check_fn_null)
-		(void) validate_if_expr(on_table, text_to_cstring(privilege),
-								text_to_cstring(check_fn));
+	if (!if_null)
+	{
+		/* Resolved now, in the author's search_path; stored qualified. */
+		IfForm		form = validate_if_expr(on_table, text_to_cstring(privilege),
+											text_to_cstring(if_expr), false);
+		char	   *canonical = canonical_if(on_table, text_to_cstring(if_expr), form);
+
+		(void) validate_if_expr(on_table, text_to_cstring(privilege), canonical, true);
+		if_expr = cstring_to_text(canonical);
+	}
 
 	for (i = 0; i < col_count; i++)
 	{
@@ -531,7 +614,7 @@ letter_grant(PG_FUNCTION_ARGS)
 		values[3] = PointerGetDatum(col_name);
 		values[4] = ObjectIdGetDatum(scope);
 		values[5] = via_null ? (Datum) 0 : PointerGetDatum(via);
-		values[6] = check_fn_null ? (Datum) 0 : PointerGetDatum(check_fn);
+		values[6] = if_null ? (Datum) 0 : PointerGetDatum(if_expr);
 
 		nulls[0] = ' ';
 		nulls[1] = ' ';
@@ -539,7 +622,7 @@ letter_grant(PG_FUNCTION_ARGS)
 		nulls[3] = ' ';
 		nulls[4] = ' ';
 		nulls[5] = via_null ? 'n' : ' ';
-		nulls[6] = check_fn_null ? 'n' : ' ';
+		nulls[6] = if_null ? 'n' : ' ';
 
 		ret = SPI_execute_with_args(
 			"INSERT INTO letter.grants (privilege, on_table, role, column_name, scope, via, if) "
@@ -591,7 +674,7 @@ letter_grant(PG_FUNCTION_ARGS)
 }
 
 /* ----------------------------------------------------------------
- * letter.revoke()
+ * letter._revoke() — the C half of revoke_global / revoke_scoped
  * ---------------------------------------------------------------- */
 Datum
 letter_revoke(PG_FUNCTION_ARGS)
@@ -608,6 +691,7 @@ letter_revoke(PG_FUNCTION_ARGS)
 	int			i;
 	bool		wildcard = false;
 	int			ret;
+	bool		scoped = PG_ARGISNULL(5) ? false : PG_GETARG_BOOL(5);
 
 	require_superuser("letter.revoke_global/revoke_scoped");
 	/* Not STRICT: a NULL scope means unscoped. Everything else is required. */
@@ -615,6 +699,10 @@ letter_revoke(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("letter: privilege, on_table, role and columns are required")));
+	if (scoped && PG_ARGISNULL(4))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("letter: revoke_scoped needs a scope (use revoke_global for the global scope)")));
 	privilege = PG_GETARG_TEXT_PP(0);
 	on_table = PG_GETARG_OID(1);
 	role = PG_GETARG_TEXT_PP(2);
@@ -702,7 +790,7 @@ letter_revoke(PG_FUNCTION_ARGS)
  * letter._membership_cleanup() - trigger
  * ---------------------------------------------------------------- */
 Datum
-letter_role_cleanup(PG_FUNCTION_ARGS)
+letter_membership_cleanup(PG_FUNCTION_ARGS)
 {
 	TriggerData *trigdata = (TriggerData *) fcinfo->context;
 	TupleDesc	tupdesc;
@@ -780,28 +868,6 @@ spi_query_text(const char *sql)
 
 	result = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 	return result ? pstrdup(result) : NULL;
-}
-
-/* ----------------------------------------------------------------
- * Helper: check whether a table exists.
- * Must be called within an SPI connection.
- * ---------------------------------------------------------------- */
-static bool
-table_exists(const char *schema_name, const char *table_name)
-{
-	Oid			argtypes[2] = {TEXTOID, TEXTOID};
-	Datum		values[2];
-	int			ret;
-
-	values[0] = CStringGetTextDatum(schema_name);
-	values[1] = CStringGetTextDatum(table_name);
-	ret = guarded_spi_execute_with_args(
-		"SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-		"WHERE n.nspname = $1 AND c.relname = $2 LIMIT 1",
-		2, argtypes, values, NULL, true, 1);
-	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "letter: table existence check failed");
-	return SPI_processed > 0;
 }
 
 /* ----------------------------------------------------------------
@@ -927,11 +993,10 @@ lookup_pk_column(const char *schema_name, const char *table_name,
 }
 
 /* ----------------------------------------------------------------
- * Helper: refuse a composite primary key on a scope or hop table
- * (plan/17 D4). The walker, the barrier generator and
+ * Helper: a scope or hop table has a single-column primary key
+ * (plan/17 D4): the walker, the barrier generator and
  * letter.memberships.scope_id all identify such a row by ONE key column.
- * Leaf tables may have composite keys. A table with no primary key
- * is left for scope-path resolution to report.
+ * Leaf tables may have composite keys, or none.
  * Must be called within an SPI connection.
  * ---------------------------------------------------------------- */
 static void
@@ -952,8 +1017,13 @@ reject_composite_pk(const char *schema_name, const char *table_name)
 		2, argtypes, values, NULL, true, 1);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "letter: primary key lookup failed on %s.%s", schema_name, table_name);
+	/* No key at all is refused too (plan/24, 2026-09-23): before, it was
+	 * left for the first read to fail on. */
 	if (SPI_processed == 0)
-		return;
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("letter: %s.%s has no primary key — a scope table or a table along a scope path needs one",
+						schema_name, table_name)));
 
 	ncols = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 	if (ncols != NULL && atoi(ncols) > 1)
@@ -1028,9 +1098,7 @@ warn_if_unindexed(const char *schema_name, const char *table_name, const char *c
  * For select grants (warn_unindexed) it also warns about path columns
  * with no index — see warn_if_unindexed.
  *
- * Silently skips what cannot be checked yet: the protected table or
- * scope table not existing (grants may be declared before their
- * tables are created).
+ * Both tables exist: a grant names them as regclass (plan/17 D10).
  *
  * Must be called within an SPI connection.
  * ---------------------------------------------------------------- */
@@ -1071,15 +1139,18 @@ validate_scope_path(const char *on_table_qualified, const char *scope_qualified,
 		char	   *target;
 
 		if (path_nulls[i])
-			elog(ERROR, "letter: via contains NULL at position %d", i);
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("letter: via contains NULL at position %d", i)));
 
 		col_name = text_to_cstring(DatumGetTextPP(path_datums[i]));
 
 		target = lookup_fk_target(schema_name, table_name, col_name);
 		if (target == NULL)
-			elog(ERROR,
-				 "letter: via column \"%s\" is not a foreign key on %s.%s",
-				 col_name, schema_name, table_name);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("letter: via column \"%s\" is not a foreign key on %s.%s",
+							col_name, schema_name, table_name)));
 
 		if (warn_unindexed)
 			warn_if_unindexed(schema_name, table_name, col_name);
@@ -1098,9 +1169,7 @@ validate_scope_path(const char *on_table_qualified, const char *scope_qualified,
 		return;
 	}
 
-	/* Final hop must be inferable. Skip if the scope table doesn't exist yet. */
-	if (!table_exists(scope_schema, scope_name))
-		return;
+	/* Final hop must be inferable. */
 	reject_composite_pk(scope_schema, scope_name);
 
 	{
@@ -1315,7 +1384,7 @@ require_bypass(const char *fn)
 	if (!letter_bypass)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("%s requires letter.bypass = on", fn),
+				 errmsg("letter: %s requires letter.bypass = on", fn),
 				 errhint("Run it as an administrative role with letter.bypass enabled.")));
 }
 
@@ -1384,22 +1453,22 @@ sanitize_id(const char *uuid_str)
  * letter.assign(source_table, user_column, scope_table,
  *               role, role_column, if_fn)
  *
- * Creates an assignment rule and installs triggers on the source
+ * Creates a membership rule and installs triggers on the source
  * table (and scope table if scoped) to maintain letter.memberships.
  * ---------------------------------------------------------------- */
 Datum
 letter_assign(PG_FUNCTION_ARGS)
 {
-	Oid			source_oid = PG_GETARG_OID(0);
-	text	   *user_column_arg = PG_GETARG_TEXT_PP(1);
+	Oid			source_oid;
+	text	   *user_column_arg;
 	bool		scope_null = PG_ARGISNULL(2);
 	Oid			scope_oid = scope_null ? InvalidOid : PG_GETARG_OID(2);
-	bool		role_name_null = PG_ARGISNULL(3);
-	text	   *role_name_arg = role_name_null ? NULL : PG_GETARG_TEXT_PP(3);
+	bool		role_null = PG_ARGISNULL(3);
+	text	   *role_arg = role_null ? NULL : PG_GETARG_TEXT_PP(3);
 	bool		role_column_null = PG_ARGISNULL(4);
 	text	   *role_column_arg = role_column_null ? NULL : PG_GETARG_TEXT_PP(4);
-	bool		if_fn_null = PG_ARGISNULL(5);
-	text	   *if_fn_arg = if_fn_null ? NULL : PG_GETARG_TEXT_PP(5);
+	bool		if_null = PG_ARGISNULL(5);
+	text	   *if_arg = if_null ? NULL : PG_GETARG_TEXT_PP(5);
 
 	char	   *source_table;		/* quoted, for SQL text */
 	char	   *source_schema;
@@ -1410,8 +1479,8 @@ letter_assign(PG_FUNCTION_ARGS)
 	char	   *scope_name;
 	char	   *role;
 	char	   *role_column;
-	char	   *if_fn;
-	char	   *if_sql = NULL;		/* if_fn, schema-qualified, over the source name */
+	char	   *if_expr;
+	char	   *if_sql = NULL;		/* if_expr, schema-qualified, over the source name */
 	char	   *assignment_id;
 	char	   *safe_id;
 	char	   *pk_column;
@@ -1420,13 +1489,19 @@ letter_assign(PG_FUNCTION_ARGS)
 
 	require_superuser("letter.assign");
 	require_bypass("letter.assign");
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("letter: source_table and user_column are required")));
+	source_oid = PG_GETARG_OID(0);
+	user_column_arg = PG_GETARG_TEXT_PP(1);
 
 	source_table = rel_quoted_name(source_oid);
 	user_column = text_to_cstring(user_column_arg);
 	scope_table = scope_null ? NULL : rel_quoted_name(scope_oid);
-	role = role_name_null ? NULL : text_to_cstring(role_name_arg);
+	role = role_null ? NULL : text_to_cstring(role_arg);
 	role_column = role_column_null ? NULL : text_to_cstring(role_column_arg);
-	if_fn = if_fn_null ? NULL : text_to_cstring(if_fn_arg);
+	if_expr = if_null ? NULL : text_to_cstring(if_arg);
 
 	split_table_name(rel_qualified_name(source_oid), &source_schema, &source_name);
 	if (scope_table != NULL)
@@ -1439,7 +1514,18 @@ letter_assign(PG_FUNCTION_ARGS)
 
 	/* Validate: must have role or role_column but not both */
 	if ((role == NULL) == (role_column == NULL))
-		elog(ERROR, "letter: must provide exactly one of role or role_column");
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("letter: a rule confers a role or reads one from a column, not both"),
+				 errhint("Give exactly one of role and role_column.")));
+	if (role_column != NULL && !column_exists(source_oid, role_column))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("letter: column \"%s\" of %s does not exist", role_column, source_table)));
+	if (!column_exists(source_oid, user_column))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("letter: column \"%s\" of %s does not exist", user_column, source_table)));
 	if (role != NULL && is_builtin_role(role))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1449,53 +1535,36 @@ letter_assign(PG_FUNCTION_ARGS)
 	/* The if is an expression over the source row (plan/20 §3). The rule
 	 * functions run SECURITY DEFINER with search_path pinned to pg_catalog,
 	 * so the text they embed is the schema-qualified form. */
-	if (if_fn != NULL)
+	if (if_expr != NULL)
 	{
-		(void) validate_if_expr(source_oid, "assign", if_fn);
-		if_sql = deparse_if_as(source_oid, if_fn, source_name, true);
+		(void) validate_if_expr(source_oid, "assign", if_expr, false);
+		if_expr = canonical_if(source_oid, if_expr, IF_ROW);	/* stored and embedded alike */
+		(void) validate_if_expr(source_oid, "assign", if_expr, true);
+		if_sql = if_expr;
 	}
 
 	SPI_connect();
 
 	initStringInfo(&buf);
 
-	/* ---- Step 1: Insert the assignment rule ---- */
-	appendStringInfo(&buf,
-		"INSERT INTO letter.membership_rules (table_name, scope_table, user_column, role, role_column, if) "
-		"VALUES (%u, %s, '%s', %s, %s, %s) RETURNING id::text",
-		source_oid,
-		scope_table ? psprintf("%u", scope_oid) : "NULL",
-		user_column,
-		role ? psprintf("'%s'", role) : "NULL",
-		role_column ? psprintf("'%s'", role_column) : "NULL",
-		if_fn ? quote_literal_cstr(if_fn) : "NULL");
-
-	{
-		int		ret;
-		ret = SPI_execute(buf.data, false, 1);
-		if (ret != SPI_OK_INSERT_RETURNING || SPI_processed == 0)
-			elog(ERROR, "letter: failed to insert assignment rule");
-		assignment_id = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
-											  SPI_tuptable->tupdesc, 1));
-		safe_id = sanitize_id(assignment_id);
-	}
-
-	/* ---- Step 2: Find the source table's primary key column ---- */
-	resetStringInfo(&buf);
+	/* ---- Step 1: Find the source table's primary key column ---- */
 	appendStringInfo(&buf,
 		"SELECT a.attname FROM pg_constraint c "
 		"JOIN pg_class t ON t.oid = c.conrelid "
 		"JOIN pg_namespace n ON n.oid = t.relnamespace "
 		"JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey) "
-		"WHERE c.contype = 'p' AND n.nspname = '%s' AND t.relname = '%s' "
+		"WHERE c.contype = 'p' AND n.nspname = %s AND t.relname = %s "
 		"ORDER BY a.attnum LIMIT 1",
-		source_schema, source_name);
+		quote_literal_cstr(source_schema), quote_literal_cstr(source_name));
 
 	pk_column = spi_query_text(buf.data);
 	if (pk_column == NULL)
-		elog(ERROR, "letter: could not find primary key for table \"%s\"", source_table);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("letter: %s has no primary key", source_table),
+				 errhint("A membership rule identifies the source row by its primary key.")));
 
-	/* ---- Step 3: Find the FK column pointing to scope table (if scoped) ---- */
+	/* ---- Step 2: Find the FK column pointing to scope table (if scoped) ---- */
 	scope_fk_column = NULL;
 	if (scope_table != NULL && scope_oid == source_oid)
 	{
@@ -1513,16 +1582,53 @@ letter_assign(PG_FUNCTION_ARGS)
 			"JOIN pg_class ft ON ft.oid = c.confrelid "
 			"JOIN pg_namespace fn ON fn.oid = ft.relnamespace "
 			"JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey) "
-			"WHERE c.contype = 'f' AND n.nspname = '%s' AND t.relname = '%s' "
-			"AND fn.nspname = '%s' AND ft.relname = '%s' "
+			"WHERE c.contype = 'f' AND n.nspname = %s AND t.relname = %s "
+			"AND fn.nspname = %s AND ft.relname = %s "
 			"LIMIT 1",
-			source_schema, source_name, scope_schema, scope_name);
+			quote_literal_cstr(source_schema), quote_literal_cstr(source_name),
+			quote_literal_cstr(scope_schema), quote_literal_cstr(scope_name));
 
 		scope_fk_column = spi_query_text(buf.data);
 		if (scope_fk_column == NULL)
-			elog(ERROR, "letter: could not find FK from \"%s\" to \"%s\"",
-				 source_table, scope_table);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("letter: %s has no foreign key to its scope table %s",
+							source_table, scope_table)));
 	}
+
+	/* ---- Step 3: Insert the membership rule, key columns included (B1) ---- */
+	resetStringInfo(&buf);
+	appendStringInfo(&buf,
+		"INSERT INTO letter.membership_rules "
+		"(table_name, scope_table, user_column, role, role_column, if, pk_column, scope_column) "
+		"VALUES (%u, %s, %s, %s, %s, %s, %s, %s) RETURNING id::text",
+		source_oid,
+		scope_table ? psprintf("%u", scope_oid) : "NULL",
+		quote_literal_cstr(user_column),
+		role ? quote_literal_cstr(role) : "NULL",
+		role_column ? quote_literal_cstr(role_column) : "NULL",
+		if_expr ? quote_literal_cstr(if_expr) : "NULL",
+		quote_literal_cstr(pk_column),
+		scope_fk_column ? quote_literal_cstr(scope_fk_column) : "NULL");
+
+	{
+		int		ret;
+		ret = SPI_execute(buf.data, false, 1);
+		if (ret != SPI_OK_INSERT_RETURNING || SPI_processed == 0)
+			elog(ERROR, "letter: failed to insert membership rule");
+		assignment_id = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc, 1));
+		safe_id = sanitize_id(assignment_id);
+	}
+
+	/* From here on the names are SQL text inside generated function bodies
+	 * (plan/24 B6): quoted identifiers and literals, never raw. */
+	pk_column = pstrdup(quote_identifier(pk_column));
+	if (scope_fk_column != NULL)
+		scope_fk_column = pstrdup(quote_identifier(scope_fk_column));
+	user_column = pstrdup(quote_identifier(user_column));
+	if (role_column != NULL)
+		role_column = pstrdup(quote_identifier(role_column));
 
 	/* ---- Step 4: Create the upsert trigger function ---- */
 	/*
@@ -1530,7 +1636,7 @@ letter_assign(PG_FUNCTION_ARGS)
 	 * It reads the assignment rule from TG_ARGV[0] (assignment_id)
 	 * and uses column names from TG_ARGV[1..N].
 	 *
-	 * We generate a per-assignment function because the column references
+	 * We generate a per-rule function because the column references
 	 * must be baked into the function body (NEW.col_name syntax).
 	 */
 	{
@@ -1543,12 +1649,12 @@ letter_assign(PG_FUNCTION_ARGS)
 		const char *scope_update_role_set = "";
 
 		if (role != NULL)
-			role_expr = psprintf("'%s'", role);
+			role_expr = quote_literal_cstr(role);
 		else
 			role_expr = psprintf("NEW.%s", role_column);
 
 		/* Evaluated over NEW as the source table's row, like a grant's if. */
-		condition = if_fn ? psprintf("SELECT %s FROM (SELECT (NEW).*) AS %s",
+		condition = if_expr ? psprintf("SELECT %s FROM (SELECT (NEW).*) AS %s",
 									 if_sql, quote_identifier(source_name)) : "TRUE";
 
 		if (scope_table != NULL)
@@ -1602,16 +1708,16 @@ letter_assign(PG_FUNCTION_ARGS)
 			source_oid,					/* AND source_table = */
 			pk_column,					/* AND source_id = NEW.pk */
 			condition,					/* IF (condition) */
-			scope_role_cols,			/* roles insert columns */
+			scope_role_cols,			/* memberships insert columns */
 			user_column,				/* NEW.user_column */
-			scope_role_vals,			/* roles insert values */
-			scope_insert_cols,			/* role_assignments extra columns */
+			scope_role_vals,			/* memberships insert values */
+			scope_insert_cols,			/* membership_sources extra columns */
 			assignment_id,				/* assignment_id value */
 			source_oid,					/* source_table value */
 			pk_column,					/* source_id = NEW.pk */
 			user_column,				/* user_id = NEW.user_column */
 			scope_insert_vals,			/* scope values */
-			user_column,				/* UPDATE roles SET user_id = */
+			user_column,				/* UPDATE memberships SET user_id = */
 			scope_update_role_set		/* , scope_table = ..., scope_id = ... */
 		);
 
@@ -1652,14 +1758,16 @@ letter_assign(PG_FUNCTION_ARGS)
 			"JOIN pg_class t ON t.oid = c.conrelid "
 			"JOIN pg_namespace n ON n.oid = t.relnamespace "
 			"JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey) "
-			"WHERE c.contype = 'p' AND n.nspname = '%s' AND t.relname = '%s' "
+			"WHERE c.contype = 'p' AND n.nspname = %s AND t.relname = %s "
 			"ORDER BY a.attnum LIMIT 1",
-			scope_schema, scope_name);
+			quote_literal_cstr(scope_schema), quote_literal_cstr(scope_name));
 
 		scope_pk = spi_query_text(buf.data);
 		if (scope_pk == NULL)
-			elog(ERROR, "letter: could not find primary key for scope table \"%s\"",
-				 scope_table);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					 errmsg("letter: scope table %s has no primary key", scope_table)));
+		scope_pk = pstrdup(quote_identifier(scope_pk));
 
 		resetStringInfo(&buf);
 		appendStringInfo(&buf,
@@ -1729,7 +1837,7 @@ letter_assign(PG_FUNCTION_ARGS)
 		const char *scope_vals = "";
 
 		if (role != NULL)
-			role_expr = psprintf("'%s'", role);
+			role_expr = quote_literal_cstr(role);
 		else
 			role_expr = psprintf("s.%s", role_column);
 
@@ -1739,10 +1847,10 @@ letter_assign(PG_FUNCTION_ARGS)
 			scope_vals = psprintf(", %u, s.%s::text", scope_oid, scope_fk_column);
 		}
 
-		/* Insert roles for existing rows */
+		/* Insert memberships for existing rows */
 		resetStringInfo(&buf);
 		appendStringInfo(&buf,
-			"WITH new_roles AS ("
+			"WITH new_memberships AS ("
 			"  INSERT INTO letter.memberships (role, user_id%s) "
 			"  SELECT %s, s.%s::text%s FROM %s s "
 			"  %s"
@@ -1752,16 +1860,16 @@ letter_assign(PG_FUNCTION_ARGS)
 			"  (assignment_id, role_id, source_table, source_id, user_id%s) "
 			"SELECT '%s', nr.id, %u, s.%s::text, s.%s::text%s "
 			"FROM %s s "
-			"JOIN new_roles nr ON nr.user_id = s.%s::text "
+			"JOIN new_memberships nr ON nr.user_id = s.%s::text "
 			"%s",
-			scope_cols,					/* roles extra columns */
+			scope_cols,					/* memberships extra columns */
 			role_expr,					/* role value */
 			user_column,				/* user_id */
 			scope_vals,					/* scope values */
 			source_table,				/* FROM source */
-			if_fn ? psprintf("WHERE (SELECT %s FROM (SELECT s.*) AS %s)",
+			if_expr ? psprintf("WHERE (SELECT %s FROM (SELECT s.*) AS %s)",
 							 if_sql, quote_identifier(source_name)) : "",	/* condition */
-			scope_cols,					/* role_assignments extra columns */
+			scope_cols,					/* membership_sources extra columns */
 			assignment_id,				/* assignment_id */
 			source_oid,					/* source_table */
 			pk_column,					/* source_id */
@@ -1769,7 +1877,7 @@ letter_assign(PG_FUNCTION_ARGS)
 			scope_vals,					/* scope values */
 			source_table,				/* FROM source */
 			user_column,				/* JOIN on user_id */
-			if_fn ? psprintf("WHERE (SELECT %s FROM (SELECT s.*) AS %s)",
+			if_expr ? psprintf("WHERE (SELECT %s FROM (SELECT s.*) AS %s)",
 							 if_sql, quote_identifier(source_name)) : ""	/* condition */
 		);
 
@@ -1784,19 +1892,19 @@ letter_assign(PG_FUNCTION_ARGS)
  * letter.unassign(source_table, user_column, scope_table,
  *                 role, role_column)
  *
- * Removes an assignment rule: drops triggers and functions,
- * then deletes the assignment row (CASCADE cleans up
- * role_assignments, and the cleanup trigger removes roles).
+ * Removes a membership rule: drops triggers and functions,
+ * then deletes the rule row (CASCADE cleans up
+ * membership_sources, and the cleanup trigger removes memberships).
  * ---------------------------------------------------------------- */
 Datum
 letter_unassign(PG_FUNCTION_ARGS)
 {
-	Oid			source_oid = PG_GETARG_OID(0);
-	text	   *user_column_arg = PG_GETARG_TEXT_PP(1);
+	Oid			source_oid;
+	text	   *user_column_arg;
 	bool		scope_null = PG_ARGISNULL(2);
 	Oid			scope_oid = scope_null ? InvalidOid : PG_GETARG_OID(2);
-	bool		role_name_null = PG_ARGISNULL(3);
-	text	   *role_name_arg = role_name_null ? NULL : PG_GETARG_TEXT_PP(3);
+	bool		role_null = PG_ARGISNULL(3);
+	text	   *role_arg = role_null ? NULL : PG_GETARG_TEXT_PP(3);
 	bool		role_column_null = PG_ARGISNULL(4);
 	text	   *role_column_arg = role_column_null ? NULL : PG_GETARG_TEXT_PP(4);
 
@@ -1809,35 +1917,44 @@ letter_unassign(PG_FUNCTION_ARGS)
 
 	require_superuser("letter.unassign");
 	require_bypass("letter.unassign");
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("letter: source_table and user_column are required")));
+	source_oid = PG_GETARG_OID(0);
+	user_column_arg = PG_GETARG_TEXT_PP(1);
 
 	(void) rel_quoted_name(source_oid);		/* the table must exist */
 	user_column = text_to_cstring(user_column_arg);
 	scope_table = scope_null ? NULL : rel_quoted_name(scope_oid);
-	role = role_name_null ? NULL : text_to_cstring(role_name_arg);
+	role = role_null ? NULL : text_to_cstring(role_arg);
 	role_column = role_column_null ? NULL : text_to_cstring(role_column_arg);
 
 	SPI_connect();
 	initStringInfo(&buf);
 
-	/* ---- Step 1: Find the assignment ---- */
+	/* ---- Step 1: Find the rule ---- */
 	appendStringInfo(&buf,
 		"SELECT id::text FROM letter.membership_rules "
 		"WHERE table_name = %u "
-		"AND user_column = '%s' "
+		"AND user_column = %s "
 		"AND scope_table %s "
 		"AND role %s "
 		"AND role_column %s",
 		source_oid,
-		user_column,
+		quote_literal_cstr(user_column),
 		scope_table ? psprintf("= %u", scope_oid) : "IS NULL",
-		role ? psprintf("= '%s'", role) : "IS NULL",
-		role_column ? psprintf("= '%s'", role_column) : "IS NULL");
+		role ? psprintf("= %s", quote_literal_cstr(role)) : "IS NULL",
+		role_column ? psprintf("= %s", quote_literal_cstr(role_column)) : "IS NULL");
 
 	assignment_id = spi_query_text(buf.data);
 	if (assignment_id == NULL)
-		elog(ERROR, "letter: no matching assignment found");
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("letter: no such membership rule"),
+				 errhint("unassign takes the same source table, user column, role or role column and scope that assign took.")));
 
-	/* ---- Steps 2–4: triggers, functions, row (cascade → roles) ---- */
+	/* ---- Steps 2–4: triggers, functions, row (cascade → memberships) ---- */
 	remove_assignment(assignment_id, source_oid, scope_oid);
 
 	SPI_finish();
@@ -1855,15 +1972,6 @@ get_current_user_id(void)
 	if (letter_current_user_id == NULL || letter_current_user_id[0] == '\0')
 		return NULL;
 	return letter_current_user_id;
-}
-
-/* ----------------------------------------------------------------
- * Helper: check if enforcement should be bypassed.
- * ---------------------------------------------------------------- */
-static bool
-should_bypass(void)
-{
-	return letter_bypass;
 }
 
 /* ----------------------------------------------------------------
@@ -1886,15 +1994,18 @@ populate_cache(const char *user_id)
 	/* Reset cache */
 	letter_cache.nroles = 0;
 	letter_cache.ngrants = 0;
+	letter_cache.roles = NULL;
+	letter_cache.grants = NULL;
 	letter_cache.valid = false;
+	(void) membership_signal_oid();		/* so a remote memberships write can reach this cache */
 	if (letter_cache_cxt == NULL)
 		letter_cache_cxt = AllocSetContextCreate(TopMemoryContext, "letter session cache",
 												 ALLOCSET_SMALL_SIZES);
 	else
 		MemoryContextReset(letter_cache_cxt);
-	strlcpy(letter_cache.user_id, uid, sizeof(letter_cache.user_id));
+	letter_cache.user_id = MemoryContextStrdup(letter_cache_cxt, uid);
 
-	/* Load roles for this user. Parameterized: the user id comes from a
+	/* Load memberships for this user. Parameterized: the user id comes from a
 	 * user-settable GUC and must never be interpolated into SQL. */
 	if (uid[0] == '\0')
 		ret = SPI_OK_SELECT;			/* nothing to load: SPI_processed stays 0 */
@@ -1907,20 +2018,22 @@ populate_cache(const char *user_id)
 		ret = guarded_spi_execute_with_args(
 			"SELECT role, scope_table, scope_id FROM letter.memberships "
 			"WHERE user_id = $1",
-			1, argtypes, values, NULL, true, LETTER_MAX_ROLES);
+			1, argtypes, values, NULL, true, 0);
 	}
 	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "letter: failed to load roles for cache");
+		elog(ERROR, "letter: failed to load memberships for cache");
 
-	for (i = 0; i < (uid[0] ? SPI_processed : 0) && letter_cache.nroles < LETTER_MAX_ROLES; i++)
+	if (uid[0] && SPI_processed > 0)
+		letter_cache.roles = (LetterRole *)
+			MemoryContextAllocZero(letter_cache_cxt, sizeof(LetterRole) * SPI_processed);
+	for (i = 0; i < (uid[0] ? SPI_processed : 0); i++)
 	{
 		LetterRole *r = &letter_cache.roles[letter_cache.nroles];
 		char	   *val;
 		bool		isnull;
 
 		val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
-		if (val) strlcpy(r->role, val, sizeof(r->role));
-		else r->role[0] = '\0';
+		r->role = MemoryContextStrdup(letter_cache_cxt, val ? val : "");
 
 		{
 			Datum	d = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull);
@@ -1942,14 +2055,8 @@ populate_cache(const char *user_id)
 		}
 
 		SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3, &isnull);
-		if (!isnull)
-		{
-			val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
-			if (val) strlcpy(r->scope_id, val, sizeof(r->scope_id));
-			else r->scope_id[0] = '\0';
-		}
-		else
-			r->scope_id[0] = '\0';
+		val = isnull ? NULL : SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
+		r->scope_id = MemoryContextStrdup(letter_cache_cxt, val ? val : "");
 
 		letter_cache.nroles++;
 	}
@@ -1981,22 +2088,23 @@ populate_cache(const char *user_id)
 			"COALESCE(array_to_string(g.via, ','), ''), g.\"if\" "
 			"FROM letter.grants g "
 			"WHERE g.role = ANY($1)",
-			1, argtypes, values, NULL, true, LETTER_MAX_GRANTS);
+			1, argtypes, values, NULL, true, 0);
 		if (ret != SPI_OK_SELECT)
 			elog(ERROR, "letter: failed to load grants for cache");
 
-		for (i = 0; i < SPI_processed && letter_cache.ngrants < LETTER_MAX_GRANTS; i++)
+		if (SPI_processed > 0)
+			letter_cache.grants = (LetterGrant *)
+				MemoryContextAllocZero(letter_cache_cxt, sizeof(LetterGrant) * SPI_processed);
+		for (i = 0; i < SPI_processed; i++)
 		{
 			LetterGrant *g = &letter_cache.grants[letter_cache.ngrants];
 			char	   *val;
 
 			val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
-			if (val) strlcpy(g->role, val, sizeof(g->role));
-			else g->role[0] = '\0';
+			g->role = MemoryContextStrdup(letter_cache_cxt, val ? val : "");
 
 			val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
-			if (val) strlcpy(g->privilege, val, sizeof(g->privilege));
-			else g->privilege[0] = '\0';
+			g->privilege = MemoryContextStrdup(letter_cache_cxt, val ? val : "");
 
 			{
 				bool	isnull;
@@ -2009,8 +2117,7 @@ populate_cache(const char *user_id)
 			}
 
 			val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4);
-			if (val) strlcpy(g->column_name, val, sizeof(g->column_name));
-			else g->column_name[0] = '\0';
+			g->column_name = MemoryContextStrdup(letter_cache_cxt, val ? val : "");
 
 			{
 				bool	isnull;
@@ -2024,13 +2131,7 @@ populate_cache(const char *user_id)
 			}
 
 			val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 6);
-			if (val)
-			{
-				if (strlcpy(g->via, val, sizeof(g->via)) >= sizeof(g->via))
-					elog(ERROR, "letter: via too long for grant on %s",
-						 rel_qualified_name(g->on_table));
-			}
-			else g->via[0] = '\0';
+			g->via = MemoryContextStrdup(letter_cache_cxt, val ? val : "");
 
 			val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 7);
 			g->if_expr = val ? MemoryContextStrdup(letter_cache_cxt, val) : NULL;
@@ -2061,7 +2162,7 @@ populate_cache(const char *user_id)
 #define LETTER_PRIV_INSERT	(1 << 1)
 #define LETTER_PRIV_UPDATE	(1 << 2)
 #define LETTER_PRIV_DELETE	(1 << 3)
-#define LETTER_PRIV_SET		(1 << 4)
+#define LETTER_PRIV_FILL	(1 << 4)
 
 typedef struct ProtectedRelEntry
 {
@@ -2096,7 +2197,7 @@ privilege_bit(const char *privilege)
 	if (strcmp(privilege, "insert") == 0) return LETTER_PRIV_INSERT;
 	if (strcmp(privilege, "update") == 0) return LETTER_PRIV_UPDATE;
 	if (strcmp(privilege, "delete") == 0) return LETTER_PRIV_DELETE;
-	if (strcmp(privilege, "fill") == 0) return LETTER_PRIV_SET;
+	if (strcmp(privilege, "fill") == 0) return LETTER_PRIV_FILL;
 	return 0;
 }
 
@@ -2208,6 +2309,7 @@ typedef struct HookTarget
 	Query	   *query;
 	RangeTblEntry *rte;
 	Index		rti;
+	bool		inh;			/* false: FROM ONLY (plan/24 B5) */
 } HookTarget;
 
 typedef struct WriteTarget
@@ -2285,7 +2387,7 @@ collect_walker(Node *node, void *context)
 				switch (q->commandType)
 				{
 					case CMD_INSERT: need = LETTER_PRIV_INSERT; break;
-					case CMD_UPDATE: need = LETTER_PRIV_UPDATE | LETTER_PRIV_SET; break;
+					case CMD_UPDATE: need = LETTER_PRIV_UPDATE | LETTER_PRIV_FILL; break;
 					case CMD_DELETE: need = LETTER_PRIV_DELETE; break;
 					default:
 						letter_unsupported("MERGE", rte->relid);
@@ -2344,6 +2446,7 @@ collect_walker(Node *node, void *context)
 				t->query = q;
 				t->rte = rte;
 				t->rti = rti;
+				t->inh = rte->inh;
 				cxt->targets = lappend(cxt->targets, t);
 			}
 		}
@@ -2418,12 +2521,17 @@ convert_rte_in_place(HookTarget *t)
 	List	   *raw;
 	Query	   *sub;
 
+	int			nest;
+
 	scxt.rti = t->rti;
 	scxt.level = 0;
 	scxt.relid = rte->relid;
 	(void) query_tree_walker(t->query, syscol_walker, &scxt, 0);
 
-	sql = build_barrier_sql(rte->relid);
+	/* Generated and parsed under the pin: nothing in the session's own
+	 * search_path can shadow a name in it. */
+	nest = pin_search_path();
+	sql = build_barrier_sql(rte->relid, !t->inh);
 	if (sql == NULL)
 		elog(ERROR, "letter: no barrier for protected table \"%s\"",
 			 rel_qualified_name(rte->relid));
@@ -2434,6 +2542,7 @@ convert_rte_in_place(HookTarget *t)
 	sub = parse_analyze_fixedparams(linitial_node(RawStmt, raw), sql, NULL, 0, NULL);
 	if (sub->commandType != CMD_SELECT)
 		elog(ERROR, "letter: generated barrier is not a SELECT");
+	unpin_search_path(nest);
 
 	/* Everything inside the generated subquery is trusted plumbing (D6). */
 	(void) zero_perms_walker((Node *) sub, NULL);
@@ -2577,10 +2686,12 @@ redact_write_target(WriteTarget *t)
 	RangeTblEntry *rte = t->rte;
 	WriteRedaction *wr;
 	WriteMutatorContext cxt;
+	int			nest;
 
 	if (rte->securityQuals != NIL)
 		letter_unsupported("row-level security", rte->relid);
 
+	nest = pin_search_path();		/* generation and every parse below */
 	wr = build_write_redaction(rte->relid);
 
 	/* Column visibility first (§1.2, D2–D4), everywhere the statement reads
@@ -2615,6 +2726,38 @@ redact_write_target(WriteTarget *t)
 		rte->securityQuals = lappend(rte->securityQuals, qual);
 	}
 
+	/* … except that INSERT … ON CONFLICT DO UPDATE reaches an existing row —
+	 * one the user may not be able to see. Refused, loudly (plan/24 A4, Paul
+	 * 2026-09-23): the unique violation would have revealed the row anyway,
+	 * and a silent skip would contradict D1's promise only in this one place.
+	 * The ON CONFLICT WHERE becomes CASE WHEN <row visible> THEN <the
+	 * statement's own WHERE, or true> ELSE error() END — a shape the planner
+	 * cannot fold away when the statement's WHERE is a constant. */
+	if (q->commandType == CMD_INSERT && q->onConflict != NULL &&
+		q->onConflict->action == ONCONFLICT_UPDATE)
+	{
+		OnConflictExpr *oc = q->onConflict;
+		Node	   *visible = parse_expr_over_b(rte->relid, wr ? wr->row_qual : "false");
+		Node	   *refuse = parse_expr_over_b(rte->relid,
+											   psprintf("letter._hidden_conflict(%u::pg_catalog.oid)", rte->relid));
+		CaseWhen   *w = makeNode(CaseWhen);
+		CaseExpr   *c = makeNode(CaseExpr);
+
+		ChangeVarNodes(visible, 1, t->rti, 0);
+		w->expr = (Expr *) visible;
+		w->result = oc->onConflictWhere ? (Expr *) oc->onConflictWhere : (Expr *) makeBoolConst(true, false);
+		w->location = -1;
+		c->casetype = BOOLOID;
+		c->casecollid = InvalidOid;
+		c->arg = NULL;
+		c->args = list_make1(w);
+		c->defresult = (Expr *) refuse;
+		c->location = -1;
+		oc->onConflictWhere = (Node *) c;
+		q->hasSubLinks = true;
+	}
+
+	unpin_search_path(nest);
 	elog(DEBUG1, "letter: planner hook: redacting result relation \"%s\"",
 		 rel_qualified_name(rte->relid));
 }
@@ -2763,7 +2906,7 @@ invalidate_cache(void)
  *
  * Cross-backend (§4.1, plan/17 H4): the trigger also raises a
  * relcache invalidation — on letter.grants for a grants write, on the
- * empty signal table letter._membership_signal for a roles write. Relcache
+ * empty signal table letter._membership_signal for a memberships write. Relcache
  * invalidations are transactional and reach every backend at commit:
  * the plancache drops every plan that lists letter.grants in its
  * relationOids (every rewritten plan does), and letter_relcache_
@@ -2771,19 +2914,22 @@ invalidate_cache(void)
  * churn — frequent, and irrelevant to the rewritten trees — does not
  * also invalidate every plan.
  * ---------------------------------------------------------------- */
-static Oid	letter_roles_epoch_oid = InvalidOid;
+static Oid	letter_membership_signal_oid = InvalidOid;
 
+/* Resolved lazily, on both ends: the writer raises the invalidation on it,
+ * and every backend whose session cache holds memberships must recognise
+ * it when it arrives (plan/24 A2). */
 static Oid
-roles_epoch_oid(void)
+membership_signal_oid(void)
 {
-	if (!OidIsValid(letter_roles_epoch_oid))
+	if (!OidIsValid(letter_membership_signal_oid))
 	{
 		Oid			nspid = get_namespace_oid("letter", true);
 
 		if (OidIsValid(nspid))
-			letter_roles_epoch_oid = get_relname_relid("roles_epoch", nspid);
+			letter_membership_signal_oid = get_relname_relid("_membership_signal", nspid);
 	}
-	return letter_roles_epoch_oid;
+	return letter_membership_signal_oid;
 }
 
 Datum
@@ -2800,8 +2946,8 @@ letter_cache_inval(PG_FUNCTION_ARGS)
 	relname = RelationGetRelationName(trigdata->tg_relation);
 	if (strcmp(relname, "grants") == 0)
 		CacheInvalidateRelcacheByRelid(RelationGetRelid(trigdata->tg_relation));
-	else if (strcmp(relname, "roles") == 0 && OidIsValid(roles_epoch_oid()))
-		CacheInvalidateRelcacheByRelid(roles_epoch_oid());
+	else if (strcmp(relname, "memberships") == 0 && OidIsValid(membership_signal_oid()))
+		CacheInvalidateRelcacheByRelid(membership_signal_oid());
 
 	return PointerGetDatum(NULL);
 }
@@ -2818,7 +2964,7 @@ letter_relcache_callback(Datum arg, Oid relid)
 		if (!OidIsValid(relid))
 			letter_owner = InvalidOid;
 	}
-	else if (relid == letter_roles_epoch_oid)
+	else if (OidIsValid(letter_membership_signal_oid) && relid == letter_membership_signal_oid)
 		letter_cache.valid = false;
 }
 
@@ -3267,7 +3413,7 @@ get_compiled_scope_path(Oid relid, Oid scope_oid, const char *via_str)
  * The shared path-walker: resolve a row's scope_id for a grant.
  *
  * This is the single implementation of scope resolution — used
- * today by the write-enforcement triggers and letter.read(). Both
+ * today by the write-enforcement triggers and letter._read(). Both
  * must gate identically (plan/15-join-enforcement.md D5); per-hop
  * visibility gating will slot into the hop loop below. The planner
  * hook expresses the same walk as joins (plan/16 §3).
@@ -3441,7 +3587,8 @@ typedef struct BarrierGroup
  * is b.col and the whole row is b. No sublink: the planner sees a plain
  * expression, and a hop alias can never capture a name. */
 static char *
-deparse_if_as(Oid relid, const char *if_expr, const char *out_alias, bool qualify)
+deparse_if_as(Oid relid, const char *if_expr, const char *out_alias,
+			  bool qualify, bool forceprefix, bool pinned)
 {
 	char	   *sql = psprintf("SELECT (\n%s\n) FROM %s AS %s", if_expr, rel_quoted_name(relid),
 							   quote_identifier(get_rel_name(relid)));
@@ -3450,35 +3597,86 @@ deparse_if_as(Oid relid, const char *if_expr, const char *out_alias, bool qualif
 	TargetEntry *tle;
 	List	   *context;
 	char	   *text;
+	int			nest;
 
 	if (list_length(raw) != 1)
 		elog(ERROR, "letter: if expression is not a single statement");
+	/* pinned: the text is a stored (canonical) one — self-contained */
+	nest = pinned ? pin_search_path() : 0;
 	q = parse_analyze_fixedparams(linitial_node(RawStmt, raw), sql, NULL, 0, NULL);
+	if (pinned)
+		unpin_search_path(nest);
 	tle = linitial_node(TargetEntry, q->targetList);
 	context = deparse_context_for(out_alias, relid);
 	/* forceprefix: <alias>.col always — no other alias may capture a name */
 	if (qualify)
 	{
-		/* Names were resolved above in the caller's search_path; deparsing
-		 * with only pg_catalog visible writes every other schema out, so the
-		 * text means the same wherever it is later run (a SECURITY DEFINER
-		 * function with a pinned search_path). pg_dump's trick. */
-		int			nest = NewGUCNestLevel();
-
-		(void) set_config_option("search_path", "pg_catalog", PGC_USERSET, PGC_S_SESSION,
-								 GUC_ACTION_SAVE, true, 0, false);
-		text = deparse_expression((Node *) tle->expr, context, true, false);
-		AtEOXact_GUC(true, nest);
+		/* Names were resolved above; deparsing with only pg_catalog visible
+		 * writes every other schema out, so the text means the same wherever
+		 * it is later parsed under the same pin. */
+		nest = pin_search_path();
+		text = deparse_expression((Node *) tle->expr, context, forceprefix, false);
+		unpin_search_path(nest);
 	}
 	else
-		text = deparse_expression((Node *) tle->expr, context, true, false);
+		text = deparse_expression((Node *) tle->expr, context, forceprefix, false);
 	return psprintf("(%s)", text);
 }
 
+/* The barrier's form of a stored if: over alias b, every name qualified
+ * (the barrier is parsed pinned), every column b.col. */
 static char *
 deparse_if_over_b(Oid relid, const char *if_expr)
 {
-	return deparse_if_as(relid, if_expr, "b", false);
+	return deparse_if_as(relid, if_expr, "b", true, true, true);
+}
+
+/* The stored form of an if (plan/24, Paul 2026-09-23): the author's text,
+ * resolved in the author's search_path and written out schema-qualified,
+ * so that it means the same wherever it is parsed under the pin. Row form:
+ * no prefix (the row's alias varies with the table's name); transition
+ * form: old.col and new.col. */
+static char *
+canonical_if(Oid relid, const char *raw, IfForm form)
+{
+	const char *rel = rel_quoted_name(relid);
+	char	   *sql;
+	List	   *parsed;
+	Query	   *q;
+	TargetEntry *tle;
+	List	   *context;
+	char	   *text;
+	int			nest;
+
+	if (form == IF_ROW)
+	{
+		char	   *wrapped = deparse_if_as(relid, raw, get_rel_name(relid), true, false, false);
+
+		return pnstrdup(wrapped + 1, strlen(wrapped) - 2);	/* without deparse_if_as's own (…) */
+	}
+
+	/* Two range-table entries: deparse_context_for() takes one relation, so
+	 * the context is built the way EXPLAIN builds one, from a bare plan
+	 * carrying the analysed range table — no planning, so nothing is
+	 * inlined or folded. */
+	sql = psprintf("SELECT (\n%s\n) FROM %s AS old, %s AS new", raw, rel, rel);
+	parsed = pg_parse_query(sql);
+	if (list_length(parsed) != 1)
+		elog(ERROR, "letter: if expression is not a single statement");
+	q = parse_analyze_fixedparams(linitial_node(RawStmt, parsed), sql, NULL, 0, NULL);
+	tle = linitial_node(TargetEntry, q->targetList);
+	{
+		PlannedStmt *shell = makeNode(PlannedStmt);
+
+		shell->commandType = CMD_SELECT;
+		shell->rtable = q->rtable;
+		context = deparse_context_for_plan_tree(shell,
+												select_rtable_names_for_explain(q->rtable, NULL));
+	}
+	nest = pin_search_path();
+	text = deparse_expression((Node *) tle->expr, context, true, false);
+	unpin_search_path(nest);
+	return text;
 }
 
 /* Does every role of the group cover the column (plan/17 D17)? Then the
@@ -3670,9 +3868,9 @@ barrier_append_test(StringInfo buf, BarrierGroup *g, const char *column_name)
 /* Returns the barrier SQL for a relation, palloc'd in the caller's context,
  * or NULL if the relation has no select grants. */
 static char *
-build_barrier_sql(Oid relid)
+build_barrier_sql(Oid relid, bool from_only)
 {
-	return build_barrier_sql_ext(relid, BARRIER_SUBQUERY, NULL, NULL, NULL);
+	return build_barrier_sql_ext(relid, BARRIER_SUBQUERY, from_only, NULL, NULL, NULL);
 }
 
 /* NULL if the relation has no select grants. */
@@ -3681,7 +3879,7 @@ build_write_redaction(Oid relid)
 {
 	WriteRedaction *wr = NULL;
 
-	(void) build_barrier_sql_ext(relid, BARRIER_CORRELATED, NULL, NULL, &wr);
+	(void) build_barrier_sql_ext(relid, BARRIER_CORRELATED, false, NULL, NULL, &wr);
 	return wr;
 }
 
@@ -3691,8 +3889,8 @@ build_write_redaction(Oid relid)
  * OR-ed rather than branched (a single indexed row, so strictness does
  * not matter). Reports the PK column and type for the caller's WHERE. */
 static char *
-build_barrier_sql_ext(Oid relid, BarrierMode mode, char **pk_col_out, char **pk_type_out,
-					  WriteRedaction **wr_out)
+build_barrier_sql_ext(Oid relid, BarrierMode mode, bool from_only,
+					  char **pk_col_out, char **pk_type_out, WriteRedaction **wr_out)
 {
 	MemoryContext caller_cxt = CurrentMemoryContext;
 	bool		visibility = (mode == BARRIER_VISIBILITY);
@@ -4021,7 +4219,9 @@ build_barrier_sql_ext(Oid relid, BarrierMode mode, char **pk_col_out, char **pk_
 		if (i > 0)
 			appendStringInfoString(&sql, "\nUNION ALL\n");
 
-		appendStringInfo(&sql, "SELECT %s\nFROM %s.%s b", bcols.data,
+		/* ONLY when the query said so (plan/24 B5): the barrier stands in
+		 * for the RTE, inheritance flag included. */
+		appendStringInfo(&sql, "SELECT %s\nFROM %s%s.%s b", bcols.data, from_only ? "ONLY " : "",
 						 quote_identifier(schema_name), quote_identifier(table_name));
 		pfree(bcols.data);
 
@@ -4078,8 +4278,10 @@ build_barrier_sql_ext(Oid relid, BarrierMode mode, char **pk_col_out, char **pk_
 Datum
 letter_barrier_sql(PG_FUNCTION_ARGS)
 {
-	char	   *sql = build_barrier_sql(PG_GETARG_OID(0));
+	int			nest = pin_search_path();
+	char	   *sql = build_barrier_sql(PG_GETARG_OID(0), false);
 
+	unpin_search_path(nest);
 	if (sql == NULL)
 		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(cstring_to_text(sql));
@@ -4094,12 +4296,14 @@ Datum
 letter_barrier_write_sql(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
+	int			nest = pin_search_path();
 	WriteRedaction *wr = build_write_redaction(relid);
 	Relation	rel;
 	TupleDesc	tupdesc;
 	StringInfoData out;
 	int			i;
 
+	unpin_search_path(nest);
 	if (wr == NULL)
 		PG_RETURN_NULL();
 
@@ -4167,6 +4371,7 @@ letter_visible_columns(PG_FUNCTION_ARGS)
 	Oid			argtypes[1] = {TEXTOID};
 	Datum		values[1];
 	int			ret;
+	int			nest;
 	Datum		result;
 	bool		isnull;
 
@@ -4188,7 +4393,8 @@ letter_visible_columns(PG_FUNCTION_ARGS)
 
 	SPI_connect();
 
-	sql = build_barrier_sql_ext(relid, BARRIER_VISIBILITY, &pk_col, &pk_type, NULL);
+	nest = pin_search_path();		/* generation and the parse in SPI below */
+	sql = build_barrier_sql_ext(relid, BARRIER_VISIBILITY, false, &pk_col, &pk_type, NULL);
 	if (sql == NULL)
 		elog(ERROR, "letter: no barrier for protected table \"%s\"", rel_qualified_name(relid));
 
@@ -4202,6 +4408,7 @@ letter_visible_columns(PG_FUNCTION_ARGS)
 
 	values[0] = CStringGetTextDatum(pk_text);
 	ret = guarded_spi_execute_with_args(sql, 1, argtypes, values, NULL, true, 1);
+	unpin_search_path(nest);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "letter: query failed");
 
@@ -4244,21 +4451,27 @@ if_prepare(void *arg)
 	Oid			rowtype = get_rel_type_id(p->relid);
 	Oid			argtypes[2] = {rowtype, rowtype};
 	char	   *sql;
-	LetterGuard guard;
 
 	if (p->form == IF_ROW)
 		sql = psprintf("SELECT (\n%s\n) FROM (SELECT ($1).*) AS %s", p->text, alias);
 	else
 		sql = psprintf("SELECT (\n%s\n) FROM (SELECT ($1).*) AS old, (SELECT ($2).*) AS new",
 					   p->text);
-	guard_enter(&guard);
+	/* Depth only, no uid switch (plan/24 A1): the expression is the rule
+	 * author's, but a function it names runs as the writer — as it does in
+	 * the read path — never as the extension owner. The plan reads a
+	 * composite parameter and touches no table of letter's. */
+	letter_guard_depth++;
 	PG_TRY();
 	{
+		int			nest = pin_search_path();
+
 		p->plan = SPI_prepare(sql, p->form == IF_ROW ? 1 : 2, argtypes);
+		unpin_search_path(nest);
 	}
 	PG_FINALLY();
 	{
-		guard_exit(&guard);
+		letter_guard_depth--;
 	}
 	PG_END_TRY();
 	if (p->plan == NULL)
@@ -4321,10 +4534,7 @@ get_if_plan(Oid relid, const char *privilege, const char *text)
 					 errmsg("letter: invalid if expression for %s on %s: %s",
 							privilege, rel_qualified_name(relid), why_row)));
 		if (!try_in_subxact(if_prepare, &prep, &why))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("letter: invalid if expression for %s on %s: %s (as a transition over old and new: %s)",
-							privilege, rel_qualified_name(relid), why_row, why)));
+			if_invalid(relid, privilege, why_row, why);
 	}
 
 	e = (IfPlanEntry *) hash_search(if_plan_hash, &key, HASH_ENTER, &found);
@@ -4385,7 +4595,6 @@ if_holds(Oid relid, const char *privilege, const char *text,
 	int			ret;
 	bool		isnull;
 	Datum		d;
-	LetterGuard guard;
 
 	if (e->key.form == IF_ROW)
 		values[0] = row_as_composite(relid, tuple, tupdesc);
@@ -4397,14 +4606,15 @@ if_holds(Oid relid, const char *privilege, const char *text,
 		values[1] = row_as_composite(relid, newtuple, tupdesc);
 	}
 
-	guard_enter(&guard);
+	/* As the invoker (plan/24 A1); see if_prepare. */
+	letter_guard_depth++;
 	PG_TRY();
 	{
 		ret = SPI_execute_plan(e->plan, values, NULL, true, 1);
 	}
 	PG_FINALLY();
 	{
-		guard_exit(&guard);
+		letter_guard_depth--;
 	}
 	PG_END_TRY();
 	if (ret != SPI_OK_SELECT || SPI_processed != 1)
@@ -4611,7 +4821,7 @@ letter_enforce_insert(PG_FUNCTION_ARGS)
 
 	rel = trigdata->tg_relation;
 
-	if (should_bypass())
+	if (letter_bypass)
 		return PointerGetDatum(trigdata->tg_trigtuple);
 
 	user_id = get_current_user_id();	/* NULL: anonymous — only anyone rules apply (plan/22) */
@@ -4655,7 +4865,7 @@ letter_enforce_update(PG_FUNCTION_ARGS)
 
 	rel = trigdata->tg_relation;
 
-	if (should_bypass())
+	if (letter_bypass)
 		return PointerGetDatum(trigdata->tg_newtuple);
 
 	user_id = get_current_user_id();	/* NULL: anonymous — only anyone rules apply (plan/22) */
@@ -4704,7 +4914,7 @@ letter_enforce_update(PG_FUNCTION_ARGS)
 		 * scoped grant — fail closed. */
 		if (old_isnull)
 		{
-			/* OLD was NULL → 'set' or 'update' is sufficient */
+			/* OLD was NULL → 'fill' or 'update' is sufficient */
 			bool	ok_old =
 				check_grant(user_id, "fill", relid, col_name, oldtuple, tupdesc, oldtuple, newtuple) ||
 				check_grant(user_id, "update", relid, col_name, oldtuple, tupdesc, oldtuple, newtuple);
@@ -4751,7 +4961,7 @@ letter_enforce_delete(PG_FUNCTION_ARGS)
 
 	rel = trigdata->tg_relation;
 
-	if (should_bypass())
+	if (letter_bypass)
 		return PointerGetDatum(trigdata->tg_trigtuple);
 
 	user_id = get_current_user_id();	/* NULL: anonymous — only anyone rules apply (plan/22) */
@@ -4777,11 +4987,11 @@ letter_enforce_delete(PG_FUNCTION_ARGS)
  *
  * Drop cascades, alter refuses. Two event triggers:
  *   - sql_drop (letter_on_sql_drop): for each dropped table, remove
- *     the grants on it or scoped to it, the assignments using it and
- *     the roles scoped to it; for each dropped column, the grants on
+ *     the grants on it or scoped to it, the rules using it and
+ *     the memberships scoped to it; for each dropped column, the grants on
  *     it. Then revalidate everything that is left and remove, with a
  *     NOTICE, whatever no longer makes sense (a path through a
- *     dropped hop, an assignment whose column went).
+ *     dropped hop, a rule whose column went).
  *   - ddl_command_end (letter_on_ddl_command_end), after ALTER TABLE:
  *     the same revalidation, but a failure is an ERROR, which rolls
  *     the DDL back. (A dropped index is not a failure: sql_drop just
@@ -4880,11 +5090,32 @@ if_function_walker(Node *node, void *context)
 	return expression_tree_walker(node, if_function_walker, context);
 }
 
+/* Both forms failed. One reason is reported, from the form the text is
+ * evidently written in (plan/24, 2026-09-23): the transition form's when
+ * the row form's complaint was that old or new is not there, the row
+ * form's otherwise. */
+static void
+if_invalid(Oid relid, const char *privilege, const char *why_row, const char *why_transition)
+{
+	bool		names_old_new = (strstr(why_row, "\"old\"") != NULL || strstr(why_row, "\"new\"") != NULL);
+
+	if (names_old_new)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("letter: invalid if expression for %s on %s (as a transition over old and new): %s",
+						privilege, rel_qualified_name(relid), why_transition)));
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("letter: invalid if expression for %s on %s: %s",
+					privilege, rel_qualified_name(relid), why_row)));
+}
+
 typedef struct IfCheck
 {
 	Oid			relid;
 	const char *if_text;
 	IfForm		form;
+	bool		canonical;		/* a stored form: parsed under the pin */
 } IfCheck;
 
 /* Analyse the expression in the given form; errors out with why not. */
@@ -4905,7 +5136,13 @@ if_analyze(void *arg)
 		sql = psprintf("SELECT (\n%s\n) FROM (SELECT * FROM %s) AS old, (SELECT * FROM %s) AS new",
 					   c->if_text, rel, rel);
 	raw = pg_parse_query(sql);
-	q = parse_analyze_fixedparams(linitial_node(RawStmt, raw), sql, NULL, 0, NULL);
+	{
+		int			nest = c->canonical ? pin_search_path() : 0;
+
+		q = parse_analyze_fixedparams(linitial_node(RawStmt, raw), sql, NULL, 0, NULL);
+		if (c->canonical)
+			unpin_search_path(nest);
+	}
 	tle = linitial_node(TargetEntry, q->targetList);
 
 	if (exprType((Node *) tle->expr) != BOOLOID)
@@ -4948,9 +5185,10 @@ if_check_shape(void *arg)
 
 /* Validate an `if` for a grant on relid; returns which form it is. A
  * select/insert/delete rule has one row and must be over it; an
- * update/fill rule may instead name old and new. */
+ * update/fill rule may instead name old and new. canonical: the text is
+ * a stored form (revalidation), parsed under the pin like every use. */
 static IfForm
-validate_if_expr(Oid relid, const char *privilege, const char *if_text)
+validate_if_expr(Oid relid, const char *privilege, const char *if_text, bool canonical)
 {
 	IfCheck		c;
 	char	   *why;
@@ -4964,6 +5202,7 @@ validate_if_expr(Oid relid, const char *privilege, const char *if_text)
 
 	c.relid = relid;
 	c.if_text = if_text;
+	c.canonical = canonical;
 	c.form = IF_ROW;
 	if (try_in_subxact(if_analyze, &c, &why))
 		return IF_ROW;
@@ -4974,10 +5213,7 @@ validate_if_expr(Oid relid, const char *privilege, const char *if_text)
 		c.form = IF_TRANSITION;
 		if (try_in_subxact(if_analyze, &c, &why))
 			return IF_TRANSITION;
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("letter: invalid if expression for %s on %s: %s (as a transition over old and new: %s)",
-						privilege, rel_qualified_name(relid), why_row, why)));
+		if_invalid(relid, privilege, why_row, why);
 	}
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -4994,7 +5230,7 @@ typedef struct GrantRow
 	char	   *privilege;
 	char	   *column_name;
 	ArrayType  *via;		/* NULL if none */
-	char	   *check_fn;		/* NULL if none */
+	char	   *if_expr;		/* NULL if none */
 	bool		warn_unindexed;	/* re-issue the grant-time index warning */
 } GrantRow;
 
@@ -5012,8 +5248,8 @@ validate_grant_row(void *arg)
 						OidIsValid(g->scope) ? rel_qualified_name(g->scope) : "",
 						g->via,
 						g->warn_unindexed && strcmp(g->privilege, "select") == 0);
-	if (g->check_fn != NULL)
-		(void) validate_if_expr(g->on_table, g->privilege, g->check_fn);
+	if (g->if_expr != NULL)
+		(void) validate_if_expr(g->on_table, g->privilege, g->if_expr, true);
 }
 
 typedef struct AssignmentRow
@@ -5024,6 +5260,8 @@ typedef struct AssignmentRow
 	char	   *user_column;
 	char	   *role_column;	/* NULL if role is used */
 	char	   *if_expr;		/* NULL if none */
+	char	   *pk_column;		/* the key the generated functions bake in (plan/24 B1) */
+	char	   *scope_column;	/* the FK to the scope, NULL when unscoped */
 } AssignmentRow;
 
 static void
@@ -5041,24 +5279,39 @@ validate_assignment_row(void *arg)
 				(errcode(ERRCODE_UNDEFINED_COLUMN),
 				 errmsg("column \"%s\" of %s no longer exists", a->role_column, source_name)));
 	if (a->if_expr != NULL)
-		(void) validate_if_expr(a->table_name, "assign", a->if_expr);
+		(void) validate_if_expr(a->table_name, "assign", a->if_expr, true);
+	/* The generated functions name the key and the scope FK (plan/24 B1). */
+	if (a->pk_column != NULL && !column_exists(a->table_name, a->pk_column))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("key column \"%s\" of %s no longer exists", a->pk_column, source_name)));
+	if (a->scope_column != NULL && !column_exists(a->table_name, a->scope_column))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("scope column \"%s\" of %s no longer exists", a->scope_column, source_name)));
 	if (OidIsValid(a->scope_table) && a->scope_table != a->table_name)	/* self-scoped: the PK (D8) */
 	{
 		char	   *s_schema, *s_table, *t_schema, *t_table;
+		char	   *fk_col;
 		int			nfks = 0;
 
 		split_table_name(source_name, &s_schema, &s_table);
 		split_table_name(rel_qualified_name(a->scope_table), &t_schema, &t_table);
-		(void) lookup_fk_to_table(s_schema, s_table, t_schema, t_table, &nfks);
+		fk_col = lookup_fk_to_table(s_schema, s_table, t_schema, t_table, &nfks);
 		if (nfks != 1)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("%s has %s foreign key to its scope table %s.%s",
 							source_name, nfks == 0 ? "no" : "more than one", t_schema, t_table)));
+		if (a->scope_column != NULL && fk_col != NULL && strcmp(fk_col, a->scope_column) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("the foreign key of %s to its scope table is now \"%s\", not \"%s\"",
+							source_name, fk_col, a->scope_column)));
 	}
 }
 
-/* Drop an assignment's triggers, functions and row — the tail of
+/* Drop a membership rule's triggers, functions and row — the tail of
  * letter.unassign(), tolerant of a source or scope table that is
  * already gone. Must be called within an SPI connection. */
 static void
@@ -5104,7 +5357,7 @@ remove_assignment(const char *assignment_id, Oid source_oid, Oid scope_oid)
 		spi_exec(buf.data);
 	}
 
-	/* CASCADE deletes role_assignments; the cleanup trigger removes roles. */
+	/* CASCADE deletes membership_sources; the cleanup trigger removes memberships. */
 	resetStringInfo(&buf);
 	appendStringInfo(&buf, "DELETE FROM letter.membership_rules WHERE id = '%s'", assignment_id);
 	spi_exec(buf.data);
@@ -5128,7 +5381,7 @@ typedef enum RevalidateMode
 	REVALIDATE_REPORT			/* check_health: collect failures as rows */
 } RevalidateMode;
 
-/* Every grant and assignment must still validate; see RevalidateMode
+/* Every grant and membership rule must still validate; see RevalidateMode
  * for what a failure means. warn_unindexed re-issues the grant-time
  * FK-index warning (after DROP INDEX; a row under REPORT). Must be
  * called within an SPI connection. */
@@ -5171,7 +5424,7 @@ revalidate_all(RevalidateMode mode, bool warn_unindexed, List **report)
 		g->column_name = SPI_getvalue(tup, td, 5);
 		d = SPI_getbinval(tup, td, 6, &isnull);
 		g->via = isnull ? NULL : DatumGetArrayTypePCopy(d);
-		g->check_fn = SPI_getvalue(tup, td, 7);
+		g->if_expr = SPI_getvalue(tup, td, 7);
 		g->warn_unindexed = warn_unindexed;
 		all_grants = lappend(all_grants, g);
 	}
@@ -5213,11 +5466,12 @@ revalidate_all(RevalidateMode mode, bool warn_unindexed, List **report)
 	}
 
 	ret = guarded_spi_execute(
-		"SELECT id::text, table_name, scope_table, user_column, role_column, \"if\" "
+		"SELECT id::text, table_name, scope_table, user_column, role_column, \"if\", "
+		"pk_column, scope_column "
 		"FROM letter.membership_rules ORDER BY table_name, user_column",
 		false, 0);
 	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "letter: failed to load assignments for revalidation");
+		elog(ERROR, "letter: failed to load membership rules for revalidation");
 
 	for (i = 0; i < SPI_processed; i++)
 	{
@@ -5234,6 +5488,8 @@ revalidate_all(RevalidateMode mode, bool warn_unindexed, List **report)
 		a->user_column = SPI_getvalue(tup, td, 4);
 		a->role_column = SPI_getvalue(tup, td, 5);
 		a->if_expr = SPI_getvalue(tup, td, 6);
+		a->pk_column = SPI_getvalue(tup, td, 7);
+		a->scope_column = SPI_getvalue(tup, td, 8);
 		all_assignments = lappend(all_assignments, a);
 	}
 
@@ -5252,18 +5508,18 @@ revalidate_all(RevalidateMode mode, bool warn_unindexed, List **report)
 		if (mode == REVALIDATE_REPORT)
 		{
 			health_add(report, "error",
-					   psprintf("assignment on %s", rel_qualified_name(a->table_name)), why);
+					   psprintf("rule on %s", rel_qualified_name(a->table_name)), why);
 			continue;
 		}
 		if (mode == REVALIDATE_REFUSE)
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
-					 errmsg("letter: the assignment on %s would no longer be valid: %s",
+					 errmsg("letter: the membership rule on %s would no longer be valid: %s",
 							rel_qualified_name(a->table_name), why),
-					 errhint("Remove the assignment (letter.unassign) before altering the table.")));
+					 errhint("Remove the rule (letter.unassign) before altering the table.")));
 
 		ereport(NOTICE,
-				(errmsg("letter: removed the assignment on %s: %s",
+				(errmsg("letter: removed the membership rule on %s: %s",
 						rel_qualified_name(a->table_name), why)));
 		bad_assignments = lappend(bad_assignments, a);
 	}
@@ -5283,8 +5539,8 @@ revalidate_all(RevalidateMode mode, bool warn_unindexed, List **report)
 		values[4] = CStringGetTextDatum(g->column_name);
 		values[5] = g->via ? PointerGetDatum(g->via) : (Datum) 0;
 		nulls[5] = g->via ? ' ' : 'n';
-		values[6] = g->check_fn ? CStringGetTextDatum(g->check_fn) : (Datum) 0;
-		nulls[6] = g->check_fn ? ' ' : 'n';
+		values[6] = g->if_expr ? CStringGetTextDatum(g->if_expr) : (Datum) 0;
+		nulls[6] = g->if_expr ? ' ' : 'n';
 		/* the whole rule: another rule under the same key may still be valid */
 		ret = SPI_execute_with_args(
 			"DELETE FROM letter.grants WHERE on_table = $1 AND scope = $2 "
@@ -5301,6 +5557,59 @@ revalidate_all(RevalidateMode mode, bool warn_unindexed, List **report)
 
 		remove_assignment(a->id, a->table_name, a->scope_table);
 	}
+
+	/* The users tables (plan/24 B8): the key column the trigger reads. */
+	ret = guarded_spi_execute(
+		"SELECT table_name, key_column FROM letter.user_tables ORDER BY table_name", false, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "letter: failed to load users tables for revalidation");
+	{
+		List	   *bad = NIL;		/* Oid, as a list of pointers to Oid */
+		List	   *bad_keys = NIL;
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			HeapTuple	tup = SPI_tuptable->vals[i];
+			TupleDesc	td = SPI_tuptable->tupdesc;
+			bool		isnull;
+			Oid			relid = DatumGetObjectId(SPI_getbinval(tup, td, 1, &isnull));
+			char	   *key = SPI_getvalue(tup, td, 2);
+			const char *name;
+
+			if (get_rel_name(relid) == NULL || key == NULL || column_exists(relid, key))
+				continue;
+			name = rel_qualified_name(relid);
+			if (mode == REVALIDATE_REPORT)
+			{
+				health_add(report, "error", psprintf("users table %s", name),
+						   psprintf("key column \"%s\" no longer exists", key));
+				continue;
+			}
+			if (mode == REVALIDATE_REFUSE)
+				ereport(ERROR,
+						(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+						 errmsg("letter: the users table %s would no longer be valid: key column \"%s\" no longer exists",
+								name, key),
+						 errhint("Undeclare it (letter.unusers) before altering the table.")));
+			ereport(NOTICE,
+					(errmsg("letter: %s is no longer the users table: key column \"%s\" no longer exists",
+							name, key)));
+			bad = lappend_oid(bad, relid);
+			bad_keys = lappend(bad_keys, key);
+		}
+		foreach(lc, bad)
+		{
+			Oid			relid = lfirst_oid(lc);
+
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "DELETE FROM letter.user_tables WHERE table_name = %u", relid);
+			spi_exec(buf.data);
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "DROP TRIGGER IF EXISTS letter_users_forget ON %s",
+							 rel_quoted_name(relid));
+			spi_exec(buf.data);
+		}
+	}
 	pfree(buf.data);
 }
 
@@ -5314,17 +5623,37 @@ cascade_dropped_table(Oid relid, const char *identity)
 	List	   *assignments = NIL;
 	ListCell   *lc;
 
-	sql = psprintf("DELETE FROM letter.grants WHERE on_table = %u OR scope = %u", relid, relid);
+	/* The grants on the table die with it; the grants scoped to it were on
+	 * OTHER tables, which keep their enforcement triggers unless this was
+	 * their last grant (plan/24, 2026-09-23): note those tables, and tidy
+	 * them once the rows are gone. */
+	sql = psprintf("DELETE FROM letter.grants WHERE on_table = %u OR scope = %u "
+				   "RETURNING on_table", relid, relid);
 	ret = SPI_execute(sql, false, 0);
-	if (ret != SPI_OK_DELETE)
+	if (ret != SPI_OK_DELETE_RETURNING)
 		elog(ERROR, "letter: failed to remove grants of a dropped table");
 	ngrants = SPI_processed;
+	{
+		List	   *others = NIL;
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			bool		isnull;
+			Oid			on_table = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i],
+																  SPI_tuptable->tupdesc, 1, &isnull));
+
+			if (!isnull && on_table != relid && !list_member_oid(others, on_table))
+				others = lappend_oid(others, on_table);
+		}
+		foreach(lc, others)
+			maybe_remove_enforcement_triggers(lfirst_oid(lc));
+	}
 
 	sql = psprintf("SELECT id::text, table_name, scope_table FROM letter.membership_rules "
 				   "WHERE table_name = %u OR scope_table = %u", relid, relid);
 	ret = SPI_execute(sql, false, 0);
 	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "letter: failed to load assignments of a dropped table");
+		elog(ERROR, "letter: failed to load membership rules of a dropped table");
 	for (i = 0; i < SPI_processed; i++)
 	{
 		HeapTuple	tup = SPI_tuptable->vals[i];
@@ -5349,12 +5678,21 @@ cascade_dropped_table(Oid relid, const char *identity)
 	sql = psprintf("DELETE FROM letter.memberships WHERE scope_table = %u", relid);
 	ret = SPI_execute(sql, false, 0);
 	if (ret != SPI_OK_DELETE)
-		elog(ERROR, "letter: failed to remove roles scoped to a dropped table");
+		elog(ERROR, "letter: failed to remove memberships scoped to a dropped table");
 	nroles = SPI_processed;
+
+	/* the users table (plan/24 B8): its trigger went with it */
+	sql = psprintf("DELETE FROM letter.user_tables WHERE table_name = %u", relid);
+	ret = SPI_execute(sql, false, 0);
+	if (ret != SPI_OK_DELETE)
+		elog(ERROR, "letter: failed to remove a dropped users table");
+	if (SPI_processed > 0)
+		ereport(NOTICE,
+				(errmsg("letter: dropped table %s: it was the users table", identity)));
 
 	if (ngrants > 0 || list_length(assignments) > 0 || nroles > 0)
 		ereport(NOTICE,
-				(errmsg("letter: dropped table %s: removed %llu grant(s), %d assignment(s), %llu role(s)",
+				(errmsg("letter: dropped table %s: removed %llu grant(s), %d rule(s), %llu membership(s)",
 						identity, (unsigned long long) ngrants,
 						list_length(assignments), (unsigned long long) nroles)));
 }
@@ -5391,6 +5729,7 @@ letter_on_sql_drop(PG_FUNCTION_ARGS)
 	bool		dropped_index = false;
 	bool		dropped_table = false;
 	bool		dropped_column = false;
+	bool		dropped_function = false;
 
 	if (!CALLED_AS_EVENT_TRIGGER(fcinfo))
 		elog(ERROR, "letter: not called as an event trigger");
@@ -5407,10 +5746,14 @@ letter_on_sql_drop(PG_FUNCTION_ARGS)
 		PushActiveSnapshot(GetTransactionSnapshot());
 		SPI_connect();
 
+		/* Functions too (plan/24 B3): an if may name one. Letter's own —
+		 * the generated rule functions unassign drops — are not a change to
+		 * anything letter depends on. */
 		ret = SPI_execute(
 			"SELECT object_type, objid, object_identity, address_names "
 			"FROM pg_catalog.pg_event_trigger_dropped_objects() "
-			"WHERE object_type IN ('table', 'table column', 'index')",
+			"WHERE object_type IN ('table', 'table column', 'index') "
+			"OR (object_type = 'function' AND schema_name <> 'letter')",
 			true, 0);
 		if (ret != SPI_OK_SELECT)
 			elog(ERROR, "letter: failed to read dropped objects");
@@ -5459,6 +5802,8 @@ letter_on_sql_drop(PG_FUNCTION_ARGS)
 				}
 				else if (strcmp(types[i], "index") == 0)
 					dropped_index = true;
+				else if (strcmp(types[i], "function") == 0)
+					dropped_function = true;
 				else if (cols[i] != NULL)
 				{
 					cascade_dropped_column(oids[i], cols[i], idents[i]);
@@ -5467,9 +5812,10 @@ letter_on_sql_drop(PG_FUNCTION_ARGS)
 			}
 		}
 
-		if (dropped_table || dropped_column)
+		if (dropped_table || dropped_column || dropped_function)
 		{
-			/* A table or column is gone: whatever depended on it goes too. */
+			/* A table, column or function is gone: whatever depended on it
+			 * goes too. */
 			revalidate_all(REVALIDATE_REMOVE, false, NULL);
 			invalidate_cache();
 		}
@@ -5497,18 +5843,38 @@ letter_on_sql_drop(PG_FUNCTION_ARGS)
 Datum
 letter_on_ddl_command_end(PG_FUNCTION_ARGS)
 {
+	EventTriggerData *trigdata = (EventTriggerData *) fcinfo->context;
+	bool		create_function;
+
 	if (!CALLED_AS_EVENT_TRIGGER(fcinfo))
 		elog(ERROR, "letter: not called as an event trigger");
 	if (letter_event_depth > 0 || !letter_catalog_exists())
 		PG_RETURN_NULL();
+	create_function = (strcmp(GetCommandTagName(trigdata->tag), "CREATE FUNCTION") == 0);
 
 	letter_event_depth++;
 	PG_TRY();
 	{
+		bool		skip = false;
+
 		CommandCounterIncrement();
 		PushActiveSnapshot(GetTransactionSnapshot());
 		SPI_connect();
-		revalidate_all(REVALIDATE_REFUSE, false, NULL);
+		/* CREATE OR REPLACE FUNCTION can change a function an if names
+		 * (plan/24, 2026-09-23). Letter's own generated rule functions are
+		 * not that: assign() would otherwise revalidate three times over. */
+		if (create_function)
+		{
+			int			ret = SPI_execute(
+				"SELECT 1 FROM pg_catalog.pg_event_trigger_ddl_commands() "
+				"WHERE schema_name IS DISTINCT FROM 'letter' LIMIT 1", true, 1);
+
+			if (ret != SPI_OK_SELECT)
+				elog(ERROR, "letter: failed to read the created objects");
+			skip = (SPI_processed == 0);
+		}
+		if (!skip)
+			revalidate_all(REVALIDATE_REFUSE, false, NULL);
 		SPI_finish();
 		PopActiveSnapshot();
 	}
@@ -5579,7 +5945,7 @@ letter_enforce_truncate(PG_FUNCTION_ARGS)
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		elog(ERROR, "letter: not called as trigger");
 
-	if (!should_bypass())
+	if (!letter_bypass)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("letter: TRUNCATE denied on \"%s.%s\" — requires letter.bypass",
@@ -5604,6 +5970,7 @@ letter_enforce_truncate(PG_FUNCTION_ARGS)
  * ---------------------------------------------------------------- */
 
 static void token_reject(const char *why) pg_attribute_noreturn();
+static void keys_reject(const char *why) pg_attribute_noreturn();
 
 static void
 token_reject(const char *why)
@@ -5613,7 +5980,22 @@ token_reject(const char *why)
 			 errmsg("letter: token rejected: %s", why)));
 }
 
-/* base64url, unpadded (RFC 7515). Returns palloc'd bytes, NUL-terminated too. */
+/* letter.jwt_keys itself is the problem: configuration, not a token
+ * (plan/24 C). The bare reason travels in errdetail for check_health(). */
+static void
+keys_reject(const char *why)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("letter: letter.jwt_keys: %s", why),
+			 errdetail("%s", why),
+			 errhint("letter.jwt_keys holds PEM public keys, each optionally preceded by a kid=… line.")));
+}
+
+/* base64url, unpadded (RFC 7515). Returns palloc'd bytes, NUL-terminated
+ * too. Strict (plan/24 E): padding, if any, is trailing '=' and nothing
+ * after it; a final quantum of one character encodes nothing and is
+ * refused. */
 static unsigned char *
 b64url_decode(const char *in, size_t inlen, size_t *outlen)
 {
@@ -5628,12 +6010,18 @@ b64url_decode(const char *in, size_t inlen, size_t *outlen)
 		char		c = in[i];
 		int			v;
 
+		if (c == '=')
+		{
+			for (; i < inlen; i++)
+				if (in[i] != '=')
+					token_reject("malformed base64url");
+			break;
+		}
 		if (c >= 'A' && c <= 'Z') v = c - 'A';
 		else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
 		else if (c >= '0' && c <= '9') v = c - '0' + 52;
 		else if (c == '-') v = 62;
 		else if (c == '_') v = 63;
-		else if (c == '=') break;
 		else token_reject("malformed base64url");
 		acc = (acc << 6) | v;
 		bits += 6;
@@ -5643,6 +6031,8 @@ b64url_decode(const char *in, size_t inlen, size_t *outlen)
 			out[o++] = (acc >> bits) & 0xff;
 		}
 	}
+	if (bits >= 6)
+		token_reject("malformed base64url");	/* a truncated final quantum */
 	out[o] = '\0';
 	*outlen = o;
 	return out;
@@ -5681,18 +6071,29 @@ token_string(Jsonb *jb, const char *key, bool *present)
 		*present = (v != NULL);
 	if (v == NULL || v->type != jbvString)
 		return NULL;
+	if (memchr(v->val.string.val, '\0', v->val.string.len) != NULL)
+		token_reject(psprintf("%s contains a NUL byte", key));		/* would be truncated (plan/24 E) */
 	return pnstrdup(v->val.string.val, v->val.string.len);
 }
 
+/* A NumericDate claim, exact (plan/24 E): compared as numeric, never
+ * through a double. */
 static bool
-token_number(Jsonb *jb, const char *key, double *out)
+token_number(Jsonb *jb, const char *key, Numeric *out)
 {
 	JsonbValue *v = getKeyJsonValueFromContainer(&jb->root, key, strlen(key), NULL);
 
 	if (v == NULL || v->type != jbvNumeric)
 		return false;
-	*out = DatumGetFloat8(DirectFunctionCall1(numeric_float8, NumericGetDatum(v->val.numeric)));
+	*out = v->val.numeric;
 	return true;
+}
+
+static int
+numeric_cmp_int64(Numeric a, int64 b)
+{
+	return DatumGetInt32(DirectFunctionCall2(numeric_cmp, NumericGetDatum(a),
+											 NumericGetDatum(int64_to_numeric(b))));
 }
 
 /* Does the aud claim (a string or an array of strings) contain aud? */
@@ -5789,14 +6190,14 @@ jwt_load_keys(void)
 			JwtKey	   *k;
 
 			if (end == NULL)
-				token_reject("letter.jwt_keys: a PEM block has no END line");
+				keys_reject("a PEM block has no END line");
 			endeol = strchr(end, '\n');
 			blocklen = (endeol ? (size_t) (endeol - p) : strlen(p));
 			bio = BIO_new_mem_buf(p, (int) blocklen);
 			pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
 			BIO_free(bio);
 			if (pkey == NULL)
-				token_reject("letter.jwt_keys: a PEM block is not a public key");
+				keys_reject("a PEM block is not a public key");
 			k = palloc0(sizeof(JwtKey));
 			k->kid = kid;
 			k->pkey = pkey;
@@ -5879,10 +6280,11 @@ jwt_verify(const char *token)
 	List	   *keys;
 	ListCell   *lc;
 	bool		verified = false, any_key = false, present;
-	double		now, exp, nbf;
+	int64		now;
+	Numeric		exp, nbf;
 
 	if (letter_jwt_keys[0] == '\0')
-		token_reject("no keys configured (letter.jwt_keys)");
+		keys_reject("no keys configured: nothing can be verified");
 	dot1 = strchr(token, '.');
 	dot2 = dot1 ? strchr(dot1 + 1, '.') : NULL;
 	if (dot1 == NULL || dot2 == NULL || strchr(dot2 + 1, '.') != NULL)
@@ -5901,6 +6303,10 @@ jwt_verify(const char *token)
 	if (alg == NULL)
 		token_reject(psprintf("algorithm %s is not accepted (RS256/384/512, ES256/384, EdDSA)", algname));
 	kid = token_string(header, "kid", NULL);
+	/* RFC 7515 §4.1.11: a crit header names extensions the verifier must
+	 * understand; this one understands none (plan/24 E). */
+	if (getKeyJsonValueFromContainer(&header->root, "crit", 4, NULL) != NULL)
+		token_reject("crit header: no extension is supported");
 
 	keys = jwt_load_keys();
 	foreach(lc, keys)
@@ -5922,13 +6328,13 @@ jwt_verify(const char *token)
 	if (!verified)
 		token_reject("bad signature");
 
-	now = (double) (GetCurrentTimestamp() / USECS_PER_SEC) +
-		(double) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY;
+	now = (int64) (GetCurrentTimestamp() / USECS_PER_SEC) +
+		(int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY;
 	if (!token_number(claims, "exp", &exp))
 		token_reject("no exp claim");
-	if (now > exp + letter_jwt_leeway)
+	if (numeric_cmp_int64(exp, now - letter_jwt_leeway) < 0)		/* now > exp + leeway */
 		token_reject("expired");
-	if (token_number(claims, "nbf", &nbf) && now + letter_jwt_leeway < nbf)
+	if (token_number(claims, "nbf", &nbf) && numeric_cmp_int64(nbf, now + letter_jwt_leeway) > 0)
 		token_reject("not yet valid");
 	if (letter_jwt_issuer[0] != '\0')
 	{
@@ -6066,13 +6472,13 @@ letter_jwt_keys_check(PG_FUNCTION_ARGS)
 		MemoryContextSwitchTo(oldcxt);
 		edata = CopyErrorData();
 		FlushErrorState();
-		why = pstrdup(edata->message);
+		why = pstrdup(edata->detail ? edata->detail : edata->message);
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
 	if (why == NULL)
 		PG_RETURN_NULL();
-	PG_RETURN_TEXT_P(cstring_to_text(why));
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("does not parse: %s", why)));
 #else
 	PG_RETURN_TEXT_P(cstring_to_text("letter was built without OpenSSL"));
 #endif
@@ -6092,6 +6498,170 @@ Datum
 letter_enforcing(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_BOOL(letter_preloaded && letter_enforce_reads && !letter_bypass);
+}
+
+/* ----------------------------------------------------------------
+ * The users table (plan/24 B8, Paul 2026-09-23). letter.users(rel)
+ * declares it: deleting a row of it — or changing its key — forgets
+ * that user, every membership the key holds, rule-derived (with their
+ * sources) and directly managed alike. So an identifier that is later
+ * reused starts from nothing. The declaration is a row of
+ * letter.user_tables (dumped, revalidated: its key column may not be
+ * renamed) and an AFTER trigger on the table, which runs with letter's
+ * authority so that the application's own delete forgets too.
+ * ---------------------------------------------------------------- */
+Datum
+letter_users(PG_FUNCTION_ARGS)
+{
+	Oid			relid;
+	char	   *schema_name;
+	char	   *table_name;
+	char	   *pk_col;
+	char	   *pk_type;
+	Oid			argtypes[2] = {REGCLASSOID, TEXTOID};
+	Datum		values[2];
+	int			ret;
+
+	require_superuser("letter.users");
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("letter: users needs a table")));
+	relid = PG_GETARG_OID(0);
+	split_table_name(rel_qualified_name(relid), &schema_name, &table_name);
+
+	SPI_connect();
+	reject_composite_pk(schema_name, table_name);
+	if (!lookup_pk_column(schema_name, table_name, &pk_col, &pk_type))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("letter: %s has no primary key", rel_qualified_name(relid)),
+				 errhint("The users table's key is what memberships name as user_id.")));
+
+	values[0] = ObjectIdGetDatum(relid);
+	values[1] = CStringGetTextDatum(pk_col);
+	ret = SPI_execute_with_args(
+		"INSERT INTO letter.user_tables (table_name, key_column) VALUES ($1, $2) "
+		"ON CONFLICT (table_name) DO UPDATE SET key_column = EXCLUDED.key_column",
+		2, argtypes, values, NULL, false, 0);
+	if (ret != SPI_OK_INSERT && ret != SPI_OK_UPDATE)
+		elog(ERROR, "letter: failed to record the users table");
+
+	spi_exec(psprintf("CREATE OR REPLACE TRIGGER letter_users_forget "
+					  "AFTER DELETE OR UPDATE ON %s FOR EACH ROW "
+					  "EXECUTE FUNCTION letter._users_forget()",
+					  rel_quoted_name(relid)));
+	SPI_finish();
+	PG_RETURN_BOOL(true);
+}
+
+Datum
+letter_unusers(PG_FUNCTION_ARGS)
+{
+	Oid			relid;
+	Oid			argtypes[1] = {REGCLASSOID};
+	Datum		values[1];
+	int			ret;
+
+	require_superuser("letter.unusers");
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("letter: unusers needs a table")));
+	relid = PG_GETARG_OID(0);
+	(void) rel_qualified_name(relid);
+
+	SPI_connect();
+	values[0] = ObjectIdGetDatum(relid);
+	ret = SPI_execute_with_args("DELETE FROM letter.user_tables WHERE table_name = $1",
+								1, argtypes, values, NULL, false, 0);
+	if (ret != SPI_OK_DELETE)
+		elog(ERROR, "letter: failed to remove the users table");
+	if (SPI_processed == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("letter: %s is not a declared users table", rel_qualified_name(relid))));
+	spi_exec(psprintf("DROP TRIGGER IF EXISTS letter_users_forget ON %s", rel_quoted_name(relid)));
+	SPI_finish();
+	PG_RETURN_BOOL(true);
+}
+
+/* AFTER DELETE OR UPDATE, for each row of a users table: forget the old
+ * key when it is gone or changed. Not subject to bypass — an
+ * administrator deleting users wants the hygiene too. */
+Datum
+letter_users_forget(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	Relation	rel;
+	Oid			argtypes[1] = {REGCLASSOID};
+	Datum		values[1];
+	char	   *key;
+	char	   *old_key;
+	int			attnum;
+	int			ret;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "letter: not called as trigger");
+	rel = trigdata->tg_relation;
+
+	SPI_connect();
+	values[0] = ObjectIdGetDatum(RelationGetRelid(rel));
+	ret = guarded_spi_execute_with_args(
+		"SELECT key_column FROM letter.user_tables WHERE table_name = $1",
+		1, argtypes, values, NULL, true, 1);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "letter: failed to look up the users table");
+	if (SPI_processed == 0)
+	{
+		/* the declaration is gone and the trigger was left behind:
+		 * check_health() says so; nothing to forget by */
+		SPI_finish();
+		return PointerGetDatum(NULL);
+	}
+	key = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+	attnum = SPI_fnumber(rel->rd_att, key);
+	if (attnum <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("letter: users table %s has no column \"%s\"",
+						rel_qualified_name(RelationGetRelid(rel)), key)));
+	old_key = SPI_getvalue(trigdata->tg_trigtuple, rel->rd_att, attnum);
+	if (old_key != NULL && TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+	{
+		char	   *new_key = SPI_getvalue(trigdata->tg_newtuple, rel->rd_att, attnum);
+
+		if (new_key != NULL && strcmp(new_key, old_key) == 0)
+			old_key = NULL;		/* the key stayed: nothing to forget */
+	}
+	if (old_key != NULL)
+	{
+		Oid			targtypes[1] = {TEXTOID};
+		Datum		tvalues[1];
+
+		tvalues[0] = CStringGetTextDatum(old_key);
+		ret = guarded_spi_execute_with_args("SELECT letter._forget_user($1)",
+											1, targtypes, tvalues, NULL, false, 0);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "letter: failed to forget a deleted user");
+	}
+	SPI_finish();
+	return PointerGetDatum(NULL);
+}
+
+/* letter._hidden_conflict(oid): the ON CONFLICT DO UPDATE path of a protected
+ * table reached a row the user cannot see (plan/24 A4). Never returns. */
+Datum
+letter_hidden_conflict(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("letter: INSERT … ON CONFLICT DO UPDATE on \"%s\" conflicts with a row the user cannot see",
+					rel_qualified_name(relid)),
+			 errhint("Rows the user cannot see are not there for UPDATE; an upsert that would update one is refused.")));
+	PG_RETURN_BOOL(false);		/* not reached */
 }
 
 Datum
@@ -6163,7 +6733,7 @@ letter_read(PG_FUNCTION_ARGS)
 		split_table_name(qualified_table, &schema_name, &table_name);
 		condition = cond_null ? NULL : text_to_cstring(cond_arg);
 
-		bypass = should_bypass();
+		bypass = letter_bypass;
 
 		/* Fail closed: a missing user id is the one read error we raise.
 		 * Every other access failure (no applicable grant, row out of scope,
@@ -6200,8 +6770,8 @@ letter_read(PG_FUNCTION_ARGS)
 		 * condition is a raw SQL fragment BY DESIGN and sits inside the
 		 * application trust boundary — it is also evaluated against true
 		 * values (the predicate oracle, plan/14-enforcement-gaps.md §1),
-		 * which is why letter.read() must be rebuilt on the planner
-		 * hook's barrier machinery or deprecated at Phase 5 step 2. */
+		 * which is why letter._read() is test-only plumbing (plan/20 S2),
+		 * not callable by the application (plan/24 A3). */
 		initStringInfo(&query);
 		appendStringInfo(&query, "SELECT * FROM %s.%s",
 						 quote_identifier(schema_name),

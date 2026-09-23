@@ -17,10 +17,24 @@ SET letter.jwt_issuer = 'https://issuer.test';
 SET letter.jwt_audience = 'letter';
 
 -- ============================================================
--- 1. A good token, for the session and for a transaction.
+-- 1. A good token, for the session and for a transaction. In the
+--    default mode login() sets letter.user_id, and enforcement follows
+--    the setting as it always does.
 -- ============================================================
 SELECT letter.login(:'rs256_ok', false);
 SELECT letter.user_id();
+SHOW letter.user_id;
+SET letter.bypass = on;
+CREATE TABLE diary (id int PRIMARY KEY, owner text, body text);
+INSERT INTO diary VALUES (1, 'alice', 'hers'), (2, 'bob', 'his');
+SELECT letter.grant_global('select', 'public.diary', 'any_user', ARRAY['*'], if := 'owner = letter.user_id()');
+RESET letter.bypass;
+SELECT body FROM diary;                       -- alice's row, through the setting login() made
+SET letter.user_id = 'bob';                   -- the setting is the identity here: the application may still change it
+SELECT body FROM diary;
+SET letter.bypass = on;
+DROP TABLE diary;
+RESET letter.bypass;
 RESET letter.user_id;
 BEGIN;
 SELECT letter.login(:'rs256_ok');
@@ -101,6 +115,11 @@ RESET letter.bypass;
 SET letter.identity = token;
 SET letter.user_id = 'mallory';
 SELECT letter.user_id() IS NULL AS setting_ignored;
+-- a proxy's claims would set the same ignored setting: an error, not a
+-- silent no-op (plan/24 B7)
+SELECT set_config('request.jwt.claims', '{"sub": "mallory"}', false) IS NOT NULL AS claims_set;
+SELECT letter.user_from_claims();
+RESET request.jwt.claims;
 SELECT count(*) FROM notes;                  -- nobody: an error, as ever
 SELECT letter.login(:'rs256_ok', false);
 SELECT letter.user_id();

@@ -191,9 +191,9 @@ SELECT count(*) FROM reactions WHERE emoji LIKE 'fk-%';
 \set VERBOSITY default
 -- Cleanup
 DROP TABLE team_members CASCADE;
-NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 rule(s), 0 membership(s)
 DROP TABLE reactions CASCADE;
-NOTICE:  letter: dropped table public.reactions: removed 2 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.reactions: removed 2 grant(s), 0 rule(s), 0 membership(s)
 DROP TABLE comments CASCADE;
 DROP TABLE tasks CASCADE;
 DROP TABLE projects CASCADE;

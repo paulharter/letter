@@ -267,7 +267,7 @@ DEALLOCATE count_p;
 -- until it is granted on again, as a migration would.
 SET letter.bypass = on;
 DROP TABLE notes;
-NOTICE:  letter: dropped table public.notes: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.notes: removed 1 grant(s), 0 rule(s), 0 membership(s)
 CREATE TABLE notes (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id uuid NOT NULL REFERENCES projects(id),
@@ -512,7 +512,7 @@ DROP FUNCTION count_notes();
 DROP TABLE scratch;
 DROP TABLE widgets CASCADE;
 DROP TABLE notes CASCADE;
-NOTICE:  letter: dropped table public.notes: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.notes: removed 1 grant(s), 0 rule(s), 0 membership(s)
 DROP TABLE projects CASCADE;
-NOTICE:  letter: dropped table public.projects: removed 1 grant(s), 0 assignment(s), 2 role(s)
+NOTICE:  letter: dropped table public.projects: removed 1 grant(s), 0 rule(s), 2 membership(s)
 DROP EXTENSION letter CASCADE;

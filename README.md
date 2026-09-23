@@ -41,8 +41,9 @@ otherwise run without it. The library warns when loaded any other way, and
   `anyone` is every session at all, user set or not. Both are global only. Sign-up is
   `grant_global('insert', 'public.users', 'any_user', if := 'id = letter.user_id()::uuid')`
   — a user inserts the row that brings them into existence, and no other. An `anyone`
-  select grant makes a table readable by an anonymous session: the one case in which
-  an unset user is not an error, and only on that table.
+  grant serves anonymous sessions: a select grant makes the table readable with no
+  user set — the one case in which an unset user is not an error, and only on that
+  table — and an insert grant (a guestbook) accepts their rows.
 - **Grants are a set of permissive rules.** They cannot contradict each other and their
   order does not matter; a rule can only add. Granting the same rule twice is one rule;
   two rules for one role that differ in their path both stand. Narrowing means revoking.
@@ -59,13 +60,20 @@ otherwise run without it. The library warns when loaded any other way, and
   (`old.status = 'draft' AND new.status = 'published'`) is checked once, on the
   transition. The expression sees only the row: no subqueries, and any function it
   calls must be `IMMUTABLE` (`pg_catalog` functions and `letter.user_id()` are allowed).
+  It is stored in its resolved, schema-qualified form — what `list_grants()` shows —
+  and, like letter's own generated SQL, parsed with `search_path` pinned to
+  `pg_catalog`, so a session's search path cannot steer a name in it.
 - **Membership rules** (`letter.assign`) derive memberships from your own tables (a
   `team_members` table with a `user_id`, a `project_id` and a `role` column) and keep
   them in step through triggers. An `if` limits them to the source rows that satisfy it.
-- **Users** are opaque strings to letter. Memberships derived by rules follow their
-  source rows; memberships the application inserts directly are the application's to
-  remove — `letter.forget_user(user_id)` removes every membership a user holds, of both
-  kinds.
+- **Users** are opaque strings to letter — whatever the application, or the token,
+  calls them. Memberships derived by rules follow their source rows. Declaring the
+  users table (`letter.users('public.users')`) makes forgetting consequent on
+  deletion: when a row of it goes, or its key changes, every membership that key
+  holds goes too — the ones rules derived and the ones an administrator inserted —
+  so an identifier that is later reused starts from nothing. An application without
+  a users table (an external identity provider, say) has only rule-derived
+  memberships, which need no declaration.
 - **The current user** is the session setting `letter.user_id`, which the
   application sets per request. While it is unset, any read or write of a protected
   table is an error — except on a table with an `anyone` grant, which serves the
@@ -91,23 +99,30 @@ letter.assign  (source_table regclass, user_column text,
 letter.unassign(source_table regclass, user_column text,
                 role text DEFAULT NULL, role_column text DEFAULT NULL, scope regclass DEFAULT NULL)
 
+letter.users(rel regclass)                                  -- declare the users table: deleting a row forgets that user
+letter.unusers(rel regclass)                                -- undeclare it
 letter.visible_columns(rel regclass, pk text)              -- text[]: what this user may read of that row
-letter.forget_user(user_id text)                            -- remove every membership the user holds; bigint
 letter.user_id()                                       -- the current user id as text, NULL when unset
-letter.user_from_claims(claim DEFAULT 'sub')          -- identity from a proxy's verified JWT claims, for the transaction
-letter.login(token text, local DEFAULT true)           -- verify a JWT against letter.jwt_keys, become its user; letter.logout()
+letter.user_from_claims(claim DEFAULT 'sub', setting DEFAULT 'request.jwt.claims')
+                                                       -- identity from a proxy's verified JWT claims, for the transaction
+letter.login(token text, local DEFAULT true)           -- verify a JWT against letter.jwt_keys, become its user
+letter.logout()                                        -- nobody, in either identity mode
 letter.enforcing()                                     -- is this session protected? the application's start-up probe
 letter.list_grants(role text DEFAULT NULL)
 letter.user_permissions(user_id text)
-letter.read_policy(rel regclass)                            -- the read-enforcement subquery
+letter.read_policy(rel regclass)                            -- the read-enforcement subquery (not callable by the application)
+letter.write_policy(rel regclass)                           -- the write path's row qual and column tests (likewise)
 letter.check_health()                                       -- (severity, object, message)
 ```
 
 `columns` may be `ARRAY['*']`; for `insert` and `delete` — row-level privileges — it
-is omitted (a column list is refused). A grant on a table that does not exist is refused; a scoped grant
-whose `via` is not a chain of foreign keys, or whose scope or hop tables have
-composite primary keys, is refused. Primary-key columns are always readable.
-`revoke_*` removes every rule under its key.
+is omitted (a column list is refused). A privilege that is not one of the five, or a
+column the table does not have, is refused. A grant on a table that does not exist is
+refused; a scoped grant whose `via` is not a chain of foreign keys, or whose scope or
+hop tables have composite primary keys, is refused. Primary-key columns are always
+readable. `revoke_*` removes every rule under its key; `revoke_scoped` takes its
+`columns` before the scope, so a scoped insert or delete rule is revoked with
+`ARRAY['*']`.
 
 Example:
 
@@ -191,10 +206,11 @@ once per request, through PostgREST's pre-request hook:
 db-pre-request = "letter.user_from_claims"
 ```
 
-`letter.user_from_claims(claim DEFAULT 'sub')` sets `letter.user_id` for the
-transaction from the claim named, and leaves it unset for a request without one — an
-anonymous request, which only `anyone` grants serve. The proxy validates; the database
-trusts it.
+`letter.user_from_claims(claim DEFAULT 'sub', setting DEFAULT 'request.jwt.claims')`
+sets `letter.user_id` for the transaction from the claim named, and leaves it unset
+for a request without one — an anonymous request, which only `anyone` grants serve.
+The proxy validates; the database trusts it. In token mode (below) the setting it
+would make is ignored, so there it is an error.
 
 **Token mode: the database validates.** For an application server that holds the raw
 token, letter can verify it itself, against the issuer's *public* key — RSA, ECDSA or
@@ -254,7 +270,9 @@ grant that shows the rows to be written: a role with `delete` but no `select` on
 table deletes nothing, silently. `grant_*` warns when a write grant has no select
 grant beside it, and `check_health()` reports it. Hidden columns read as NULL wherever
 a write reads them: in the `WHERE`, in `SET` expressions, in `RETURNING`, in
-`ON CONFLICT`. `INSERT … RETURNING` is redacted too.
+`ON CONFLICT`. `INSERT … RETURNING` is redacted too. An `INSERT … ON CONFLICT DO
+UPDATE` whose conflicting row the user cannot see is refused — the unique violation
+would have revealed the row anyway, so there is nothing to hide by skipping it.
 
 ## Deployment model
 
@@ -264,7 +282,11 @@ needs `USAGE` on schema `letter` to call `letter.user_id()` and
 `letter.visible_columns()`, and nothing else. Letter's own reads and writes — the
 grants it consults, the memberships its rules maintain — run with letter's authority
 (the extension owner's), the way a `SECURITY DEFINER` function does, so the
-application can only ever reach a membership through a rule:
+application can only ever reach a membership through a rule. The functions that
+disclose configuration (`read_policy`, `write_policy`, `check_health`'s plumbing) and
+letter's test-only walker are not executable by `PUBLIC`. An `if` is the exception
+in the other direction: a function it names runs as the writer or reader, never as
+letter — an `if` cannot borrow letter's authority.
 
 ```sql
 GRANT USAGE ON SCHEMA letter TO app;
@@ -286,7 +308,8 @@ ALTER ROLE migrator SET letter.bypass = on;      -- a superuser, for now
 
 `letter.bypass` is superuser-settable only (`PGC_SUSET`). Superusers are **not**
 bypassed implicitly — the same `ALTER ROLE` opts them in. `letter.assign()` and
-`letter.unassign()` require bypass. `TRUNCATE` on a protected table requires bypass.
+`letter.unassign()` require bypass. `TRUNCATE` requires bypass on every table outside
+the exempt schemas, protected or not: it is a bulk operation no grant describes.
 
 Memberships never need an administrator unless you want them to: they follow from
 the application's own writes. A user signs up as themselves (`any_user`); one who
@@ -299,8 +322,8 @@ process with bypass, never through a letter-enforced route.
 
 ## Backup and restore
 
-`pg_dump` includes letter's grants, memberships, membership rules and membership
-sources. Restore
+`pg_dump` includes letter's grants, memberships, membership rules, membership
+sources and users-table declarations. Restore
 with letter switched off, so that nothing is re-derived or re-validated while the
 schema is half-built:
 
@@ -321,14 +344,21 @@ on have not been added yet. The dump role should have `letter.bypass = on` by de
 
 Letter keeps its state consistent with your schema:
 
-- **Dropping** a table or column removes the letter state that depended on it — grants
-  on it, grants whose scope path or `if` crosses it, membership rules that use it,
-  memberships scoped to it — with a `NOTICE`.
+- **Dropping** a table, a column or a function an `if` names removes the letter state
+  that depended on it — grants on it, grants whose scope path or `if` crosses it,
+  membership rules that use it, memberships scoped to it — with a `NOTICE`.
 - **Altering** something so that existing letter state stops making sense — renaming a
-  granted column or one an `if` names, dropping a foreign key on a scope path, adding a
-  second foreign key that makes an inferred hop ambiguous, giving a scope table a
-  composite key — is **refused**. Revoke or unassign first.
+  granted column or one an `if` names, renaming a rule's user, role, key or scope
+  column or the users table's key, dropping a foreign key on a scope path, adding a
+  second foreign key that makes an inferred hop ambiguous, dropping a scope or hop
+  table's primary key or making it composite, making a function an `if` names
+  non-`IMMUTABLE` (by `ALTER` or by `CREATE OR REPLACE`) or renaming it — is
+  **refused**. Revoke or unassign first.
 - Renames and schema moves need nothing: identity is by OID.
+- These cascades write letter's tables, so the DDL that triggers them runs as a role
+  that may: the superuser that configures letter. A non-superuser table owner's
+  `DROP TABLE` fails on letter's tables — even one that owns the table — until it
+  is run as the administrator.
 - `DROP EXTENSION letter` is refused while enforcement or membership-rule triggers exist on
   your tables; `DROP EXTENSION letter CASCADE` removes them all.
 - `letter.check_health()` reports what the above cannot prevent: state edited by hand,

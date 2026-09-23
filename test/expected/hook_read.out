@@ -625,7 +625,7 @@ SELECT name FROM projects ORDER BY name;
 
 SET letter.bypass = on;
 DROP TABLE pages;
-NOTICE:  letter: dropped table public.pages: removed 3 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.pages: removed 3 grant(s), 0 rule(s), 0 membership(s)
 -- ============================================================
 -- 10. Identity from a proxy's verified claims (plan/23 T1): what
 --     PostgREST does per request — SET LOCAL request.jwt.claims, then
@@ -684,6 +684,115 @@ SELECT letter.user_id() IS NULL AS still_unset;
 
 ROLLBACK;
 SET letter.bypass = on;
+-- ============================================================
+-- 11. FROM ONLY is honoured (plan/24 B5): an inheritance child's rows
+--     come through the parent's barrier, and ONLY leaves them out, as
+--     it does for an unprotected table.
+-- ============================================================
+CREATE TABLE tasks_archive () INHERITS (tasks);
+INSERT INTO tasks_archive (project_id, title) VALUES ('b0000000-0000-0000-0000-000000000001', 'Alpha task, archived');
+SET letter.bypass = off;
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
+SELECT title FROM tasks ORDER BY title;
+        title         
+----------------------
+ Alpha task
+ Alpha task, archived
+(2 rows)
+
+SELECT title FROM ONLY tasks ORDER BY title;
+   title    
+------------
+ Alpha task
+(1 row)
+
+SELECT count(*) FROM ONLY tasks t JOIN projects p ON p.id = t.project_id;
+ count 
+-------
+     1
+(1 row)
+
+SET letter.bypass = on;
+DROP TABLE tasks_archive;
+-- ============================================================
+-- 12. A session's search_path cannot reach into letter's SQL (plan/24,
+--     2026-09-23): the barrier, the write path's tests and every stored
+--     if are parsed with search_path pinned to pg_catalog, and an if is
+--     stored resolved and schema-qualified. A schema named first in the
+--     application's search_path — or pg_temp — with its own is_ok() and
+--     its own "=" changes nothing. dora is a global auditor: names only.
+-- ============================================================
+CREATE FUNCTION public.is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT t <> 'Gamma' $$;
+SELECT letter.grant_global('select', 'public.projects', 'auditor', ARRAY['status'], if := 'is_ok(name)');
+ grant_global 
+--------------
+ t
+(1 row)
+
+SELECT letter.grant_global('update', 'public.projects', 'auditor', ARRAY['status'], if := 'is_ok(name)');
+ grant_global 
+--------------
+ t
+(1 row)
+
+SELECT "if" FROM letter.grants WHERE role = 'auditor' AND privilege = 'update';   -- stored resolved
+         if         
+--------------------
+ public.is_ok(name)
+(1 row)
+
+CREATE SCHEMA evil;
+CREATE FUNCTION evil.is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;
+CREATE FUNCTION evil.always(a uuid, b uuid) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;
+CREATE OPERATOR evil.= (LEFTARG = uuid, RIGHTARG = uuid, FUNCTION = evil.always);
+CREATE FUNCTION pg_temp.is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;
+SET letter.bypass = off;
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000004';
+SET search_path = evil, pg_temp, pg_catalog, public;
+SELECT name, status FROM projects ORDER BY name;                   -- Gamma's status stays hidden
+ name  | status 
+-------+--------
+ Alpha | active
+ Beta  | draft
+ Gamma | 
+(3 rows)
+
+UPDATE projects SET status = 'hijacked' WHERE name = 'Gamma';     -- and unwritable
+ERROR:  letter: UPDATE denied on "public.projects" column "status" for user "a0000000-0000-0000-0000-000000000004" — requires 'update' privilege
+SELECT name, status FROM projects ORDER BY name;
+ name  | status 
+-------+--------
+ Alpha | active
+ Beta  | draft
+ Gamma | 
+(3 rows)
+
+SET search_path = pg_temp, public, pg_catalog;
+SELECT name, status FROM projects ORDER BY name;
+ name  | status 
+-------+--------
+ Alpha | active
+ Beta  | draft
+ Gamma | 
+(3 rows)
+
+RESET search_path;
+SET letter.bypass = on;
+SELECT letter.revoke_global('select', 'public.projects', 'auditor', ARRAY['status']);
+ revoke_global 
+---------------
+ t
+(1 row)
+
+SELECT letter.revoke_global('update', 'public.projects', 'auditor', ARRAY['status']);
+ revoke_global 
+---------------
+ t
+(1 row)
+
+DROP SCHEMA evil CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DROP FUNCTION public.is_ok(text);
 \set VERBOSITY default
 -- Cleanup
 RESET letter.user_id;
@@ -692,11 +801,11 @@ DROP FUNCTION parity(regclass), project_names(), project_names_plpgsql();
 DROP VIEW project_budgets, project_budgets_inv;
 DROP TABLE scratch;
 DROP TABLE log, loggers, reporters, auditors, team_members, tasks, projects, users CASCADE;
-NOTICE:  letter: dropped table public.users: removed 1 grant(s), 0 assignment(s), 0 role(s)
-NOTICE:  letter: dropped table public.projects: removed 6 grant(s), 1 assignment(s), 0 role(s)
-NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 assignment(s), 0 role(s)
-NOTICE:  letter: dropped table public.auditors: removed 0 grant(s), 1 assignment(s), 0 role(s)
-NOTICE:  letter: dropped table public.reporters: removed 0 grant(s), 1 assignment(s), 0 role(s)
-NOTICE:  letter: dropped table public.loggers: removed 0 grant(s), 1 assignment(s), 0 role(s)
-NOTICE:  letter: dropped table public.log: removed 3 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.users: removed 1 grant(s), 0 rule(s), 0 membership(s)
+NOTICE:  letter: dropped table public.projects: removed 6 grant(s), 1 rule(s), 0 membership(s)
+NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 rule(s), 0 membership(s)
+NOTICE:  letter: dropped table public.auditors: removed 0 grant(s), 1 rule(s), 0 membership(s)
+NOTICE:  letter: dropped table public.reporters: removed 0 grant(s), 1 rule(s), 0 membership(s)
+NOTICE:  letter: dropped table public.loggers: removed 0 grant(s), 1 rule(s), 0 membership(s)
+NOTICE:  letter: dropped table public.log: removed 3 grant(s), 0 rule(s), 0 membership(s)
 DROP EXTENSION letter CASCADE;

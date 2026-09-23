@@ -44,7 +44,7 @@ HINT:  Add letter to shared_preload_libraries (or session_preload_libraries).
 \set VERBOSITY terse
 -- Nothing configured: nothing verifies.
 SELECT letter.login(:'rs256_ok');
-ERROR:  letter: token rejected: no keys configured (letter.jwt_keys)
+ERROR:  letter: letter.jwt_keys: no keys configured: nothing can be verified
 SELECT set_config('letter.jwt_keys', :'key_rsa_a', false) IS NOT NULL AS keys_set;
  keys_set 
 ----------
@@ -54,7 +54,9 @@ SELECT set_config('letter.jwt_keys', :'key_rsa_a', false) IS NOT NULL AS keys_se
 SET letter.jwt_issuer = 'https://issuer.test';
 SET letter.jwt_audience = 'letter';
 -- ============================================================
--- 1. A good token, for the session and for a transaction.
+-- 1. A good token, for the session and for a transaction. In the
+--    default mode login() sets letter.user_id, and enforcement follows
+--    the setting as it always does.
 -- ============================================================
 SELECT letter.login(:'rs256_ok', false);
  login 
@@ -68,6 +70,39 @@ SELECT letter.user_id();
  alice
 (1 row)
 
+SHOW letter.user_id;
+ letter.user_id 
+----------------
+ alice
+(1 row)
+
+SET letter.bypass = on;
+CREATE TABLE diary (id int PRIMARY KEY, owner text, body text);
+INSERT INTO diary VALUES (1, 'alice', 'hers'), (2, 'bob', 'his');
+SELECT letter.grant_global('select', 'public.diary', 'any_user', ARRAY['*'], if := 'owner = letter.user_id()');
+ grant_global 
+--------------
+ t
+(1 row)
+
+RESET letter.bypass;
+SELECT body FROM diary;                       -- alice's row, through the setting login() made
+ body 
+------
+ hers
+(1 row)
+
+SET letter.user_id = 'bob';                   -- the setting is the identity here: the application may still change it
+SELECT body FROM diary;
+ body 
+------
+ his
+(1 row)
+
+SET letter.bypass = on;
+DROP TABLE diary;
+NOTICE:  letter: dropped table public.diary: removed 1 grant(s), 0 rule(s), 0 membership(s)
+RESET letter.bypass;
 RESET letter.user_id;
 BEGIN;
 SELECT letter.login(:'rs256_ok');
@@ -117,7 +152,7 @@ ERROR:  letter: token rejected: algorithm HS256 is not accepted (RS256/384/512, 
 SELECT letter.login(:'es256_ok');            -- an RSA key never verifies an ES256 token
 ERROR:  letter: token rejected: bad signature
 SELECT letter.login(:'garbage');
-ERROR:  letter: token rejected: header is not valid JSON
+ERROR:  letter: token rejected: malformed base64url
 SELECT letter.login(:'two_parts');
 ERROR:  letter: token rejected: not a JWT (three segments expected)
 SELECT letter.login('');
@@ -226,7 +261,7 @@ SELECT set_config('letter.jwt_keys', E'-----BEGIN PUBLIC KEY-----\nnot a key\n--
 (1 row)
 
 SELECT letter.login(:'rs256_ok');
-ERROR:  letter: token rejected: letter.jwt_keys: a PEM block is not a public key
+ERROR:  letter: letter.jwt_keys: a PEM block is not a public key
 -- ============================================================
 -- 6. Token mode (plan/23 D4): the current user is what login() verified
 --    and nothing else — SET letter.user_id neither helps nor hurts. Local
@@ -257,6 +292,17 @@ SELECT letter.user_id() IS NULL AS setting_ignored;
  t
 (1 row)
 
+-- a proxy's claims would set the same ignored setting: an error, not a
+-- silent no-op (plan/24 B7)
+SELECT set_config('request.jwt.claims', '{"sub": "mallory"}', false) IS NOT NULL AS claims_set;
+ claims_set 
+------------
+ t
+(1 row)
+
+SELECT letter.user_from_claims();
+ERROR:  letter: letter.identity is token: the setting user_from_claims() would make is ignored
+RESET request.jwt.claims;
 SELECT count(*) FROM notes;                  -- nobody: an error, as ever
 ERROR:  letter: letter.user_id is not set
 SELECT letter.login(:'rs256_ok', false);
@@ -380,5 +426,5 @@ SELECT letter.user_id() AS setting_again;     -- the GUC is the identity again: 
 \set VERBOSITY default
 RESET letter.user_id;
 DROP TABLE notes;
-NOTICE:  letter: dropped table public.notes: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.notes: removed 1 grant(s), 0 rule(s), 0 membership(s)
 DROP EXTENSION letter CASCADE;

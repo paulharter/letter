@@ -304,6 +304,45 @@ SELECT * FROM truth() WHERE tbl = 'notes';
 (3 rows)
 
 UPDATE notes SET extra = 'x1' WHERE id = 'c0000000-0000-0000-0000-000000000001';
+-- An upsert that conflicts with a row alice cannot see (Beta's note) is
+-- refused (plan/24 A4): rows she cannot see are not there for UPDATE, and
+-- the unique violation would have revealed the row anyway — whatever the
+-- statement's own WHERE says, constant or not. DO NOTHING on the same
+-- conflict is what it says. A conflict with a visible row still updates it,
+-- the statement's own WHERE included.
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'take over')
+    ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body;
+ERROR:  letter: INSERT … ON CONFLICT DO UPDATE on "public.notes" conflicts with a row the user cannot see
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'take over')
+    ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body WHERE notes.body = 'n2';
+ERROR:  letter: INSERT … ON CONFLICT DO UPDATE on "public.notes" conflicts with a row the user cannot see
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'take over')
+    ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body WHERE false;
+ERROR:  letter: INSERT … ON CONFLICT DO UPDATE on "public.notes" conflicts with a row the user cannot see
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', 'take over')
+    ON CONFLICT (id) DO NOTHING;
+INSERT INTO notes (id, project_id, body)
+    VALUES ('c0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', 'mine')
+    ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body WHERE notes.body = 'n1'
+    RETURNING body;
+ body 
+------
+ mine
+(1 row)
+
+SELECT * FROM truth() WHERE tbl = 'notes';
+  tbl  |                  id                  |  a   | b  
+-------+--------------------------------------+------+----
+ notes | c0000000-0000-0000-0000-000000000001 | mine | x1
+ notes | c0000000-0000-0000-0000-000000000002 | n2   | x2
+ notes | c0000000-0000-0000-0000-000000000003 | n3   | x3
+(3 rows)
+
+UPDATE notes SET body = 'n1' WHERE id = 'c0000000-0000-0000-0000-000000000001';
 -- ============================================================
 -- 6. UPDATE … FROM a protected table, and a sublink back to the
 --    result relation. notes.project_id is the grant's path column
@@ -423,7 +462,7 @@ SELECT title, state FROM tickets ORDER BY title;
 (2 rows)
 
 DROP TABLE tickets;
-NOTICE:  letter: dropped table public.tickets: removed 4 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.tickets: removed 4 grant(s), 0 rule(s), 0 membership(s)
 SET letter.bypass = off;
 \set VERBOSITY default
 -- Cleanup
@@ -431,5 +470,5 @@ RESET letter.user_id;
 RESET letter.enforce_reads;
 DROP FUNCTION truth();
 DROP TABLE team_members, notes, projects, users CASCADE;
-NOTICE:  letter: dropped table public.projects: removed 10 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.projects: removed 10 grant(s), 1 rule(s), 0 membership(s)
 DROP EXTENSION letter CASCADE;

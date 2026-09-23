@@ -135,3 +135,15 @@ def test_the_user_is_whoever_the_app_says(seeded, app):
         assert col(app, "SELECT name FROM projects") == ["Alpha"]
     with as_user(app, BOB):
         assert col(app, "SELECT name FROM projects") == ["Beta"]
+
+
+def test_the_walker_oracle_is_not_the_apps(seeded, app):
+    """`letter._read()` — test plumbing that evaluates a raw condition with letter's authority — and the functions that disclose configuration are not executable by the application role (plan/24 A3)."""
+    with as_user(app, ALICE):
+        for call in ("SELECT letter._read('public.projects', 'true')",
+                     "SELECT letter.read_policy('public.projects')",
+                     "SELECT letter.write_policy('public.projects')",
+                     "SELECT * FROM letter._problems()"):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                app.execute(call)
+        assert col(app, "SELECT name FROM projects") == ["Alpha"]       # the enforced read is the app's

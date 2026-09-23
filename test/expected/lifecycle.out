@@ -207,9 +207,15 @@ ERROR:  letter: the select grant to "editor" on public.comments (column "body") 
 -- a via column
 ALTER TABLE comments RENAME COLUMN task_id TO task;
 ERROR:  letter: the select grant to "editor" on public.comments (column "body") would no longer be valid: letter: via column "task_id" is not a foreign key on public.comments
--- an assignment's user column
+-- a rule's user column
 ALTER TABLE team_members RENAME COLUMN user_id TO member_id;
-ERROR:  letter: the assignment on public.team_members would no longer be valid: column "user_id" of public.team_members no longer exists
+ERROR:  letter: the membership rule on public.team_members would no longer be valid: column "user_id" of public.team_members no longer exists
+-- a rule's key column and its scope column: the generated functions name
+-- them (plan/24 B1)
+ALTER TABLE team_members RENAME COLUMN id TO tm_id;
+ERROR:  letter: the membership rule on public.team_members would no longer be valid: key column "id" of public.team_members no longer exists
+ALTER TABLE team_members RENAME COLUMN project_id TO proj_id;
+ERROR:  letter: the membership rule on public.team_members would no longer be valid: scope column "project_id" of public.team_members no longer exists
 -- an FK on a path (explicit hop, then inferred final hop)
 ALTER TABLE comments DROP CONSTRAINT comments_task_id_fkey;
 ERROR:  letter: the select grant to "editor" on public.comments (column "body") would no longer be valid: letter: via column "task_id" is not a foreign key on public.comments
@@ -222,9 +228,13 @@ ERROR:  letter: the select grant to "editor" on public.tasks (column "title") wo
 ALTER TABLE tasks DROP CONSTRAINT tasks_pkey CASCADE, ADD PRIMARY KEY (id, project_id);
 NOTICE:  drop cascades to constraint comments_task_id_fkey on table comments
 ERROR:  letter: the select grant to "editor" on public.comments (column "body") would no longer be valid: letter: via column "task_id" is not a foreign key on public.comments
--- an assignment's scope FK
+-- no PK at all on a scope table (plan/24, 2026-09-23)
+ALTER TABLE projects DROP CONSTRAINT projects_pkey CASCADE;
+NOTICE:  drop cascades to 2 other objects
+ERROR:  letter: the select grant to "editor" on public.tasks (column "title") would no longer be valid: letter: public.projects has no primary key — a scope table or a table along a scope path needs one
+-- a rule's scope FK
 ALTER TABLE team_members DROP CONSTRAINT team_members_project_id_fkey;
-ERROR:  letter: the assignment on public.team_members would no longer be valid: public.team_members has no foreign key to its scope table public.projects
+ERROR:  letter: the membership rule on public.team_members would no longer be valid: public.team_members has no foreign key to its scope table public.projects
 -- nothing changed
 SELECT attname FROM pg_attribute WHERE attrelid = 'comments'::regclass AND attnum > 0 ORDER BY attnum;
  attname 
@@ -233,6 +243,15 @@ SELECT attname FROM pg_attribute WHERE attrelid = 'comments'::regclass AND attnu
  task_id
  author
  body
+(4 rows)
+
+SELECT attname FROM pg_attribute WHERE attrelid = 'team_members'::regclass AND attnum > 0 ORDER BY attnum;
+  attname   
+------------
+ id
+ user_id
+ project_id
+ role
 (4 rows)
 
 SELECT conname FROM pg_constraint WHERE conrelid IN ('comments'::regclass, 'tasks'::regclass) ORDER BY 1;
@@ -255,6 +274,96 @@ DROP INDEX comments_task_id_idx;
 WARNING:  letter: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
 WARNING:  letter: scope path column "task_id" on public.comments has no index — reads scoped through it will scan the whole table
 CREATE INDEX comments_task_id_idx ON comments (task_id);
+-- ============================================================
+-- 2b. A function an if names (plan/24 B3): changing it so that the
+--     if no longer validates is refused, dropping it removes the
+--     rules that name it — grants and membership rules alike.
+-- ============================================================
+CREATE FUNCTION is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT t <> 'no' $$;
+SELECT letter.grant_scoped('update', 'public.comments', 'editor', ARRAY['body'], 'public.projects',
+                           ARRAY['task_id'], if := 'is_ok(body)');
+ grant_scoped 
+--------------
+ t
+(1 row)
+
+SET letter.bypass = on;
+SELECT letter.assign('public.auditors', 'user_id', role := 'checked', if := 'is_ok(user_id::text)');
+ assign 
+--------
+ t
+(1 row)
+
+RESET letter.bypass;
+ALTER FUNCTION is_ok(text) STABLE;                    -- no longer allowed in an if: refused
+ERROR:  letter: the update grant to "editor" on public.comments (column "body") would no longer be valid: letter: invalid if expression for update on public.comments: function public.is_ok is not IMMUTABLE
+CREATE OR REPLACE FUNCTION is_ok(t text) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT t <> 'no' $$;   -- the same by replacement: refused
+ERROR:  letter: the update grant to "editor" on public.comments (column "body") would no longer be valid: letter: invalid if expression for update on public.comments: function public.is_ok is not IMMUTABLE
+CREATE OR REPLACE FUNCTION is_ok(t text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT t <> 'never' $$;   -- a new body, still IMMUTABLE: fine
+CREATE FUNCTION unrelated() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;   -- any other function: fine
+DROP FUNCTION unrelated();
+ALTER FUNCTION is_ok(text) RENAME TO is_fine;         -- the if would not resolve: refused
+ERROR:  letter: the update grant to "editor" on public.comments (column "body") would no longer be valid: letter: invalid if expression for update on public.comments: function public.is_ok(text) does not exist
+SELECT provolatile, proname FROM pg_proc WHERE proname IN ('is_ok', 'is_fine');
+ provolatile | proname 
+-------------+---------
+ i           | is_ok
+(1 row)
+
+DROP FUNCTION is_ok(text);                            -- cascades, with a NOTICE each
+NOTICE:  letter: removed the update grant to "editor" on public.comments (column "body"): letter: invalid if expression for update on public.comments: function public.is_ok(text) does not exist
+NOTICE:  letter: removed the membership rule on public.auditors: letter: invalid if expression for assign on public.auditors: function public.is_ok(text) does not exist
+SELECT count(*) AS grants_with_if FROM letter.grants WHERE "if" IS NOT NULL;
+ grants_with_if 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS rules_with_if FROM letter.membership_rules WHERE "if" IS NOT NULL;
+ rules_with_if 
+---------------
+             0
+(1 row)
+
+SELECT * FROM state ORDER BY 1, 2, 3;
+    kind    |     tbl      |            detail             
+------------+--------------+-------------------------------
+ assignment | auditors     | -
+ assignment | team_members | projects
+ function   | letter       | _rule_<id>_delete
+ function   | letter       | _rule_<id>_delete
+ function   | letter       | _rule_<id>_scope_delete
+ function   | letter       | _rule_<id>_upsert
+ function   | letter       | _rule_<id>_upsert
+ grant      | comments     | auditor/select/author
+ grant      | comments     | editor/select/body
+ grant      | comments     | editor/update/body
+ grant      | reactions    | editor/select/emoji
+ grant      | tasks        | editor/select/title
+ role       | -            | auditor@a0000000
+ role       | projects     | editor@a0000000
+ role       | projects     | editor@a0000000
+ trigger    | auditors     | letter_rule_<id>_delete
+ trigger    | auditors     | letter_rule_<id>_insert
+ trigger    | auditors     | letter_rule_<id>_update
+ trigger    | comments     | letter_enforce_delete
+ trigger    | comments     | letter_enforce_insert
+ trigger    | comments     | letter_enforce_truncate
+ trigger    | comments     | letter_enforce_update
+ trigger    | projects     | letter_rule_<id>_scope_delete
+ trigger    | reactions    | letter_enforce_delete
+ trigger    | reactions    | letter_enforce_insert
+ trigger    | reactions    | letter_enforce_truncate
+ trigger    | reactions    | letter_enforce_update
+ trigger    | tasks        | letter_enforce_delete
+ trigger    | tasks        | letter_enforce_insert
+ trigger    | tasks        | letter_enforce_truncate
+ trigger    | tasks        | letter_enforce_update
+ trigger    | team_members | letter_rule_<id>_delete
+ trigger    | team_members | letter_rule_<id>_insert
+ trigger    | team_members | letter_rule_<id>_update
+(34 rows)
+
 -- ============================================================
 -- 3. TRUNCATE on a protected table requires bypass (18 D3).
 -- ============================================================
@@ -297,7 +406,7 @@ SELECT tbl, detail FROM state WHERE kind IN ('grant', 'trigger') AND tbl = 'reac
 -- ============================================================
 DROP TABLE tasks CASCADE;
 NOTICE:  drop cascades to constraint comments_task_id_fkey on table comments
-NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.tasks: removed 1 grant(s), 0 rule(s), 0 membership(s)
 NOTICE:  letter: removed the select grant to "editor" on public.comments (column "body"): letter: via column "task_id" is not a foreign key on public.comments
 NOTICE:  letter: removed the update grant to "editor" on public.comments (column "body"): letter: via column "task_id" is not a foreign key on public.comments
 SELECT * FROM state WHERE kind IN ('grant', 'trigger') ORDER BY 1, 2, 3;
@@ -317,7 +426,7 @@ SELECT * FROM state WHERE kind IN ('grant', 'trigger') ORDER BY 1, 2, 3;
 --    triggers and roles.
 -- ============================================================
 DROP TABLE auditors;
-NOTICE:  letter: dropped table public.auditors: removed 0 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.auditors: removed 0 grant(s), 1 rule(s), 0 membership(s)
 SELECT * FROM state WHERE kind IN ('assignment', 'role', 'function') ORDER BY 1, 2, 3;
     kind    |     tbl      |         detail          
 ------------+--------------+-------------------------
@@ -343,30 +452,64 @@ WARNING:  letter: scope path column "project_id" on public.team_members has no i
 
 DROP TABLE projects CASCADE;
 NOTICE:  drop cascades to constraint team_members_project_id_fkey on table team_members
-NOTICE:  letter: dropped table public.projects: removed 1 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.projects: removed 1 grant(s), 1 rule(s), 0 membership(s)
 SELECT * FROM state ORDER BY 1, 2, 3;
-  kind   |     tbl      |         detail          
----------+--------------+-------------------------
- trigger | team_members | letter_enforce_delete
- trigger | team_members | letter_enforce_insert
- trigger | team_members | letter_enforce_truncate
- trigger | team_members | letter_enforce_update
-(4 rows)
+ kind | tbl | detail 
+------+-----+--------
+(0 rows)
 
 -- ============================================================
--- 7b. letter.forget_user(): every role a user holds goes — the
---     assignment-derived ones with their assignment records, and the
---     directly-managed ones — and nobody else's.
+-- 7b. The users table (plan/24 B8): deleting a row of it forgets that
+--     user — every membership the key holds goes, the rule-derived ones
+--     with their sources and the directly-managed ones — and nobody
+--     else's. Changing the key forgets the old one. While declared, its
+--     key column may not be renamed; a trigger dropped by hand shows in
+--     check_health().
 -- ============================================================
 SET letter.bypass = on;
-CREATE TABLE members (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL);
+CREATE TABLE members (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL);   -- no FK: a source that outlives its user
 SELECT letter.assign('public.members', 'user_id', role := 'member');
  assign 
 --------
  t
 (1 row)
 
-SET letter.bypass = off;
+DELETE FROM team_members;                     -- the application's own FK housekeeping (no cascade in this schema)
+SELECT letter.users('public.users');
+ users 
+-------
+ t
+(1 row)
+
+SELECT letter.users('public.users');          -- again: the same declaration
+ users 
+-------
+ t
+(1 row)
+
+SELECT letter.users('public.members');        -- a second one is allowed
+ users 
+-------
+ t
+(1 row)
+
+SELECT letter.unusers('public.members');
+ unusers 
+---------
+ t
+(1 row)
+
+ALTER TABLE users RENAME COLUMN id TO uid;    -- refused while declared
+ERROR:  letter: the users table public.users would no longer be valid: key column "id" no longer exists
+-- a user may delete themselves: the application's own route
+SELECT letter.grant_global('delete', 'public.users', 'any_user', if := 'id = letter.user_id()::uuid');
+WARNING:  letter: "any_user" has no select grant on public.users — it can see no row, so it can change none
+ grant_global 
+--------------
+ t
+(1 row)
+
+RESET letter.bypass;
 INSERT INTO members (user_id) VALUES
     ('a0000000-0000-0000-0000-000000000001'), ('a0000000-0000-0000-0000-000000000002');
 INSERT INTO letter.memberships (role, user_id) VALUES
@@ -381,12 +524,11 @@ SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
  vip    | 0002
 (4 rows)
 
-SELECT letter.forget_user('a0000000-0000-0000-0000-000000000001') AS forgotten;
- forgotten 
------------
-         2
-(1 row)
-
+-- alice deletes herself, as the application would: the trigger forgets
+-- her with letter's authority, not hers
+SET letter.user_id = 'a0000000-0000-0000-0000-000000000001';
+DELETE FROM users WHERE id = 'a0000000-0000-0000-0000-000000000001';
+RESET letter.user_id;
 SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
   role  | who  
 --------+------
@@ -394,21 +536,91 @@ SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
  vip    | 0002
 (2 rows)
 
-SELECT count(*) AS assignment_records_left FROM letter.membership_sources
+SELECT count(*) AS sources_left FROM letter.membership_sources
     WHERE user_id = 'a0000000-0000-0000-0000-000000000001';
- assignment_records_left 
--------------------------
-                       0
+ sources_left 
+--------------
+            0
 (1 row)
 
-SELECT letter.forget_user('nobody') AS forgotten;
- forgotten 
------------
-         0
+-- an administrator, bypass on, gives bob a new key: the old one is
+-- forgotten (the members source row, unchanged, will derive it again on its
+-- next write) — bypass does not switch the hygiene off
+SET letter.bypass = on;
+UPDATE users SET id = 'a0000000-0000-0000-0000-000000000003' WHERE id = 'a0000000-0000-0000-0000-000000000002';
+SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
+ role | who 
+------+-----
+(0 rows)
+
+UPDATE users SET name = 'Robert' WHERE id = 'a0000000-0000-0000-0000-000000000003';   -- the key stayed: nothing happens
+INSERT INTO letter.memberships (role, user_id) VALUES ('vip', 'a0000000-0000-0000-0000-000000000003');
+DROP TRIGGER letter_users_forget ON users;
+SELECT severity, object, message FROM letter.check_health() WHERE object LIKE 'users table%';
+ severity |          object          |              message               
+----------+--------------------------+------------------------------------
+ error    | users table public.users | has no letter_users_forget trigger
+(1 row)
+
+SELECT letter.users('public.users');          -- puts it back
+ users 
+-------
+ t
+(1 row)
+
+SELECT count(*) AS users_triggers FROM pg_trigger WHERE tgname = 'letter_users_forget';
+ users_triggers 
+----------------
+              1
+(1 row)
+
+SELECT letter.unusers('public.users');
+ unusers 
+---------
+ t
+(1 row)
+
+SELECT letter.unusers('public.users');        -- not declared: an error
+ERROR:  letter: public.users is not a declared users table
+SELECT count(*) AS users_triggers FROM pg_trigger WHERE tgname = 'letter_users_forget';
+ users_triggers 
+----------------
+              0
+(1 row)
+
+DELETE FROM users WHERE id = 'a0000000-0000-0000-0000-000000000003';   -- undeclared: nothing is forgotten
+SELECT role, right(user_id, 4) AS who FROM letter.memberships ORDER BY 1, 2;
+ role | who  
+------+------
+ vip  | 0003
+(1 row)
+
+DELETE FROM letter.memberships WHERE role = 'vip';
+-- a users table that goes: its declaration goes with it
+SELECT letter.users('public.members');
+ users 
+-------
+ t
 (1 row)
 
 DROP TABLE members;
-NOTICE:  letter: dropped table public.members: removed 0 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.members: it was the users table
+NOTICE:  letter: dropped table public.members: removed 0 grant(s), 1 rule(s), 0 membership(s)
+SELECT count(*) AS users_tables FROM letter.user_tables;
+ users_tables 
+--------------
+            0
+(1 row)
+
+-- back, for the sections below
+INSERT INTO users VALUES ('a0000000-0000-0000-0000-000000000001', 'Alice'), ('a0000000-0000-0000-0000-000000000002', 'Bob');
+SELECT letter.revoke_global('delete', 'public.users', 'any_user');
+ revoke_global 
+---------------
+ t
+(1 row)
+
+RESET letter.bypass;
 -- ============================================================
 -- 8. Hygiene: a role row with an empty user id is refused
 --    (it would match sessions with no letter.user_id).
@@ -437,14 +649,14 @@ RESET letter.bypass;
 SELECT count(*) AS letter_triggers FROM pg_trigger WHERE tgname LIKE 'letter\_%';
  letter_triggers 
 -----------------
-              11
+               7
 (1 row)
 
 -- without CASCADE: refused, as for the enforcement triggers
 DROP EXTENSION letter;
 ERROR:  cannot drop extension letter because other objects depend on it
 DROP EXTENSION letter CASCADE;
-NOTICE:  drop cascades to 14 other objects
+NOTICE:  drop cascades to 10 other objects
 SELECT count(*) AS letter_triggers FROM pg_trigger WHERE tgname LIKE 'letter\_%';
  letter_triggers 
 -----------------
@@ -469,7 +681,7 @@ INSERT INTO team_members (user_id, project_id, role)
 SELECT count(*) FROM team_members;
  count 
 -------
-     3
+     1
 (1 row)
 
 \set VERBOSITY default

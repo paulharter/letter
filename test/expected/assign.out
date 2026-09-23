@@ -222,7 +222,7 @@ SELECT count(*) AS staff_memberships FROM letter.memberships WHERE role = 'staff
 
 -- Dropping a column the if names removes the rule (and its memberships).
 ALTER TABLE staff DROP COLUMN title;
-NOTICE:  letter: removed the assignment on public.staff: letter: invalid if expression for assign on public.staff: column "title" does not exist
+NOTICE:  letter: removed the membership rule on public.staff: letter: invalid if expression for assign on public.staff: column "title" does not exist
 SELECT count(*) AS rules FROM letter.membership_rules WHERE table_name = 'public.staff'::regclass;
  rules 
 -------
@@ -314,10 +314,54 @@ SELECT count(*) AS owner_memberships FROM letter.memberships WHERE role = 'owner
 (1 row)
 
 DROP TABLE owned_projects CASCADE;
+-- ============================================================
+-- Test: names that need quoting are quoted wherever assign() writes
+-- them into SQL (plan/24 B6): a role with a quote in it, and columns
+-- and a table with spaces and capitals.
+-- ============================================================
+CREATE TABLE "Odd Members" ("Row Id" uuid PRIMARY KEY DEFAULT gen_random_uuid(), "User Id" uuid NOT NULL, "Their Role" text);
+INSERT INTO "Odd Members" ("User Id", "Their Role") VALUES ('a0000000-0000-0000-0000-000000000007', 'o''brien');
+SET letter.bypass = on;
+SELECT letter.assign('public."Odd Members"', 'User Id', role_column := 'Their Role');
+ assign 
+--------
+ t
+(1 row)
+
+SELECT letter.assign('public."Odd Members"', 'User Id', role := 'it''s');
+ assign 
+--------
+ t
+(1 row)
+
+RESET letter.bypass;
+INSERT INTO "Odd Members" ("User Id", "Their Role") VALUES ('a0000000-0000-0000-0000-000000000008', 'd''arcy');
+SELECT role, right(user_id, 4) AS who FROM letter.memberships WHERE user_id LIKE 'a0000000-0000-0000-0000-00000000000%' ORDER BY 1, 2;
+  role   | who  
+---------+------
+ d'arcy  | 0008
+ it's    | 0007
+ it's    | 0008
+ o'brien | 0007
+(4 rows)
+
+SET letter.bypass = on;
+SELECT letter.unassign('public."Odd Members"', 'User Id', role := 'it''s');
+ unassign 
+----------
+ t
+(1 row)
+
+SELECT letter.unassign('public."Odd Members"', 'User Id', role := 'it''s');     -- gone: an error with a proper code
+ERROR:  letter: no such membership rule
+HINT:  unassign takes the same source table, user column, role or role column and scope that assign took.
+RESET letter.bypass;
+DROP TABLE "Odd Members";
+NOTICE:  letter: dropped table public."Odd Members": removed 0 grant(s), 1 rule(s), 0 membership(s)
 DROP TABLE admins CASCADE;
-NOTICE:  letter: dropped table public.admins: removed 0 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.admins: removed 0 grant(s), 1 rule(s), 0 membership(s)
 DROP TABLE team_members CASCADE;
-NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.team_members: removed 0 grant(s), 1 rule(s), 0 membership(s)
 DROP TABLE projects CASCADE;
 DROP TABLE users CASCADE;
 DROP EXTENSION letter CASCADE;

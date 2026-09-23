@@ -54,9 +54,9 @@ SELECT letter.grant_global('insert', 'public.public_pages', 'any_user', if := 'i
 (1 row)
 
 SELECT role, privilege, column_name, "if" FROM letter.grants WHERE on_table = 'public.public_pages'::regclass ORDER BY 1, 2;
-   role   | privilege | column_name |   if   
-----------+-----------+-------------+--------
- any_user | insert    | *           | id > 0
+   role   | privilege | column_name |    if    
+----------+-----------+-------------+----------
+ any_user | insert    | *           | (id > 0)
  anyone   | select    | *           | 
 (2 rows)
 
@@ -101,7 +101,54 @@ SELECT count(*) AS rules FROM letter.grants WHERE on_table = 'public.rows_only':
 (1 row)
 
 DROP TABLE rows_only;
-NOTICE:  letter: dropped table public.rows_only: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.rows_only: removed 1 grant(s), 0 rule(s), 0 membership(s)
+-- A grant names one of the five privileges and columns that exist (plan/24
+-- B2): a misspelt privilege would be stored and never enforced, a wrong
+-- column would break the next unrelated ALTER TABLE. Nothing is stored.
+CREATE TABLE checked (id int PRIMARY KEY, body text);
+\set VERBOSITY terse
+SELECT letter.grant_global('slect', 'public.checked', 'r', ARRAY['body']);
+ERROR:  letter: "slect" is not a privilege
+SELECT letter.grant_global('select', 'public.checked', 'r', ARRAY['body', 'no_such']);
+ERROR:  letter: column "no_such" of public.checked does not exist
+SELECT letter.grant_global('select', 'public.checked', 'r', ARRAY['body', NULL]);
+ERROR:  letter: columns contains NULL
+INSERT INTO letter.grants (privilege, on_table, role, column_name, scope)
+    VALUES ('slect', 'public.checked'::regclass, 'r', '*', 0);        -- the table says so too
+ERROR:  new row for relation "grants" violates check constraint "grants_privilege_check"
+-- the plumbing is not STRICT, so it checks what it needs (plan/24 D)
+SELECT letter._grant(NULL, 'public.checked', 'r', ARRAY['*']);
+ERROR:  letter: privilege, on_table, role and columns are required
+SELECT letter._revoke('select', 'public.checked', NULL, ARRAY['*']);
+ERROR:  letter: privilege, on_table, role and columns are required
+SET letter.bypass = on;
+SELECT letter._assign(NULL, 'body');
+ERROR:  letter: source_table and user_column are required
+RESET letter.bypass;
+\set VERBOSITY default
+SELECT count(*) AS stored FROM letter.grants WHERE on_table = 'public.checked'::regclass;
+ stored 
+--------
+      0
+(1 row)
+
+SELECT count(*) AS triggers FROM pg_trigger WHERE tgrelid = 'public.checked'::regclass;
+ triggers 
+----------
+        0
+(1 row)
+
+DROP TABLE checked;
+-- A scope or hop table needs a single-column primary key (plan/17 D4; no
+-- key at all refused since plan/24): a unique column is enough for the
+-- foreign key but not for letter.
+CREATE TABLE keyless (id int UNIQUE, name text);
+CREATE TABLE keyless_leaf (id int PRIMARY KEY, keyless_id int REFERENCES keyless(id), body text);
+\set VERBOSITY terse
+SELECT letter.grant_scoped('select', 'public.keyless_leaf', 'r', ARRAY['body'], 'public.keyless');
+ERROR:  letter: public.keyless has no primary key — a scope table or a table along a scope path needs one
+\set VERBOSITY default
+DROP TABLE keyless_leaf, keyless;
 -- Tables are regclass (plan/18 D1): letter.grant_global() refuses one that does
 -- not exist (plan/17 D10) and handles names that need quoting.
 CREATE TABLE orgs (id uuid PRIMARY KEY DEFAULT gen_random_uuid());
@@ -158,9 +205,9 @@ HINT:  A write reaches only the rows the writer can see: grant select on the col
 
 SELECT privilege, on_table, role, column_name, scope, via, if
     FROM letter.grants WHERE role = 'member';
- privilege | on_table |  role  | column_name | scope |   via    |          if          
------------+----------+--------+-------------+-------+----------+----------------------
- update    | projects | member | status      | orgs  | {org_id} | status <> 'archived'
+ privilege | on_table |  role  | column_name | scope |   via    |              if              
+-----------+----------+--------+-------------+-------+----------+------------------------------
+ update    | projects | member | status      | orgs  | {org_id} | (status <> 'archived'::text)
 (1 row)
 
 -- a grant's identity is the whole rule (plan/17 D15): the same rule again is
@@ -183,10 +230,10 @@ HINT:  A write reaches only the rows the writer can see: grant select on the col
 
 SELECT privilege, on_table, role, column_name, scope, via, if
     FROM letter.grants WHERE role = 'member' ORDER BY via;
- privilege | on_table |  role  | column_name | scope |     via      |          if          
------------+----------+--------+-------------+-------+--------------+----------------------
- update    | projects | member | status      | orgs  | {alt_org_id} | status <> 'archived'
- update    | projects | member | status      | orgs  | {org_id}     | status <> 'archived'
+ privilege | on_table |  role  | column_name | scope |     via      |              if              
+-----------+----------+--------+-------------+-------+--------------+------------------------------
+ update    | projects | member | status      | orgs  | {alt_org_id} | (status <> 'archived'::text)
+ update    | projects | member | status      | orgs  | {org_id}     | (status <> 'archived'::text)
 (2 rows)
 
 -- revoke removes every rule under its key
@@ -344,7 +391,7 @@ SELECT count(*) FROM pg_trigger WHERE tgrelid = '"Mixed Leaf"'::regclass;
 
 DROP TABLE "Mixed Leaf";
 DROP TABLE scope_child;
-NOTICE:  letter: dropped table public.scope_child: removed 1 grant(s), 0 assignment(s), 0 role(s)
+NOTICE:  letter: dropped table public.scope_child: removed 1 grant(s), 0 rule(s), 0 membership(s)
 DROP TABLE scope_parent;
 DROP TABLE documents;
 DROP TABLE projects;
