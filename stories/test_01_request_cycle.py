@@ -135,3 +135,23 @@ def test_a_session_that_never_calls_letter_is_enforced(story_db, seeded):
         with as_user(conn, BOB):
             assert projects(conn) == ["Beta"]
             assert col(conn, "SELECT budget FROM projects ORDER BY name") == [2000]
+
+
+def test_identity_from_a_proxys_claims(app, seeded):
+    """Behind PostgREST or Supabase the proxy has verified the JWT and exposes
+    its claims as request.jwt.claims; letter.user_from_claims() as the
+    pre-request function sets the identity for the transaction — and a
+    request with no subject stays anonymous."""
+    with app.transaction():
+        app.execute("SELECT set_config('request.jwt.claims', %s, true)", ('{"role": "authenticated", "sub": "%s"}' % BOB,))
+        assert app.execute("SELECT letter.user_from_claims()").fetchone()[0] == BOB
+        assert projects(app) == ["Beta"]
+    with pytest.raises(psycopg.Error) as e:                        # gone with the transaction
+        projects(app)
+    assert unset_user(e.value)
+    with app.transaction():
+        app.execute("SELECT set_config('request.jwt.claims', %s, true)", ('{"role": "anon"}',))
+        assert app.execute("SELECT letter.user_from_claims()").fetchone()[0] is None
+        with pytest.raises(psycopg.Error) as e:
+            projects(app)
+        assert unset_user(e.value)

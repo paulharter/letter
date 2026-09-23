@@ -2,6 +2,7 @@ EXTENSION    = letter
 MODULE_big   = letter
 DATA         = sql/letter--0.1.sql
 OBJS         = letter.o
+SHLIB_LINK  += -lcrypto      # letter.login(): JWT signatures (plan/23)
 
 TESTS        = $(wildcard test/sql/*.sql)
 REGRESS      = $(patsubst test/sql/%.sql,%,$(TESTS))

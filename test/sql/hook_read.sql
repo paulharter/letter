@@ -265,6 +265,28 @@ SELECT name FROM projects ORDER BY name;
 SET letter.bypass = on;
 DROP TABLE pages;
 
+-- ============================================================
+-- 10. Identity from a proxy's verified claims (plan/23 T1): what
+--     PostgREST does per request — SET LOCAL request.jwt.claims, then
+--     the pre-request function — gives dora her view for the
+--     transaction and nothing after it; a request without a subject
+--     leaves the user unset.
+-- ============================================================
+SET letter.bypass = off;
+RESET letter.user_id;
+BEGIN;
+SELECT set_config('request.jwt.claims', '{"role": "authenticated", "sub": "a0000000-0000-0000-0000-000000000004"}', true) IS NOT NULL AS claims_set;
+SELECT letter.user_from_claims();
+SELECT name, budget FROM projects ORDER BY name;
+COMMIT;
+SELECT letter.user_id() IS NULL AS unset_after_commit;
+BEGIN;
+SELECT set_config('request.jwt.claims', '{"role": "anon"}', true) IS NOT NULL AS claims_set;
+SELECT letter.user_from_claims() IS NULL AS no_subject;
+SELECT letter.user_id() IS NULL AS still_unset;
+ROLLBACK;
+SET letter.bypass = on;
+
 \set VERBOSITY default
 -- Cleanup
 RESET letter.user_id;

@@ -89,3 +89,29 @@ plan/22); each entry says how it was resolved.
    intended; README "Default deny" now states the distinction). After
    `forget_user()` the user's `SELECT` on a granted table returns zero rows;
    only a table with no grants at all errors (`17` D14). Documentation.
+
+10. **A `SELECT *` prepared before a migration errors after it** (story 7 —
+    PostgreSQL, not letter). Once a column is added, every execution of a
+    statement the driver prepared as `SELECT *` fails with `cached plan must
+    not change result type`, and psycopg does not recover by itself. The
+    recipe: `DEALLOCATE ALL` on the connection (or a pool reset) after a
+    migration; statements with explicit column lists never mind.
+    Documentation.
+
+11. **`ON CONFLICT (columns)` failed under letter** (story 9 — ✅ fixed
+    2026-09-23). The write path's redaction wrapped the arbiter columns in
+    the visibility CASE, so index inference found "no unique or exclusion
+    constraint matching the ON CONFLICT specification"; `ON CONFLICT ON
+    CONSTRAINT name` worked, and so did everything under bypass. The C suite
+    had only tested inference on a primary key, which is never redacted. The
+    mutator now leaves the arbiter (columns and partial-index WHERE) alone
+    and redacts the SET, the WHERE and EXCLUDED as before; hook_write case 5
+    covers the column form.
+
+12. **An insert grant with a column list matched nothing** (story 10 — ✅
+    2026-09-23 → D14: refused at grant time; Paul: a column list might one day
+    say which defaulted columns a user may supply — left for later). Insert
+    is row-level (`11` 2.6.1): the triggers look for an insert rule whose
+    column is `*`, so `grant_scoped('insert', t, role, ARRAY['body'], …)` is
+    accepted, stored, and never applies. `_columns_or_default` could refuse a
+    column list for insert and delete outright. API rough edge — for Paul.

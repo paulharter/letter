@@ -30,6 +30,7 @@ CREATE TABLE notes (
     extra TEXT
 );
 CREATE INDEX ON notes (project_id);
+CREATE UNIQUE INDEX notes_project_body ON notes (project_id, body);   -- for the upsert of case 5
 CREATE TABLE team_members (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id uuid NOT NULL REFERENCES users(id),
@@ -139,6 +140,14 @@ INSERT INTO notes (id, project_id, body)
     RETURNING body;
 SELECT * FROM truth() WHERE tbl = 'notes';
 UPDATE notes SET body = 'n1' WHERE id = 'c0000000-0000-0000-0000-000000000001';
+-- The arbiter names ordinary (redacted) columns: inference must still find
+-- the unique index (plan/21 story 9 found it did not).
+INSERT INTO notes (project_id, body)
+    VALUES ('b0000000-0000-0000-0000-000000000001', 'n1')
+    ON CONFLICT (project_id, body) DO UPDATE SET extra = 'upserted'
+    RETURNING body, extra;
+SELECT * FROM truth() WHERE tbl = 'notes';
+UPDATE notes SET extra = 'x1' WHERE id = 'c0000000-0000-0000-0000-000000000001';
 
 -- ============================================================
 -- 6. UPDATE … FROM a protected table, and a sublink back to the

@@ -74,12 +74,17 @@ CREATE VIEW health AS
 --    the missing index.
 -- ============================================================
 SELECT * FROM health ORDER BY 1, 2, 3;
- severity |        object        |                                                                                      message                                                                                       
-----------+----------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- info     | letter.enforce_reads | read enforcement is switched off
- warning  | library              | letter is not in shared_preload_libraries or session_preload_libraries: a session that never calls a letter function has no planner hook, so read enforcement does not apply to it
- warning  | table public.tasks   | scope path column "project_id" has no index — reads scoped through it will scan the whole table; CREATE INDEX ON public.tasks (project_id)
-(3 rows)
+ severity |          object           |                                                                                      message                                                                                       
+----------+---------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ info     | letter.enforce_reads      | read enforcement is switched off
+ info     | table public.projects     | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.stale        | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.team_members | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.unguarded    | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.users        | has no grants: neither readable nor writable by the application (default deny)
+ warning  | library                   | letter is not in shared_preload_libraries or session_preload_libraries: a session that never calls a letter function has no planner hook, so read enforcement does not apply to it
+ warning  | table public.tasks        | scope path column "project_id" has no index — reads scoped through it will scan the whole table; CREATE INDEX ON public.tasks (project_id)
+(8 rows)
 
 -- ============================================================
 -- 2. Things the lifecycle contract cannot catch.
@@ -125,6 +130,10 @@ SELECT * FROM health ORDER BY 1, 2, 3;
  info     | letter.enforce_reads              | read enforcement is switched off
  info     | role letter_test_admin            | has letter.bypass = on by default
  info     | roles                             | 2 role row(s) are managed directly, not by an assignment
+ info     | table public.projects             | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.stale                | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.team_members         | has no grants: neither readable nor writable by the application (default deny)
+ info     | table public.users                | has no grants: neither readable nor writable by the application (default deny)
  warning  | library                           | letter is not in shared_preload_libraries or session_preload_libraries: a session that never calls a letter function has no planner hook, so read enforcement does not apply to it
  warning  | table public.stale                | has enforcement trigger letter_enforce_delete but no grants
  warning  | table public.stale                | has enforcement trigger letter_enforce_insert but no grants
@@ -132,7 +141,7 @@ SELECT * FROM health ORDER BY 1, 2, 3;
  warning  | table public.stale                | has enforcement trigger letter_enforce_update but no grants
  warning  | table public.tasks                | letter trigger letter_enforce_update is disabled
  warning  | table public.tasks                | scope path column "project_id" has no index — reads scoped through it will scan the whole table; CREATE INDEX ON public.tasks (project_id)
-(18 rows)
+(22 rows)
 
 -- Cleanup
 SET client_min_messages = warning;

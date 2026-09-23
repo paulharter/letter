@@ -626,6 +626,64 @@ SELECT name FROM projects ORDER BY name;
 SET letter.bypass = on;
 DROP TABLE pages;
 NOTICE:  letter: dropped table public.pages: removed 3 grant(s), 0 assignment(s), 0 role(s)
+-- ============================================================
+-- 10. Identity from a proxy's verified claims (plan/23 T1): what
+--     PostgREST does per request — SET LOCAL request.jwt.claims, then
+--     the pre-request function — gives dora her view for the
+--     transaction and nothing after it; a request without a subject
+--     leaves the user unset.
+-- ============================================================
+SET letter.bypass = off;
+RESET letter.user_id;
+BEGIN;
+SELECT set_config('request.jwt.claims', '{"role": "authenticated", "sub": "a0000000-0000-0000-0000-000000000004"}', true) IS NOT NULL AS claims_set;
+ claims_set 
+------------
+ t
+(1 row)
+
+SELECT letter.user_from_claims();
+           user_from_claims           
+--------------------------------------
+ a0000000-0000-0000-0000-000000000004
+(1 row)
+
+SELECT name, budget FROM projects ORDER BY name;
+ name  | budget 
+-------+--------
+ Alpha |  50000
+ Beta  |       
+ Gamma |       
+(3 rows)
+
+COMMIT;
+SELECT letter.user_id() IS NULL AS unset_after_commit;
+ unset_after_commit 
+--------------------
+ t
+(1 row)
+
+BEGIN;
+SELECT set_config('request.jwt.claims', '{"role": "anon"}', true) IS NOT NULL AS claims_set;
+ claims_set 
+------------
+ t
+(1 row)
+
+SELECT letter.user_from_claims() IS NULL AS no_subject;
+ no_subject 
+------------
+ t
+(1 row)
+
+SELECT letter.user_id() IS NULL AS still_unset;
+ still_unset 
+-------------
+ t
+(1 row)
+
+ROLLBACK;
+SET letter.bypass = on;
 \set VERBOSITY default
 -- Cleanup
 RESET letter.user_id;

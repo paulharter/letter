@@ -38,6 +38,18 @@ SELECT letter.revoke_global('select', 'public.public_pages', 'anyone');
 SELECT letter.revoke_global('insert', 'public.public_pages', 'any_user');
 DROP TABLE public_pages;
 
+-- insert and delete are row-level (plan/21 D14): a column list is refused,
+-- ARRAY['*'] and no list are the same thing.
+CREATE TABLE rows_only (id int PRIMARY KEY, body text);
+\set VERBOSITY terse
+SELECT letter.grant_global('insert', 'public.rows_only', 'r', ARRAY['body']);
+SELECT letter.grant_scoped('delete', 'public.rows_only', 'r', ARRAY['body'], 'public.rows_only');
+\set VERBOSITY default
+SELECT letter.grant_global('insert', 'public.rows_only', 'r');
+SELECT letter.grant_global('insert', 'public.rows_only', 'r', ARRAY['*']);      -- the same rule
+SELECT count(*) AS rules FROM letter.grants WHERE on_table = 'public.rows_only'::regclass;
+DROP TABLE rows_only;
+
 -- Tables are regclass (plan/18 D1): letter.grant_global() refuses one that does
 -- not exist (plan/17 D10) and handles names that need quoting.
 CREATE TABLE orgs (id uuid PRIMARY KEY DEFAULT gen_random_uuid());

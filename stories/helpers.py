@@ -110,3 +110,9 @@ def expected_view(app, admin, table, pk="id"):
 
 def actual_view(app, table, pk="id"):
     return app.execute(f"SELECT * FROM {table} ORDER BY {pk}").fetchall()
+
+
+def refused(exc):
+    """True if an exception is letter refusing anything — a write, a shape it
+    does not support — with the letter: prefix, whatever the SQLSTATE."""
+    return isinstance(exc, psycopg.Error) and str(exc).startswith("letter:")

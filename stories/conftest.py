@@ -23,6 +23,7 @@ from psycopg.conninfo import make_conninfo
 from psycopg_pool import ConnectionPool
 
 SUPER_DSN = os.environ.get("LETTER_TEST_DSN", "dbname=postgres")
+PG_BIN = os.environ.get("LETTER_PG_BIN", "/opt/homebrew/opt/postgresql@17/bin")   # pg_dump, psql (story 8)
 PASSWORD = "story"
 HERE = pathlib.Path(__file__).parent
 
@@ -84,6 +85,7 @@ def story_db(request):
     if not os.environ.get("LETTER_STORY_KEEP"):
         with psycopg.connect(SUPER_DSN, autocommit=True) as su:
             su.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(ident))
+            su.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name + "_copy")))
 
 
 @pytest.fixture(scope="module")
@@ -123,3 +125,15 @@ def app_rules(app_schema):
     """The application's membership rules and grants."""
     app_schema.execute((HERE / "schema" / "app_rules.sql").read_text())
     return app_schema
+
+
+def deploy(dbname, su):
+    """The per-database deployment steps that are not data and so not in a
+    dump: preload letter for every session, let the app role connect and
+    call letter's functions (story 8 re-applies them to a restored copy)."""
+    ident = sql.Identifier(dbname)
+    su.execute(sql.SQL("ALTER DATABASE {} SET session_preload_libraries = 'letter'").format(ident))
+    su.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO story_app").format(ident))
+    with psycopg.connect(_conninfo(dbname), autocommit=True) as db:
+        db.execute("GRANT USAGE ON SCHEMA letter TO story_app")
+        db.execute("REVOKE ALL ON ALL TABLES IN SCHEMA letter FROM story_app, PUBLIC")

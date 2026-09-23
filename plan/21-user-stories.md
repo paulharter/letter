@@ -169,9 +169,9 @@ sentence.
   `README` paragraph "Running the stories". Smoke: story 3's first assertion.
 - [x] **P2 — Stories 1 and 2** (the perimeter) *(2026-09-23: 10 tests; findings 3 and 4)*.
 - [x] **P3 — Stories 3–6** (building an app) *(2026-09-23: 25 tests; D8 for `assign`; findings 5–9)*.
-- [ ] **P4 — Stories 7–9** (operating it).
-- [ ] **P5 — Story 10** and the README: "Known gaps" rewritten from `FINDINGS.md`
-  and story 10's docstrings; the beta status line.
+- [x] **P4 — Stories 7–9** (operating it) *(2026-09-23: 16 tests; findings 10–11, 11 a bug in the write path's ON CONFLICT handling, fixed)*.
+- [x] **P5 — Story 10** and the README: "Known gaps" rewritten from `FINDINGS.md`
+  and story 10's docstrings; the beta status line *(2026-09-23; finding 12 for Paul)*.
 
 ## 4. Decisions (proposed — Paul to confirm or strike)
 
@@ -231,6 +231,21 @@ sentence.
   ambiguous, and the C function converted the key to text anyway. SQL callers write
   `id::text`; drivers pass the string they hold.
 
+- **D14 — insert and delete grants take no column list** *(decided 2026-09-23, Paul,
+  from finding 12)*: `_columns_or_default` refuses one (`ARRAY['*']` and no list are the
+  same rule); a rule that could never apply is no longer storable. Paul: a column list
+  on insert might later mean which defaulted columns a user may supply — not now.
+
+- **D15 — an ungranted table in a join is default deny, not a gap** *(2026-09-23,
+  Paul, walking the Known gaps)*: moved from "Known gaps" to "Default deny" in the
+  README; `check_health()` now lists every table with no grants (`info`), so a
+  migration that forgot a grant shows up before the first query does.
+
+- **D16 — letter's own tables are the operator's to expose or not** *(2026-09-23, Paul)*:
+  not a gap. Moved from "Known gaps" to "Deployment model": the default keeps them from
+  the application; granting `SELECT` on `letter.memberships` is a legitimate choice, and
+  letter does not redact its own tables. No health-check row.
+
 ## 5. Stop-and-discuss triggers
 
 1. A story needs `story_admin` for something an application should be able to do.
@@ -249,7 +264,28 @@ sentence.
 (`conftest.py`, `helpers.py`, `schema/app.sql`, `schema/app_rules.sql`,
 `test_03_signup.py` smoke, `FINDINGS.md`, `pytest.ini`, `requirements.txt`), `make
 stories` (venv under `stories/.venv`, python3.13; psycopg 3.3.6, psycopg_pool 3.3.3,
-pytest 9.1.1). **Findings pass ✅ (2026-09-23, Paul, one by one): 1 → D9, 2 → D7, 3 → README, 4 → D10,
+pytest 9.1.1). **P5 ✅ (2026-09-23): 61 story tests green; plan complete.** Story 10 pins ten limits,
+each docstring a README sentence; "Known gaps" rewritten from them; status line "first
+beta". Finding 12 (an insert grant with a column list matches nothing) is for Paul.
+
+**P4 ✅ (2026-09-23): 51 story tests green.** Story 7: a column added and granted
+reaches an open session; a prepared `SELECT *` needs `DEALLOCATE ALL` after the
+migration (PostgreSQL; finding 10); renaming a granted column refused then done
+revoke/rename/grant; dropping a scope-path FK refused; a second FK to the scope
+refused where the hop is inferred and fine where `via` names it; a dropped table's
+cascade NOTICE; a new ungranted table errors until granted; `check_health()` clean
+throughout. Story 8: `pg_dump` as the admin, restore with the README's `PGOPTIONS` gives
+every user the same view and a clean `check_health()`; without the options, and with
+`replica` alone, the restore stops on a letter error. Story 9: `COPY FROM` through the
+triggers (a foreign row fails the whole load, a viewer cannot load), `COPY table TO`
+refused with the way out in the hint, `COPY (SELECT)` redacted, `INSERT … SELECT` and
+`UPDATE … FROM` reach only visible rows, an upsert on a membership source (finding 11:
+`ON CONFLICT (columns)` was broken by the redaction of the arbiter — fixed in
+`write_mutator`, hook_write case 5 extended), `TRUNCATE` needs bypass; 10k rows
+through the insert trigger: 0.04 s. **Next: P5 (story 10 and the README's known
+gaps).**
+
+**Findings pass ✅ (2026-09-23, Paul, one by one): 1 → D9, 2 → D7, 3 → README, 4 → D10,
 5 → plan 22, 6 → D11, 7 → D12 (stays), 8 → D13, 9 → README. Next: P4 (stories 7–9).**
 
 **P1 ✅, P2 ✅ (2026-09-23): 11 story tests green.** Story 1: consecutive requests

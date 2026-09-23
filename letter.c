@@ -43,6 +43,8 @@
 #include "miscadmin.h"
 #include "utils/datum.h"
 #include "utils/jsonb.h"
+#include "utils/timestamp.h"
+#include "utils/numeric.h"
 #include "funcapi.h"
 
 PG_MODULE_MAGIC;
@@ -52,6 +54,21 @@ static char *letter_current_user_id = "";
 static bool letter_bypass = false;
 static bool letter_enforce_reads = true;
 static bool letter_preloaded = false;	/* the hook is in every session of this database */
+/* token identity (plan/23) */
+typedef enum
+{
+	IDENTITY_SETTING,			/* the current user is letter.user_id, as set by the application */
+	IDENTITY_TOKEN				/* the current user is what letter.login() verified; the GUC is ignored */
+} LetterIdentity;
+static int	letter_identity = IDENTITY_SETTING;
+static char *letter_token_user = NULL;			/* TopMemoryContext; NULL: nobody */
+static bool letter_token_user_local = false;	/* dies with the transaction */
+static SubTransactionId letter_token_subxid = InvalidSubTransactionId;
+static char *letter_jwt_keys = "";
+static char *letter_jwt_issuer = "";
+static char *letter_jwt_audience = "";
+static char *letter_jwt_claim = "sub";
+static int	letter_jwt_leeway = 30;
 
 /* ----------------------------------------------------------------
  * Internal guard (plan/17-planner-hook-implementation.md H1).
@@ -163,6 +180,10 @@ PG_FUNCTION_INFO_V1(letter_visible_columns);
 PG_FUNCTION_INFO_V1(letter_barrier_write_sql);
 PG_FUNCTION_INFO_V1(letter_require_user);
 PG_FUNCTION_INFO_V1(letter_enforcing);
+PG_FUNCTION_INFO_V1(letter_login);
+PG_FUNCTION_INFO_V1(letter_logout);
+PG_FUNCTION_INFO_V1(letter_user_id_fn);
+PG_FUNCTION_INFO_V1(letter_jwt_keys_check);
 
 void _PG_init(void);
 static void split_table_name(const char *qualified, char **schema_out, char **table_out);
@@ -219,6 +240,9 @@ typedef enum IfForm
 } IfForm;
 static IfForm validate_if_expr(Oid relid, const char *privilege, const char *if_text);
 static void require_superuser(const char *fn);
+static void token_user_xact_callback(XactEvent event, void *arg);
+static void token_user_subxact_callback(SubXactEvent event, SubTransactionId mySubid, SubTransactionId parentSubid, void *arg);
+static const struct config_enum_entry identity_options[];
 static bool is_builtin_role(const char *role);
 static char *deparse_if_as(Oid relid, const char *if_expr, const char *out_alias, bool qualify);
 static bool try_in_subxact(void (*fn) (void *), void *arg, char **errmsg_out);
@@ -279,6 +303,32 @@ _PG_init(void)
 		PGC_SUSET,
 		0,
 		NULL, letter_replan_assign_hook, NULL);
+
+	/* Token identity (plan/23): the issuer's public keys and the checks
+	 * letter.login() applies. Superuser-only, set per database. */
+	DefineCustomStringVariable("letter.jwt_keys",
+							   "PEM public keys letter.login() verifies tokens against (optionally kid=… lines)",
+							   NULL, &letter_jwt_keys, "", PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable("letter.jwt_issuer",
+							   "Required iss claim (empty: not checked)",
+							   NULL, &letter_jwt_issuer, "", PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable("letter.jwt_audience",
+							   "Required aud claim (empty: not checked)",
+							   NULL, &letter_jwt_audience, "", PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable("letter.jwt_claim",
+							   "The claim that names the user",
+							   NULL, &letter_jwt_claim, "sub", PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("letter.jwt_leeway",
+							"Clock leeway for exp and nbf, in seconds",
+							NULL, &letter_jwt_leeway, 30, 0, 3600, PGC_SUSET, GUC_UNIT_S, NULL, NULL, NULL);
+	/* Where the current user comes from (plan/23 D4): superuser-only, so an
+	 * application in token mode cannot switch itself back to being trusted. */
+	DefineCustomEnumVariable("letter.identity",
+							 "Where the current user comes from: the letter.user_id setting, or letter.login() only",
+							 NULL, &letter_identity, IDENTITY_SETTING, identity_options,
+							 PGC_SUSET, 0, NULL, NULL, NULL);
+	RegisterXactCallback(token_user_xact_callback, NULL);
+	RegisterSubXactCallback(token_user_subxact_callback, NULL);
 
 	RegisterXactCallback(protected_set_xact_callback, NULL);
 	RegisterSubXactCallback(protected_set_subxact_callback, NULL);
@@ -1800,6 +1850,8 @@ letter_unassign(PG_FUNCTION_ARGS)
 static const char *
 get_current_user_id(void)
 {
+	if (letter_identity == IDENTITY_TOKEN)
+		return letter_token_user;			/* only letter.login() sets this (plan/23 D4) */
 	if (letter_current_user_id == NULL || letter_current_user_id[0] == '\0')
 		return NULL;
 	return letter_current_user_id;
@@ -2446,6 +2498,21 @@ write_mutator(Node *node, void *context)
 		return NULL;
 	if (IsA(node, TargetEntry) && ((TargetEntry *) node)->resjunk)
 		return node;			/* the executor's own row-locating columns */
+	if (IsA(node, OnConflictExpr))
+	{
+		/* The arbiter (the columns and the partial-index WHERE that pick the
+		 * unique index) is index inference, not a read of the row: redacting
+		 * it leaves no index to match (plan/21 story 9). The SET, the WHERE
+		 * and the EXCLUDED list are reads, as in §1.2. */
+		OnConflictExpr *oc = (OnConflictExpr *) node;
+		OnConflictExpr *copy = makeNode(OnConflictExpr);
+
+		memcpy(copy, oc, sizeof(OnConflictExpr));
+		copy->onConflictSet = (List *) expression_tree_mutator((Node *) oc->onConflictSet, write_mutator, context);
+		copy->onConflictWhere = expression_tree_mutator(oc->onConflictWhere, write_mutator, context);
+		copy->exclRelTlist = (List *) expression_tree_mutator((Node *) oc->exclRelTlist, write_mutator, context);
+		return (Node *) copy;
+	}
 	if (IsA(node, Var))
 	{
 		Var		   *var = (Var *) node;
@@ -5527,6 +5594,490 @@ letter_enforce_truncate(PG_FUNCTION_ARGS)
  * barrier, so an unidentified session cannot read a protected table
  * (D2, amended 2026-09-23: reads and writes fail the same way).
  * ---------------------------------------------------------------- */
+/* ----------------------------------------------------------------
+ * Token identity (plan/23 T2): letter.login(jwt) verifies a JWT against
+ * the issuer's public keys and sets the current user. Asymmetric only —
+ * RSA (RS256/384/512), ECDSA (ES256/384), Ed25519 (EdDSA); HMAC and
+ * `none` are refused, and a token's algorithm must match the key's type.
+ * No network: keys are configured in letter.jwt_keys (PEM public keys,
+ * optionally preceded by a `kid=…` line).
+ * ---------------------------------------------------------------- */
+
+static void token_reject(const char *why) pg_attribute_noreturn();
+
+static void
+token_reject(const char *why)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+			 errmsg("letter: token rejected: %s", why)));
+}
+
+/* base64url, unpadded (RFC 7515). Returns palloc'd bytes, NUL-terminated too. */
+static unsigned char *
+b64url_decode(const char *in, size_t inlen, size_t *outlen)
+{
+	unsigned char *out = palloc(inlen + 1);
+	size_t		o = 0;
+	uint32		acc = 0;
+	int			bits = 0;
+	size_t		i;
+
+	for (i = 0; i < inlen; i++)
+	{
+		char		c = in[i];
+		int			v;
+
+		if (c >= 'A' && c <= 'Z') v = c - 'A';
+		else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+		else if (c >= '0' && c <= '9') v = c - '0' + 52;
+		else if (c == '-') v = 62;
+		else if (c == '_') v = 63;
+		else if (c == '=') break;
+		else token_reject("malformed base64url");
+		acc = (acc << 6) | v;
+		bits += 6;
+		if (bits >= 8)
+		{
+			bits -= 8;
+			out[o++] = (acc >> bits) & 0xff;
+		}
+	}
+	out[o] = '\0';
+	*outlen = o;
+	return out;
+}
+
+/* A JWT segment as jsonb, or a rejection. */
+static Jsonb *
+token_json(const char *what, const unsigned char *bytes, size_t len)
+{
+	Jsonb	   *jb = NULL;
+	MemoryContext oldcxt = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		jb = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(pnstrdup((const char *) bytes, len))));
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		FlushErrorState();
+		token_reject(psprintf("%s is not valid JSON", what));
+	}
+	PG_END_TRY();
+	if (!JB_ROOT_IS_OBJECT(jb))
+		token_reject(psprintf("%s is not a JSON object", what));
+	return jb;
+}
+
+/* A string member, or NULL; *present says whether the key exists at all. */
+static char *
+token_string(Jsonb *jb, const char *key, bool *present)
+{
+	JsonbValue *v = getKeyJsonValueFromContainer(&jb->root, key, strlen(key), NULL);
+
+	if (present)
+		*present = (v != NULL);
+	if (v == NULL || v->type != jbvString)
+		return NULL;
+	return pnstrdup(v->val.string.val, v->val.string.len);
+}
+
+static bool
+token_number(Jsonb *jb, const char *key, double *out)
+{
+	JsonbValue *v = getKeyJsonValueFromContainer(&jb->root, key, strlen(key), NULL);
+
+	if (v == NULL || v->type != jbvNumeric)
+		return false;
+	*out = DatumGetFloat8(DirectFunctionCall1(numeric_float8, NumericGetDatum(v->val.numeric)));
+	return true;
+}
+
+/* Does the aud claim (a string or an array of strings) contain aud? */
+static bool
+token_has_audience(Jsonb *jb, const char *aud)
+{
+	JsonbValue *v = getKeyJsonValueFromContainer(&jb->root, "aud", 3, NULL);
+
+	if (v == NULL)
+		return false;
+	if (v->type == jbvString)
+		return v->val.string.len == (int) strlen(aud) && memcmp(v->val.string.val, aud, v->val.string.len) == 0;
+	if (v->type == jbvBinary)
+	{
+		JsonbIterator *it = JsonbIteratorInit(v->val.binary.data);
+		JsonbValue	e;
+		JsonbIteratorToken tok;
+
+		while ((tok = JsonbIteratorNext(&it, &e, true)) != WJB_DONE)
+			if (tok == WJB_ELEM && e.type == jbvString &&
+				e.val.string.len == (int) strlen(aud) && memcmp(e.val.string.val, aud, e.val.string.len) == 0)
+				return true;
+	}
+	return false;
+}
+
+#ifdef USE_OPENSSL
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
+#include <openssl/ecdsa.h>
+#include <openssl/bn.h>
+
+typedef struct JwtAlg
+{
+	const char *name;
+	int			key_type;		/* EVP_PKEY_RSA, EVP_PKEY_EC, EVP_PKEY_ED25519 */
+	const EVP_MD *(*md) (void);
+	int			ec_coord;		/* bytes per ECDSA coordinate, 0 otherwise */
+} JwtAlg;
+
+static const JwtAlg *
+jwt_alg(const char *name)
+{
+	static const JwtAlg algs[] = {
+		{"RS256", EVP_PKEY_RSA, EVP_sha256, 0},
+		{"RS384", EVP_PKEY_RSA, EVP_sha384, 0},
+		{"RS512", EVP_PKEY_RSA, EVP_sha512, 0},
+		{"ES256", EVP_PKEY_EC, EVP_sha256, 32},
+		{"ES384", EVP_PKEY_EC, EVP_sha384, 48},
+		{"EdDSA", EVP_PKEY_ED25519, NULL, 0},
+	};
+	int			i;
+
+	for (i = 0; i < (int) lengthof(algs); i++)
+		if (strcmp(algs[i].name, name) == 0)
+			return &algs[i];
+	return NULL;
+}
+
+typedef struct JwtKey
+{
+	char	   *kid;			/* NULL if none */
+	EVP_PKEY   *pkey;
+} JwtKey;
+
+/* letter.jwt_keys: PEM public key blocks, each optionally preceded by a
+ * line `kid=<id>`. Anything else between blocks is ignored. */
+static List *
+jwt_load_keys(void)
+{
+	List	   *keys = NIL;
+	const char *p = letter_jwt_keys;
+	char	   *kid = NULL;
+
+	while (*p)
+	{
+		const char *eol = strchr(p, '\n');
+		size_t		linelen = eol ? (size_t) (eol - p) : strlen(p);
+
+		if (linelen > 4 && strncmp(p, "kid=", 4) == 0)
+		{
+			kid = pnstrdup(p + 4, linelen - 4);
+			while (kid[0] && (kid[strlen(kid) - 1] == ' ' || kid[strlen(kid) - 1] == '\r'))
+				kid[strlen(kid) - 1] = '\0';
+		}
+		else if (strncmp(p, "-----BEGIN ", 11) == 0)
+		{
+			const char *end = strstr(p, "-----END ");
+			const char *endeol;
+			size_t		blocklen;
+			BIO		   *bio;
+			EVP_PKEY   *pkey;
+			JwtKey	   *k;
+
+			if (end == NULL)
+				token_reject("letter.jwt_keys: a PEM block has no END line");
+			endeol = strchr(end, '\n');
+			blocklen = (endeol ? (size_t) (endeol - p) : strlen(p));
+			bio = BIO_new_mem_buf(p, (int) blocklen);
+			pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+			BIO_free(bio);
+			if (pkey == NULL)
+				token_reject("letter.jwt_keys: a PEM block is not a public key");
+			k = palloc0(sizeof(JwtKey));
+			k->kid = kid;
+			k->pkey = pkey;
+			keys = lappend(keys, k);
+			kid = NULL;
+			p += blocklen;
+			eol = strchr(p, '\n');
+		}
+		p = eol ? eol + 1 : p + strlen(p);
+	}
+	return keys;
+}
+
+static void
+jwt_free_keys(List *keys)
+{
+	ListCell   *lc;
+
+	foreach(lc, keys)
+		EVP_PKEY_free(((JwtKey *) lfirst(lc))->pkey);
+}
+
+/* One key against the signing input. */
+static bool
+jwt_verify_with(EVP_PKEY *pkey, const JwtAlg *alg, const unsigned char *data, size_t datalen,
+				const unsigned char *sig, size_t siglen)
+{
+	EVP_MD_CTX *ctx;
+	unsigned char *der = NULL;
+	int			derlen = 0;
+	bool		ok;
+
+	if (EVP_PKEY_base_id(pkey) != alg->key_type)
+		return false;
+	if (alg->ec_coord > 0)
+	{
+		/* JWS carries r‖s; OpenSSL wants DER */
+		ECDSA_SIG  *es;
+		BIGNUM	   *r, *s;
+
+		if (siglen != (size_t) alg->ec_coord * 2 || EVP_PKEY_bits(pkey) != alg->ec_coord * 8)
+			return false;
+		es = ECDSA_SIG_new();
+		r = BN_bin2bn(sig, alg->ec_coord, NULL);
+		s = BN_bin2bn(sig + alg->ec_coord, alg->ec_coord, NULL);
+		ECDSA_SIG_set0(es, r, s);
+		derlen = i2d_ECDSA_SIG(es, &der);
+		ECDSA_SIG_free(es);
+		if (derlen <= 0)
+			return false;
+		sig = der;
+		siglen = derlen;
+	}
+	ctx = EVP_MD_CTX_new();
+	ok = EVP_DigestVerifyInit(ctx, NULL, alg->md ? alg->md() : NULL, NULL, pkey) == 1 &&
+		EVP_DigestVerify(ctx, sig, siglen, data, datalen) == 1;
+	EVP_MD_CTX_free(ctx);
+	if (der)
+		OPENSSL_free(der);
+	return ok;
+}
+#endif							/* USE_OPENSSL */
+
+/* Verify a token; returns the user id it names. */
+static char *
+jwt_verify(const char *token)
+{
+#ifndef USE_OPENSSL
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("letter: letter.login() needs a PostgreSQL built with OpenSSL")));
+	return NULL;
+#else
+	const char *dot1, *dot2;
+	unsigned char *hdr_bytes, *pl_bytes, *sig;
+	size_t		hdr_len, pl_len, siglen;
+	Jsonb	   *header, *claims;
+	char	   *algname, *kid, *uid;
+	const JwtAlg *alg;
+	List	   *keys;
+	ListCell   *lc;
+	bool		verified = false, any_key = false, present;
+	double		now, exp, nbf;
+
+	if (letter_jwt_keys[0] == '\0')
+		token_reject("no keys configured (letter.jwt_keys)");
+	dot1 = strchr(token, '.');
+	dot2 = dot1 ? strchr(dot1 + 1, '.') : NULL;
+	if (dot1 == NULL || dot2 == NULL || strchr(dot2 + 1, '.') != NULL)
+		token_reject("not a JWT (three segments expected)");
+
+	hdr_bytes = b64url_decode(token, dot1 - token, &hdr_len);
+	pl_bytes = b64url_decode(dot1 + 1, dot2 - dot1 - 1, &pl_len);
+	sig = b64url_decode(dot2 + 1, strlen(dot2 + 1), &siglen);
+	header = token_json("header", hdr_bytes, hdr_len);
+	claims = token_json("payload", pl_bytes, pl_len);
+
+	algname = token_string(header, "alg", NULL);
+	if (algname == NULL)
+		token_reject("no alg in the header");
+	alg = jwt_alg(algname);
+	if (alg == NULL)
+		token_reject(psprintf("algorithm %s is not accepted (RS256/384/512, ES256/384, EdDSA)", algname));
+	kid = token_string(header, "kid", NULL);
+
+	keys = jwt_load_keys();
+	foreach(lc, keys)
+	{
+		JwtKey	   *k = (JwtKey *) lfirst(lc);
+
+		if (kid != NULL && (k->kid == NULL || strcmp(k->kid, kid) != 0))
+			continue;
+		any_key = true;
+		if (jwt_verify_with(k->pkey, alg, (const unsigned char *) token, dot2 - token, sig, siglen))
+		{
+			verified = true;
+			break;
+		}
+	}
+	jwt_free_keys(keys);
+	if (kid != NULL && !any_key)
+		token_reject(psprintf("no key with kid \"%s\"", kid));
+	if (!verified)
+		token_reject("bad signature");
+
+	now = (double) (GetCurrentTimestamp() / USECS_PER_SEC) +
+		(double) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY;
+	if (!token_number(claims, "exp", &exp))
+		token_reject("no exp claim");
+	if (now > exp + letter_jwt_leeway)
+		token_reject("expired");
+	if (token_number(claims, "nbf", &nbf) && now + letter_jwt_leeway < nbf)
+		token_reject("not yet valid");
+	if (letter_jwt_issuer[0] != '\0')
+	{
+		char	   *iss = token_string(claims, "iss", NULL);
+
+		if (iss == NULL || strcmp(iss, letter_jwt_issuer) != 0)
+			token_reject("wrong issuer");
+	}
+	if (letter_jwt_audience[0] != '\0' && !token_has_audience(claims, letter_jwt_audience))
+		token_reject("wrong audience");
+
+	uid = token_string(claims, letter_jwt_claim, &present);
+	if (!present)
+		token_reject(psprintf("no %s claim", letter_jwt_claim));
+	if (uid == NULL || uid[0] == '\0')
+		token_reject(psprintf("the %s claim is not a non-empty string", letter_jwt_claim));
+	return uid;
+#endif
+}
+
+/* The identity letter.login() verified: backend-local, nothing else can set
+ * it. Local (D3, the default) means it dies with the transaction — or with
+ * the subtransaction it was set in, should that roll back — like SET LOCAL. */
+static const struct config_enum_entry identity_options[] = {
+	{"setting", IDENTITY_SETTING, false},
+	{"token", IDENTITY_TOKEN, false},
+	{NULL, 0, false}
+};
+
+static void
+token_user_clear(void)
+{
+	if (letter_token_user != NULL)
+		pfree(letter_token_user);
+	letter_token_user = NULL;
+	letter_token_user_local = false;
+	letter_token_subxid = InvalidSubTransactionId;
+}
+
+static void
+token_user_set(const char *uid, bool local)
+{
+	token_user_clear();
+	letter_token_user = MemoryContextStrdup(TopMemoryContext, uid);
+	letter_token_user_local = local;
+	letter_token_subxid = local ? GetCurrentSubTransactionId() : InvalidSubTransactionId;
+}
+
+static void
+token_user_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PREPARE:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			if (letter_token_user_local)
+				token_user_clear();
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+token_user_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+							SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB && letter_token_user_local &&
+		letter_token_subxid == mySubid)
+		token_user_clear();
+}
+
+/* letter.login(token text, local boolean DEFAULT true) → text: the user id
+ * the token names, now the current user — for the transaction (local, the
+ * pool-safe default, D3) or the session. In setting mode it also sets
+ * letter.user_id, so login() is a verified way to set the user there; in
+ * token mode the store is the identity and the GUC is ignored. */
+Datum
+letter_login(PG_FUNCTION_ARGS)
+{
+	char	   *token = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	bool		local = PG_ARGISNULL(1) ? true : PG_GETARG_BOOL(1);
+	char	   *uid = jwt_verify(token);
+
+	token_user_set(uid, local);
+	(void) set_config_option("letter.user_id", uid, PGC_USERSET, PGC_S_SESSION,
+							 local ? GUC_ACTION_LOCAL : GUC_ACTION_SET, true, 0, false);
+	PG_RETURN_TEXT_P(cstring_to_text(uid));
+}
+
+/* letter.logout(): nobody, in either mode. */
+Datum
+letter_logout(PG_FUNCTION_ARGS)
+{
+	token_user_clear();
+	(void) set_config_option("letter.user_id", "", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SET, true, 0, false);
+	PG_RETURN_VOID();
+}
+
+/* letter.user_id() → text: the current user, NULL when there is none —
+ * through the same choke point as enforcement, so it follows the mode. */
+Datum
+letter_user_id_fn(PG_FUNCTION_ARGS)
+{
+	const char *uid = get_current_user_id();
+
+	if (uid == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(uid));
+}
+
+/* letter._jwt_keys_check() → text: NULL when letter.jwt_keys parses (or is
+ * empty), else why not — for check_health(). */
+Datum
+letter_jwt_keys_check(PG_FUNCTION_ARGS)
+{
+#ifdef USE_OPENSSL
+	MemoryContext oldcxt = CurrentMemoryContext;
+	char	   *why = NULL;
+
+	if (letter_jwt_keys[0] == '\0')
+		PG_RETURN_NULL();
+	PG_TRY();
+	{
+		jwt_free_keys(jwt_load_keys());
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		why = pstrdup(edata->message);
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	if (why == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(why));
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("letter was built without OpenSSL"));
+#endif
+}
+
 /* ----------------------------------------------------------------
  * letter.enforcing() → boolean: is this session protected? True when the
  * library was preloaded — so every session of the database has the

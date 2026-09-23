@@ -5,9 +5,11 @@ follow the relationships between rows — "editors of the project this task belo
 may read its title" — rather than static per-table grants. Writes are enforced by
 triggers; reads transparently, by a planner hook.
 
-**Status:** pre-release. Write enforcement, transparent read enforcement (the planner
-hook, `letter.enforce_reads`, on by default), membership rules, `if` conditions and
-the lifecycle machinery are complete and tested on PostgreSQL 16 and 17.
+**Status:** first beta. Write enforcement, transparent read enforcement (the planner
+hook, `letter.enforce_reads`, on by default), membership rules, `if` conditions, the
+built-in roles and the lifecycle machinery are complete and tested on PostgreSQL 16
+and 17 — by the regression suite (`make installcheck`) and by a black-box suite of
+user stories through a driver (`make stories`, see `stories/`).
 
 ## Install
 
@@ -92,6 +94,8 @@ letter.unassign(source_table regclass, user_column text,
 letter.visible_columns(rel regclass, pk text)              -- text[]: what this user may read of that row
 letter.forget_user(user_id text)                            -- remove every membership the user holds; bigint
 letter.user_id()                                       -- the current user id as text, NULL when unset
+letter.user_from_claims(claim DEFAULT 'sub')          -- identity from a proxy's verified JWT claims, for the transaction
+letter.login(token text, local DEFAULT true)           -- verify a JWT against letter.jwt_keys, become its user; letter.logout()
 letter.enforcing()                                     -- is this session protected? the application's start-up probe
 letter.list_grants(role text DEFAULT NULL)
 letter.user_permissions(user_id text)
@@ -99,8 +103,8 @@ letter.read_policy(rel regclass)                            -- the read-enforcem
 letter.check_health()                                       -- (severity, object, message)
 ```
 
-`columns` may be `ARRAY['*']`, and for `insert` and `delete` — row-level privileges —
-it may be omitted. A grant on a table that does not exist is refused; a scoped grant
+`columns` may be `ARRAY['*']`; for `insert` and `delete` — row-level privileges — it
+is omitted (a column list is refused). A grant on a table that does not exist is refused; a scoped grant
 whose `via` is not a chain of foreign keys, or whose scope or hop tables have
 composite primary keys, is refused. Primary-key columns are always readable.
 `revoke_*` removes every rule under its key.
@@ -167,7 +171,61 @@ demand is protected from then on, but its neighbours in the pool are not, so it 
 false.) A request that never sets the user gets an error on its first protected read
 or write, never somebody else's data. Prepared statements, including the ones a driver prepares
 on its own, are safe across users: the user is read when the statement runs, not when
-it is planned.
+it is planned. After a migration that adds or drops columns, a statement the driver
+prepared as `SELECT *` fails with "cached plan must not change result type" until the
+connection runs `DEALLOCATE ALL` (or the pool resets it); that is PostgreSQL, not
+letter, and explicit column lists never mind.
+
+### Identity
+
+`letter.user_id` is a session setting, so by default the current user is whoever the
+application says. That is the right perimeter when an application server does the
+authenticating: it holds one database role, and end users never hold a connection.
+Two other arrangements are supported.
+
+**Behind PostgREST or Supabase.** The proxy has verified the client's JWT and exposes
+its claims to SQL as `request.jwt.claims`. Letter's identity comes from those claims,
+once per request, through PostgREST's pre-request hook:
+
+```
+db-pre-request = "letter.user_from_claims"
+```
+
+`letter.user_from_claims(claim DEFAULT 'sub')` sets `letter.user_id` for the
+transaction from the claim named, and leaves it unset for a request without one — an
+anonymous request, which only `anyone` grants serve. The proxy validates; the database
+trusts it.
+
+**Token mode: the database validates.** For an application server that holds the raw
+token, letter can verify it itself, against the issuer's *public* key — RSA, ECDSA or
+Ed25519, never a shared secret — and refuse to know the user any other way:
+
+```sql
+ALTER DATABASE app SET letter.identity = token;      -- letter.user_id is now ignored
+ALTER DATABASE app SET letter.jwt_keys = '-----BEGIN PUBLIC KEY-----
+…
+-----END PUBLIC KEY-----';                           -- several blocks to rotate; kid=… lines to pick
+ALTER DATABASE app SET letter.jwt_issuer = 'https://issuer.example';   -- optional
+ALTER DATABASE app SET letter.jwt_audience = 'app';                     -- optional
+```
+
+```python
+with conn.transaction():
+    conn.execute("SELECT letter.login(%s)", (bearer_token,))   # the user, for this transaction
+    ...
+```
+
+`letter.login(token, local DEFAULT true)` checks the signature, `exp`, `nbf`, and
+`iss` and `aud` when configured (`letter.jwt_leeway`, 30 s), takes the user from
+`letter.jwt_claim` (`sub`), and returns it. Rejections are `letter: token rejected:
+…`, SQLSTATE 28000. The identity lives for the transaction, or with `local := false`
+for the session until `letter.logout()`. In token mode a `SET letter.user_id` neither
+helps nor hurts: an application bug, or an injection, can no longer be anyone. All of
+this is superuser configuration; the application role cannot switch it off. Letter
+never fetches keys over the network and checks no revocation list: keys are
+configured, and rotated by setting both. `login()` also works in the default mode,
+as a verified way to set the user. `letter.check_health()` reports the mode and a key
+that does not parse.
 
 ## Default deny
 
@@ -176,9 +234,13 @@ database. A table with no grants can be neither read nor written by an applicati
 session (an error, not an empty result: a missing grant is a configuration mistake).
 A user who holds no membership that any grant on the table names is a different case,
 and the ordinary one: they read an empty result, and their writes are refused.
-Exempt: `pg_catalog`, `information_schema`, the session's own temporary tables, and
-letter's own schema, which you keep out of the application's reach with ordinary SQL
-privileges (`REVOKE ALL ON ALL TABLES IN SCHEMA letter FROM app`). Scope and hop tables
+This holds table by table within one statement: a join that reaches an ungranted
+table errors, whatever the user may see in the others. `letter.check_health()` lists
+every table that has no grants, so a migration that created a table and forgot its
+grant shows up before the first query does. Exempt: `pg_catalog`,
+`information_schema`, the session's own temporary tables, and letter's own schema,
+which you keep out of the application's reach with ordinary SQL privileges
+(`REVOKE ALL ON ALL TABLES IN SCHEMA letter FROM app`). Scope and hop tables
 are ordinary tables in this respect: directly readable only with a grant, and readable
 *through* a scope path exactly as far as the path's author decided.
 
@@ -208,6 +270,11 @@ application can only ever reach a membership through a rule:
 GRANT USAGE ON SCHEMA letter TO app;
 REVOKE ALL ON ALL TABLES IN SCHEMA letter FROM app;
 ```
+
+Letter's tables are ordinary tables, and their SQL privileges are the operator's to
+set. The default above keeps them out of the application's reach; an application
+that should be able to list memberships, say, can be granted `SELECT` on
+`letter.memberships` like any other table — letter does not redact its own tables.
 
 Configuration — `grant_*`, `revoke_*`, `assign`, `unassign` — is done by a superuser;
 any other role is refused. Administrators, migrations and `pg_dump` connect as roles
@@ -274,12 +341,30 @@ user's scopes through those indexes.
 
 ## Known gaps
 
+Each of these is pinned by a test in `stories/test_10_cannot.py`, so a change in either
+direction is noticed.
+
 - `MERGE` on a protected table is refused, as is a whole-row reference to the table a
   statement writes to (`UPDATE t … RETURNING t`).
 - `COPY table TO` is refused (use `COPY (SELECT …) TO`, which is enforced); `COPY table
-  FROM` needs an insert grant; `TRUNCATE` needs bypass.
+  FROM` needs an insert grant and runs through the row triggers; `TRUNCATE` needs
+  bypass.
+- `via` follows foreign keys in the many-to-one direction only: from a row to the row it
+  points at, one hop per column it names or infers. It never follows a key backwards —
+  from a project to its tasks, or from a label to the `task_labels` rows that point at
+  it — so a table that is only pointed at (labels behind a join table) cannot be scoped:
+  give it a key of its own, or grant it globally. A self-reference is followed exactly
+  as many times as `via` names it.
 - A foreign-key column that is *not* on a grant's scope path must be granted like any
   other column before it can be used in a join; the path's own column is visible with
-  the grant.
-- Partitions and inheritance children are not protected unless granted on directly.
+  the grant. Under a global grant there is no path: grant the key columns a reader
+  needs to join.
+- An insert or delete grant covers the whole row and takes no column list: one is
+  refused at grant time. Column-level insert (which columns a user may *supply*, as
+  opposed to what a default fills) is not enforced.
+- A partitioned table is protected through its parent; a partition queried directly is
+  a table of its own to letter and needs its own grants. Inheritance children likewise.
+- `letter.user_id` is a session setting the application chooses: whoever can run SQL
+  as the application role can be anyone. The application layer that sets it is the
+  perimeter; end users never hold a connection.
 - Logical replication of `letter.*` rows between databases carries the wrong OIDs.

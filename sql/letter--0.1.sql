@@ -190,11 +190,17 @@ LANGUAGE C VOLATILE;
 CREATE FUNCTION letter._columns_or_default(privilege text, columns text[]) RETURNS text[]
 LANGUAGE plpgsql IMMUTABLE AS $$
 BEGIN
+    IF privilege IN ('insert', 'delete') THEN
+        -- row-level: the whole row or nothing (plan/21 D14)
+        IF columns IS NULL OR columns = ARRAY['*'] THEN
+            RETURN ARRAY['*'];
+        END IF;
+        RAISE EXCEPTION 'letter: % is row-level: give it no column list', privilege
+            USING ERRCODE = 'invalid_parameter_value',
+                  HINT = 'An insert or delete grant covers the whole row.';
+    END IF;
     IF columns IS NOT NULL THEN
         RETURN columns;
-    END IF;
-    IF privilege IN ('insert', 'delete') THEN
-        RETURN ARRAY['*'];
     END IF;
     RAISE EXCEPTION 'letter: a % grant needs a column list (or ARRAY[''*''])', privilege
         USING ERRCODE = 'null_value_not_allowed';
@@ -341,9 +347,46 @@ AS 'MODULE_PATHNAME', 'letter_enforcing'
 LANGUAGE C STABLE PARALLEL SAFE;
 
 CREATE FUNCTION letter.user_id() RETURNS text
-LANGUAGE sql STABLE PARALLEL SAFE AS $$
-    SELECT NULLIF(pg_catalog.current_setting('letter.user_id', true), '')
-$$;
+AS 'MODULE_PATHNAME', 'letter_user_id_fn'
+LANGUAGE C STABLE PARALLEL SAFE;
+
+-- Nobody, in either identity mode.
+CREATE FUNCTION letter.logout() RETURNS void
+AS 'MODULE_PATHNAME', 'letter_logout'
+LANGUAGE C VOLATILE;
+
+-- For check_health(): why letter.jwt_keys does not parse, or NULL.
+CREATE FUNCTION letter._jwt_keys_check() RETURNS text
+AS 'MODULE_PATHNAME', 'letter_jwt_keys_check'
+LANGUAGE C STABLE;
+
+-- Identity from claims a proxy has already verified (plan/23 T1): PostgREST and
+-- Supabase check the JWT and expose its claims as request.jwt.claims; as their
+-- pre-request function this sets letter.user_id for the transaction from the
+-- claim named (sub by default). No claim — an anonymous request — leaves the user
+-- unset, so only anyone grants apply. Returns the user id, or NULL.
+CREATE FUNCTION letter.user_from_claims(claim text DEFAULT 'sub',
+                                        setting text DEFAULT 'request.jwt.claims') RETURNS text
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE
+    claims text := pg_catalog.current_setting(setting, true);
+    uid text;
+BEGIN
+    IF claims IS NOT NULL AND claims <> '' THEN
+        uid := (claims::jsonb) ->> claim;
+    END IF;
+    PERFORM pg_catalog.set_config('letter.user_id', coalesce(uid, ''), true);
+    RETURN uid;
+END $$;
+
+-- Token identity (plan/23): verify a JWT against the issuer's public keys
+-- (letter.jwt_keys; RSA, ECDSA or Ed25519 — never HMAC) and its exp/nbf, iss and
+-- aud, and make the user it names (letter.jwt_claim, sub by default) the current
+-- user — for the transaction (local, the pool-safe default) or the session.
+-- Returns the user id. A rejected token is an error: "letter: token rejected: …".
+CREATE FUNCTION letter.login(token text, local boolean DEFAULT true) RETURNS text
+AS 'MODULE_PATHNAME', 'letter_login'
+LANGUAGE C VOLATILE;
 
 -- The current end user, or an error when unset. Every generated barrier reads
 -- the user through this, so an unidentified session cannot read a protected
@@ -399,6 +442,16 @@ LANGUAGE sql VOLATILE AS $$
     SELECT 'info', 'letter.enforce_reads', 'read enforcement is switched off'
     WHERE current_setting('letter.enforce_reads') = 'off'
     UNION ALL
+    -- token identity (plan/23)
+    SELECT 'info', 'letter.identity', 'token: the current user comes from letter.login() only'
+    WHERE current_setting('letter.identity') = 'token'
+    UNION ALL
+    SELECT 'error', 'letter.jwt_keys', 'letter.identity is token but no keys are configured: nobody can log in'
+    WHERE current_setting('letter.identity') = 'token' AND current_setting('letter.jwt_keys') = ''
+    UNION ALL
+    SELECT 'error', 'letter.jwt_keys', letter._jwt_keys_check()
+    WHERE letter._jwt_keys_check() IS NOT NULL
+    UNION ALL
     SELECT 'info', 'role ' || r.rolname, 'has letter.bypass = on by default'
     FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole
     WHERE s.setconfig @> ARRAY['letter.bypass=on']
@@ -413,6 +466,16 @@ LANGUAGE sql VOLATILE AS $$
     FROM letter.grants g
     WHERE g.scope <> 0 AND EXISTS (SELECT 1 FROM pg_class WHERE oid = g.on_table)
       AND NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = g.scope)
+    UNION ALL
+    -- default deny (plan/17 D14): a table with no grants is unreadable and unwritable
+    -- by the application — usually a migration that forgot the grant
+    SELECT 'info', 'table ' || letter._qualname(c.oid),
+           'has no grants: neither readable nor writable by the application (default deny)'
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'letter')
+      AND n.nspname NOT LIKE 'pg\_%'
+      AND NOT EXISTS (SELECT 1 FROM letter.grants g WHERE g.on_table = c.oid)
     UNION ALL
     -- a write grant whose role sees no row of the table can change none (plan/21 finding 6)
     SELECT DISTINCT 'warning', 'grant ' || g.role || '/' || g.privilege || ' on ' || letter._qualname(g.on_table),
